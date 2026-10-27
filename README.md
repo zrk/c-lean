@@ -3,7 +3,7 @@
 Cheap delegation for Claude Code. The plugin gives Claude two light ways to hand work to a model, and a skill that tells it which one to pick:
 
 - `c-lean`, a command that makes one model call with no agent harness. It starts at about 0.6K tokens of context.
-- `lean-scout` and `lean-worker`, two subagents that start without CLAUDE.md and with a narrow tool set. They start at about 3.8K and 4.4K tokens, a little more inside the desktop app.
+- `sub-scout` and `sub-coder`, two subagents that start without CLAUDE.md and with a narrow tool set. They start at about 3.8K and 4.4K tokens, a little more inside the desktop app.
 
 A general-purpose subagent starts at tens of thousands of tokens: the full Claude Code system prompt, the definition of every tool the session has, and your CLAUDE.md files. For a quick lookup or a small judgement most of that is never used, and every call pays for it again.
 
@@ -12,8 +12,8 @@ A general-purpose subagent starts at tens of thousands of tokens: the full Claud
 | Path | What it is |
 |---|---|
 | `bin/c-lean` | One model call through `claude -p` with no harness. While the plugin is enabled, Claude Code puts `bin/` on the PATH of the Bash tool, so Claude runs it by name. |
-| `agents/lean-scout.md` | Read-only subagent: Read, Grep, Glob. |
-| `agents/lean-worker.md` | Subagent for one bounded edit: Read, Edit, Write, Bash. |
+| `agents/sub-scout.md` | Read-only subagent: Read, Grep, Glob. |
+| `agents/sub-coder.md` | Subagent for one bounded edit: Read, Edit, Write, Bash. |
 | `skills/lean-delegation/SKILL.md` | When to use which option, and how to brief it. |
 | `tests/` | Tests against a fake `claude` binary. No model is called. |
 
@@ -22,11 +22,11 @@ A general-purpose subagent starts at tens of thousands of tokens: the full Claud
 From GitHub:
 
 ```bash
-claude plugin marketplace add <owner>/c-lean
+claude plugin marketplace add zrk/c-lean
 claude plugin install c-lean@c-lean
 ```
 
-Inside a session the same works as `/plugin marketplace add <owner>/c-lean` and `/plugin install c-lean@c-lean`.
+Inside a session the same works as `/plugin marketplace add zrk/c-lean` and `/plugin install c-lean@c-lean`.
 
 To try it without installing, load it for one session:
 
@@ -60,12 +60,12 @@ c-lean --check
 - `c-lean --check` makes one live call to Haiku and reports the size of the start-up context.
 - `c-lean -h` lists every flag, exit code and environment variable.
 
-## lean-scout and lean-worker
+## sub-scout and sub-coder
 
 - Both start without CLAUDE.md (`omitClaudeMd: true`), with their own short prompt in place of the Claude Code system prompt, and with a narrow tool list. Give them a self-contained brief: the paths, the question or the change, and the check to run.
-- Default models: lean-scout runs on `sonnet`, lean-worker on the session's model (`inherit`). Neither file sets an effort, so both use the session's effort.
+- Default models: sub-scout runs on `sonnet`, sub-coder on the session's model (`inherit`). Neither file sets an effort, so both use the session's effort.
 - Claude Code picks a subagent's model in this order: the `model` passed in that Agent call, the `model` in the agent file, the `CLAUDE_CODE_SUBAGENT_MODEL` environment variable, the session's model. So Claude, or you through Claude, can run either agent on another model for one task. A per-call `effort` works the same way. `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` pins every subagent to one model.
-- To change a default for good, copy the agent file to `~/.claude/agents/` and edit it. Your copy runs as `lean-scout`, the plugin's as `c-lean:lean-scout`.
+- To change a default for good, copy the agent file to `~/.claude/agents/` and edit it. Your copy runs as `sub-scout`, the plugin's as `c-lean:sub-scout`.
 
 ## Measurements
 
@@ -78,8 +78,8 @@ Start-up context is `input + cache_creation + cache_read` of the first model req
 | custom subagent, Read and Grep, `omitClaudeMd: true` | 3 327 |
 | custom subagent, Read, Grep and Bash, `omitClaudeMd: true` | 3 383 |
 | the same subagent without `omitClaudeMd` | 3 383 plus the size of your CLAUDE.md files (11 098 in the author's setup) |
-| `c-lean:lean-scout`, loaded from this plugin | 3 791 |
-| `c-lean:lean-worker`, loaded from this plugin | 4 354 |
+| `c-lean:sub-scout`, loaded from this plugin | 3 791 |
+| `c-lean:sub-coder`, loaded from this plugin | 4 354 |
 | general-purpose subagent | 75K to 98K in the author's setup, with 9 MCP servers and a large CLAUDE.md |
 
 - A parent session with 9 MCP servers and 83 tools gave the same subagent numbers, within one token, as a parent with no settings files and no MCP servers. The one exception was the Bash tool, whose description was 212 tokens longer under the parent without settings files. A narrowed subagent does not inherit the parent's MCP tools or skills.

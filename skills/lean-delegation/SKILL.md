@@ -1,6 +1,6 @@
 ---
 name: lean-delegation
-description: Use before delegating a bounded piece of work when start-up cost matters, such as many small judgements over text, one lookup in the code, or one narrow edit with a check. Picks between the c-lean command, the lean-scout and lean-worker subagents, and a full subagent, and says how to brief them.
+description: Use before delegating a bounded piece of work when start-up cost matters, such as many small judgements over text, one lookup in the code, or one narrow edit with a check. Picks between the c-lean command, the sub-scout and sub-coder subagents, and a full subagent, and says how to brief them.
 ---
 
 # Delegate cheaply
@@ -10,8 +10,8 @@ Every delegated call pays for its start-up context before it reads your task: sy
 | Option | Start-up context | What it can do | Use it for |
 |---|---|---|---|
 | `c-lean` command, run with Bash | about 0.6K tokens | answer only: no tools, no files | judging, classifying, rewriting or extracting from text that you put into the prompt |
-| `c-lean:lean-scout` subagent | about 3.8K | Read, Grep, Glob | one bounded lookup: where X lives, what a function does, facts with path:line |
-| `c-lean:lean-worker` subagent | about 4.4K | Read, Edit, Write, Bash | one bounded edit together with the check that proves it |
+| `c-lean:sub-scout` subagent | about 3.8K | Read, Grep, Glob | one bounded lookup: where X lives, what a function does, facts with path:line |
+| `c-lean:sub-coder` subagent | about 4.4K | Read, Edit, Write, Bash | one bounded edit together with the check that proves it |
 | a general-purpose subagent | tens of thousands | everything the session has | open-ended work that needs MCP servers, skills or the project's instructions |
 
 Inside a git repository every subagent except Explore and Plan also receives a git status snapshot, from about 0.2K tokens in a clean repository up to about 1.3K.
@@ -28,10 +28,10 @@ Inside a git repository every subagent except Explore and Plan also receives a g
 c-lean -m haiku --system "Answer yes or no." "Does this log line report an error? <line>"
 ```
 
-## lean-scout and lean-worker
+## sub-scout and sub-coder
 
 - They start without CLAUDE.md and without the project's instructions. The brief is the whole task: name the paths, the question or the change, and the check to run.
-- lean-scout runs on `sonnet` and lean-worker on the session's model by default. Pass `model` in the Agent call to choose for this task: a cheaper model for a plain lookup, a stronger one for a hard edit. The per-call value wins over the agent file. `effort` works the same way.
+- sub-scout runs on `sonnet` and sub-coder on the session's model by default. Pass `model` in the Agent call to choose for this task: a cheaper model for a plain lookup, a stronger one for a hard edit. The per-call value wins over the agent file. `effort` works the same way.
 - One task per subagent. If the work turns out larger than the brief, the subagent stops and reports instead of widening it.
 
 ## When none of these fits

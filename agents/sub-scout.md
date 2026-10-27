@@ -1,5 +1,5 @@
 ---
-name: lean-scout
+name: sub-scout
 description: "Cheap read-only scout for one bounded lookup: where X lives, what a file or function does, facts with path:line. Has only Read, Grep and Glob. Starts without CLAUDE.md, so the brief must name the paths and the question."
 tools: Read, Grep, Glob
 model: sonnet

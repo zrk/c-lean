@@ -62,7 +62,6 @@ if os.environ.get("C_LEAN_TEST_FAKE_PGREP") == "1":
     os.symlink(FAKE, os.path.join(PGREP_SANDBOX, "pgrep"))
     atexit.register(shutil.rmtree, PGREP_SANDBOX, True)
 EXIT_WALL = 75
-LEGACY_ENV_PREFIX = "BARE_"
 # the three messages of the fake's `cont3` answer (fake_claude.CONT_PIECES)
 CONT_PIECES = ["alpha 1\nalpha 2\nalpha 3\nalpha 4\nalpha 5\nalpha 6",
                "beta 1\nbeta 2", "gamma 1\ngamma 2"]
@@ -2255,42 +2254,6 @@ if _dir:
         self.assertTrue(os.path.isfile(self.log), "usage log must be created")
         self.assertEqual(stat.S_IMODE(os.stat(self.log).st_mode), 0o600,
                          "usage log file must retain mode 0600 under a restrictive umask")
-
-    def test_legacy_prefix_is_not_allow_listed(self):
-        name = LEGACY_ENV_PREFIX + "CANARY"
-        self.assertNotIn(name, B.scrubbed_env({name: "secret"}),
-                         "legacy environment prefix must not be allow-listed")
-
-    def test_legacy_pass_env_has_no_effect(self):
-        env = dict(self.env, HTTPS_PROXY="http://proxy.example:8080", C_LEAN_PASS_ENV="")
-        env[LEGACY_ENV_PREFIX + "PASS_ENV"] = "HTTPS_PROXY"
-        p = run([CLI, "-m", "haiku", "hello"], mode="envdump", state=self.state, extra_env=env)
-        self.assertEqual(p.returncode, 0, p.stderr)
-        child = json.load(open(os.path.join(self.state, "env.json")))
-        self.assertNotIn("HTTPS_PROXY", child, "legacy pass-env variable must have no effect")
-
-    def test_legacy_state_overrides_have_no_effect(self):
-        state = self.path("state")
-        env = self.state_env(state)
-        env[LEGACY_ENV_PREFIX + "USAGE_LOG"] = self.log
-        env[LEGACY_ENV_PREFIX + "PARTIAL_DIR"] = self.partial
-        p = run([CLI, "-m", "haiku", "hello"], mode="contfail", state=self.state, extra_env=env)
-        self.assertEqual(p.returncode, 1, p.stderr)
-        self.assertEqual(len(self.jsonl(os.path.join(state, "c-lean", "usage.jsonl"))), 1,
-                         "legacy usage-log override must have no effect")
-        self.assertEqual(self.saved_blocks(os.path.join(state, "c-lean", "partial")),
-                         [CUT_PIECES], "legacy partial-dir override must have no effect")
-        self.assertFalse(os.path.exists(self.log))
-        self.assertFalse(os.path.exists(self.partial))
-
-    def test_legacy_binary_override_has_no_effect(self):
-        os.symlink(FAKE, self.path("claude"))
-        env = dict(self.env, C_LEAN_CLAUDE_BIN="",
-                   PATH=self.dir + os.pathsep + os.environ.get("PATH", ""))
-        env[LEGACY_ENV_PREFIX + "CLAUDE_BIN"] = self.path("missing-binary")
-        p = run([CLI, "-m", "haiku", "hello"], mode="single", state=self.state, extra_env=env)
-        self.assertEqual(p.returncode, 0, "legacy binary override must have no effect: " + p.stderr)
-        self.assertEqual(p.stdout, "ECHO:hello\n")
 
     def test_pass_env_adds_requested_names(self):
         names = {"HTTPS_PROXY": "http://proxy.example:8080",

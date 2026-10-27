@@ -1,0 +1,130 @@
+# c-lean
+
+Cheap delegation for Claude Code. The plugin gives Claude two light ways to hand work to a model, and a skill that tells it which one to pick:
+
+- `c-lean`, a command that makes one model call with no agent harness. It starts at about 0.6K tokens of context.
+- `lean-scout` and `lean-worker`, two subagents that start without CLAUDE.md and with a narrow tool set. They start at about 3.8K and 4.4K tokens, a little more inside the desktop app.
+
+A general-purpose subagent starts at tens of thousands of tokens: the full Claude Code system prompt, the definition of every tool the session has, and your CLAUDE.md files. For a quick lookup or a small judgement most of that is never used, and every call pays for it again.
+
+## What's inside
+
+| Path | What it is |
+|---|---|
+| `bin/c-lean` | One model call through `claude -p` with no harness. While the plugin is enabled, Claude Code puts `bin/` on the PATH of the Bash tool, so Claude runs it by name. |
+| `agents/lean-scout.md` | Read-only subagent: Read, Grep, Glob. |
+| `agents/lean-worker.md` | Subagent for one bounded edit: Read, Edit, Write, Bash. |
+| `skills/lean-delegation/SKILL.md` | When to use which option, and how to brief it. |
+| `tests/` | Tests against a fake `claude` binary. No model is called. |
+
+## Install
+
+From GitHub:
+
+```bash
+claude plugin marketplace add <owner>/c-lean
+claude plugin install c-lean@c-lean
+```
+
+Inside a session the same works as `/plugin marketplace add <owner>/c-lean` and `/plugin install c-lean@c-lean`.
+
+To try it without installing, load it for one session:
+
+```bash
+claude --plugin-dir /path/to/c-lean
+```
+
+Requirements:
+
+- Claude Code 2.1.271 or later, for `omitClaudeMd` in agent files. The numbers below were measured on 2.1.311.
+- Python 3.10 or later, for `c-lean`.
+- For `c-lean`: Claude Code signed in with a Claude subscription. The subagents work with whatever provider your session uses.
+
+## c-lean
+
+```bash
+c-lean -m haiku "Classify this commit message as feat, fix or chore: ..."
+c-lean -m sonnet -e high -f brief.md
+cat brief.md | c-lean -m opus
+c-lean -m haiku --system-file rubric.md -f item.txt
+c-lean -m haiku --schema schema.json "..."
+c-lean --check
+```
+
+- There is no default model. Choose model and effort for each task.
+- stdout carries only the answer. stderr carries a trailer with token counts.
+- Each call runs `claude -p` in a fresh private empty directory with an empty system prompt, no tools, no settings files, no MCP servers and no slash commands.
+- The child process gets an allow-listed environment. Every `ANTHROPIC_*`, `CLAUDE_*` and cloud-provider variable is dropped, so an API key or a provider setting in the calling shell cannot move the call off your subscription. A proxy or an extra CA certificate passes only when you name it in `C_LEAN_PASS_ENV`.
+- When the model's answer is cut and continued, the pieces are joined. Text that could not be printed as an answer is saved under `$XDG_STATE_HOME/c-lean/partial`, by default `~/.local/state/c-lean/partial`.
+- Each call appends one line of counters to `$XDG_STATE_HOME/c-lean/usage.jsonl`. The line stores a sha256 hash of the prompt, not the prompt. That is not anonymization: anyone who holds a candidate prompt can confirm it against the hash.
+- `c-lean --check` makes one live call to Haiku and reports the size of the start-up context.
+- `c-lean -h` lists every flag, exit code and environment variable.
+
+## lean-scout and lean-worker
+
+- Both start without CLAUDE.md (`omitClaudeMd: true`), with their own short prompt in place of the Claude Code system prompt, and with a narrow tool list. Give them a self-contained brief: the paths, the question or the change, and the check to run.
+- Default models: lean-scout runs on `sonnet`, lean-worker on the session's model (`inherit`). Neither file sets an effort, so both use the session's effort.
+- Claude Code picks a subagent's model in this order: the `model` passed in that Agent call, the `model` in the agent file, the `CLAUDE_CODE_SUBAGENT_MODEL` environment variable, the session's model. So Claude, or you through Claude, can run either agent on another model for one task. A per-call `effort` works the same way. `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` pins every subagent to one model.
+- To change a default for good, copy the agent file to `~/.claude/agents/` and edit it. Your copy runs as `lean-scout`, the plugin's as `c-lean:lean-scout`.
+
+## Measurements
+
+Start-up context is `input + cache_creation + cache_read` of the first model request. For subagents it was read from the usage that the Agent tool reports. Conditions: `claude -p` on Claude Code 2.1.311, subagents on `claude-sonnet-5-5`, `c-lean` on `haiku`, a one-line task, a working directory outside git, hooks off.
+
+| What starts | Tokens |
+|---|---|
+| `c-lean`: empty system prompt, no tools | 579 |
+| custom subagent, `tools: []`, `omitClaudeMd: true` | 960 |
+| custom subagent, Read and Grep, `omitClaudeMd: true` | 3 327 |
+| custom subagent, Read, Grep and Bash, `omitClaudeMd: true` | 3 383 |
+| the same subagent without `omitClaudeMd` | 3 383 plus the size of your CLAUDE.md files (11 098 in the author's setup) |
+| `c-lean:lean-scout`, loaded from this plugin | 3 791 |
+| `c-lean:lean-worker`, loaded from this plugin | 4 354 |
+| general-purpose subagent | 75K to 98K in the author's setup, with 9 MCP servers and a large CLAUDE.md |
+
+- A parent session with 9 MCP servers and 83 tools gave the same subagent numbers, within one token, as a parent with no settings files and no MCP servers. The one exception was the Bash tool, whose description was 212 tokens longer under the parent without settings files. A narrowed subagent does not inherit the parent's MCP tools or skills.
+- Inside a git repository, every subagent except Explore and Plan also receives a git status snapshot: 165 more tokens in a clean repository, up to 1 347 more when the status reaches its length cap.
+- Inside a Claude desktop app session a subagent starts higher: the app adds a tool of its own and messages with parts of the session's environment. In the author's runs that added about 0.5K to 0.7K tokens.
+- The general-purpose figure was measured in September 2026 on an older Claude Code. Yours depends on your MCP servers, skills and CLAUDE.md.
+
+## A lean worker outside a session
+
+The subagents run inside a Claude Code session. For a script or a scheduled job, the same idea works with `claude -p` directly:
+
+```bash
+env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+  claude -p --model sonnet --effort high \
+    --setting-sources "" --strict-mcp-config --disable-slash-commands \
+    --tools "Read,Grep,Glob" --allowedTools "Read,Grep,Glob" \
+    --system-prompt "$(cat worker-prompt.md)" \
+    --output-format stream-json --verbose \
+    < brief.md > run.jsonl
+```
+
+- `--setting-sources ""` loads no settings files and no CLAUDE.md. `--strict-mcp-config` with no `--mcp-config` starts no MCP servers.
+- `--system-prompt` replaces the Claude Code system prompt with your own.
+- `--tools` limits the tool set. `--allowedTools` pre-approves the same tools, so the run never stops at a permission prompt.
+- `env -u` keeps a stray API key from moving the run off your subscription.
+- The brief comes on stdin, so its length is not limited by the command line.
+- With a slightly broader tool set, workers like this started at 5.5K to 8K tokens in the author's runs.
+
+## Known limits
+
+- `c-lean` works only on a Claude subscription login, on purpose. It does not use API keys, Amazon Bedrock, Google Cloud or Microsoft Foundry.
+- The Claude Code documentation says that `--bare` "will become the default for `-p` in a future release", and bare mode never reads a subscription login. When that happens, `c-lean` and the recipe above stop authenticating until an opt-out exists. API keys and cloud providers keep working in bare mode. The subagents run inside an authenticated session and are not affected.
+- The subagents do not see your CLAUDE.md, so project rules reach them only through the brief.
+
+## Tests
+
+```bash
+python3 tests/test_c_lean.py
+python3 tests/redphase.py
+```
+
+`test_c_lean.py` runs the tool against a fake `claude` binary; no model is called. `redphase.py` breaks a throwaway copy of the tool one way at a time and requires the matching test to fail on its own assert, so a test that cannot fail is caught.
+
+The timeout and signal tests find child processes with the real `pgrep`. In a sandbox that forbids listing processes, set `C_LEAN_TEST_FAKE_PGREP=1` to use a fixture for that step; the tests still kill real processes.
+
+## License
+
+MIT

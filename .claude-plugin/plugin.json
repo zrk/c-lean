@@ -1,0 +1,10 @@
+{
+  "name": "c-lean",
+  "version": "0.1.0",
+  "description": "Cheap delegation for Claude Code: a one-shot model call with no agent harness, and two lean subagents that start without CLAUDE.md and with a narrow tool set.",
+  "author": {
+    "name": "zrk"
+  },
+  "license": "MIT",
+  "keywords": ["subagents", "delegation", "tokens", "context", "headless"]
+}

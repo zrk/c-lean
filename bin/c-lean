@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""@TOOL@ — one model call with no harness context, on the subscription.
+
+Why this exists
+  A Claude subagent drags tens of thousands of tokens of harness (system prompt,
+  tool schemas, CLAUDE.md, skills, MCP) to the start line. A stripped
+  `claude -p` starts at ~0.6K. For many small uniform judgements that start-up
+  cost dominates the price of each item. This wrapper pins the stripping
+  flags, runs the call in a fresh private empty directory, prints ONLY the
+  answer on stdout, a counters trailer on stderr, and appends counters and a
+  sha256 hash of the prompt to the usage log at
+  $XDG_STATE_HOME/@TOOL@/usage.jsonl. This is not anonymization: anyone who
+  holds a candidate prompt can confirm it against the hash.
+  Text of the model that could not be printed as an answer is kept in a file
+  under $XDG_STATE_HOME/@TOOL@/partial (see Guarantees).
+
+Usage
+  @TOOL@ -m haiku "prompt text"              prompt as a positional argument
+  @TOOL@ -m fable -f brief.md                prompt from a file
+  cat brief.md | @TOOL@ -m opus              prompt from stdin
+  @TOOL@ -m haiku --system-file rubric.md …  rubric as the whole system prompt
+  @TOOL@ -m haiku --system "Answer in English." "…"
+  @TOOL@ -m fable -e high "…"                effort: low|medium|high|xhigh|max
+  @TOOL@ -m haiku --schema s.json "…"        structured output (prints the JSON)
+  @TOOL@ -m haiku --schema '{"type":…}' "…"  schema inline
+  @TOOL@ -m haiku --json "…"                 the CLI's result document instead of the answer
+  @TOOL@ -m haiku --tag triage "…"           tag for the usage log
+  @TOOL@ -m haiku --allow-empty "…"          an empty answer is a valid result
+  @TOOL@ --check                             one live Haiku probe: prefix size + language
+
+  There is no default model: model and effort are chosen per task, on purpose.
+
+Guarantees
+  * subscription only — the child gets an ALLOW-listed environment (PATH, HOME,
+    USER, LOGNAME, SHELL, LANG, LC_*, TZ, TMPDIR, TERM, @ENV@*).
+    Every ANTHROPIC_* and CLAUDE_* name is dropped, so an API key, an OAuth
+    token, ANTHROPIC_CUSTOM_HEADERS, CLAUDE_CONFIG_DIR, CLAUDE_ENV_FILE or
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS cannot ride in from the calling session.
+    `@TOOL@` sets that one itself, to 128000 (OUTPUT_CAP in c_lean_core.py): the
+    CLI lowers the number to the upper bound of the model without a word, so
+    a model whose default cap is below its bound writes up to the bound.
+    Examples: haiku-4-5 gets 64000 instead of 32000, opus-5 gets 128000
+    instead of 64000. Fewer continuations, fewer seams. When a result names a
+    default cap above 128000 for some model, 128000 held that model down:
+    `@TOOL@` then prints one WARN line (the model, its number, ours) and the fix
+    is to raise OUTPUT_CAP in c_lean_core.py.
+    Code loaders (NODE_OPTIONS, PYTHONPATH, LD_/DYLD_, NPM_/BUN_/DENO_) are
+    refused outright: they would run a stranger's file inside the call.
+    Proxy and CA names (HTTPS_PROXY, NODE_EXTRA_CA_CERTS, SSL_CERT_FILE …) do NOT
+    travel by default either; name them in @ENV@PASS_ENV="A,B" if a machine needs
+    them, and the trailer then says so. The CLI's API-key-only mode is never
+    used: this call needs the subscription login.
+  * no context — --tools "" --setting-sources "" --strict-mcp-config
+    --disable-slash-commands --no-session-persistence, cwd = fresh private tmpdir.
+    The system prompt is what --system or --system-file gave, and empty when
+    neither is given (text that is whitespace only counts as none). The CLI's
+    built-in system prompt, the Claude Code persona, never applies:
+    --system-prompt is always passed. What is left is the floor the CLI adds
+    on its own, ~0.6K input tokens (measured 2026-10-27 on CLI 2.1.311 with
+    haiku: 579 with an empty system prompt; on CLI 2.1.288 the built-in one
+    gave 6,598).
+  * the usage log stores a sha256 hash of the prompt, never the prompt text.
+    This is not anonymization: anyone who holds a candidate prompt can confirm
+    it against the hash. @ENV@USAGE_LOG overrides the default log path.
+    When XDG_STATE_HOME is unset or empty, ~/.local/state is used instead.
+    Missing parent directories are made with mode 0700, log files with 0600.
+  * the timeout is built in (--timeout SEC, at most 2592000 s = 30 days): the
+    call is killed with its whole process tree, no external `timeout` command
+    is needed. Without --timeout the limit depends on the effort:
+        no -e, low, medium, high   1200 s
+        xhigh                      3600 s
+        max                        6000 s
+    The numbers are generous on purpose: waiting longer is cheaper than
+    losing an answer that is already paid for. One opus message that runs to
+    the 128K output cap takes about 1200 s (measured: 131,688 output tokens
+    in 1236 s), and the CLI goes on with an answer up to 3 times, i.e. up to
+    4 messages: 6000 s covers that worst case too. An explicit --timeout
+    always wins. A call killed by the timeout prints no answer (exit 124).
+    The message says where the limit came from, how to raise it, and how
+    many messages of the model had finished by then; what was spent is
+    billed. The message that was still being written is lost; the text
+    blocks that had come whole are saved to a file (see below).
+  * an answer is printed whole, not from its last text block alone. The
+    result document of the CLI carries ONE text block, the last one. For an
+    ordinary call that is the whole answer. It is not when the model's
+    message holds two text blocks (with thinking between them), and it is
+    not when the CLI went on with the answer by itself. The CLI does that
+        - after a message that hit the output cap,
+        - after a response that was cut off mid-stream,
+        - after a response with no visible text,
+        - after thinking that was cut at the output cap,
+    up to 3 times a call, and after each of these the model goes on with the
+    same answer. @TOOL@ reads the event stream and prints every text block,
+    joined in order with nothing put in between. The trailer says
+    CONTINUED xN (N = how many times the CLI went on). It counts them even
+    when the text came in one block, and a call that the timeout or a signal
+    killed says it too. An answer of one message with several text blocks
+    gets a NOTE and no CONTINUED: nothing was continued. The NOTE on stderr
+    says why there are several blocks and shows every seam: its position in
+    the answer and 40 characters on each side. A whitespace character can be
+    lost at a seam (a newline was, in 12 of 12 measured seams after the
+    output cap), and @TOOL@ does not guess it back: read the seams. --json
+    prints the result document plus one key, @PIECES@, the text of each
+    block; the key is there only when the blocks were joined.
+    Blocks are joined only when they can be trusted to be one answer: the
+    CLI took no message back, every message from the first text block to
+    the last one continues the message before it in one of the four ways
+    above, and the last block is the document's result. Otherwise nothing
+    is joined: the `result` of the document is printed, as it was before
+    @TOOL@ read the stream, a WARN says why, and every text block is saved to
+    a file.
+    Only the first kind of continuation has been seen live; the other three
+    are read off the code of CLI 2.1.288.
+  * no text the model wrote is dropped. Every text block is either printed
+    on stdout or saved to a file, whenever the output of the CLI could be
+    read at all: a failed call, a timeout, a stop by a signal, the limit
+    wall, an empty answer, continuations that ran out, blocks that were not
+    joined, a block the CLI's document left out of its `result`. The file
+    goes to the directory @ENV@PARTIAL_DIR, by default
+    $XDG_STATE_HOME/@TOOL@/partial (made with mode 0700, the file with 0600), and is
+    named <UTC time>-<first 8 characters of the prompt's sha256>.txt, with a
+    counter added when that name is taken. Its first line says what it is:
+    the tool, the time, the model and effort, the reason, the prompt's
+    sha256 (never the prompt). Then comes every block as it arrived, each
+    after a line `===== @TOOL@: text block 2 of 3 =====` and with one newline
+    added after it. One line on stderr gives the size and the full path.
+    Such a file is the text of an answer that did not finish or was not
+    printed, never a result, and nothing of it goes to stdout. A file that
+    cannot be written costs one WARN and nothing else (none is left behind:
+    a half-written one is removed, and when the home directory cannot be
+    told, with no HOME and no entry for the user in the system, and no
+    XDG_STATE_HOME or @ENV@PARTIAL_DIR either, nothing is written at all).
+    When XDG_STATE_HOME is unset or empty, ~/.local/state is used instead;
+    @ENV@PARTIAL_DIR overrides either default. An ordinary call,
+    whose one text block is what was printed, writes no file. Three things
+    are left out on purpose: a good call with --schema (its answer is the
+    structured output, and text blocks that came with it are not kept),
+    --check (a probe, not an answer), and blocks of whitespace alone.
+    Thinking is never printed and never saved.
+  * SIGINT/SIGTERM/SIGHUP kill the child with its tree. The exit code is
+    128+signal when the signal lands before the call has started (@TOOL@ is
+    still reading the prompt) or when the child itself dies of the signal.
+    During a call to the claude CLI it is 137 or 1 instead, and a call the
+    CLI ended on its own is reported as a plain failure, not as INTERRUPTED
+    (see Known limitations). Whatever the exit code, a stopped call is
+    reported as stopped or failed, never as an
+    answer. Under `nohup` SIGHUP stays ignored and the child runs in a session
+    of its own, out of reach of the hangup a closed terminal sends to the whole
+    job (the claude CLI ends a call on it whatever it inherited), so the call
+    outlives the terminal; a SIGKILL sent to the job does not reach it then,
+    and the call runs to its end with nobody to read the answer.
+  * `think` in the trailer is part of `out`, which is why it is printed in
+    brackets: out 61 (think 55) means 61 output tokens, 55 of them thinking.
+    The trailer also names the binary that ran, because it is chosen by
+    @ENV@CLAUDE_BIN or by the parent's PATH.
+  * an empty answer is a failure, not a result (--allow-empty turns that off):
+    `@TOOL@ … > answer.md` used to leave an empty file behind and exit 0.
+
+The limit wall (exit 75)
+  It is decided by the STRUCTURE of the CLI answer, never by words in a document:
+  is_error true, plus api_error_status 429 or an error type saying rate_limit.
+  Only when the CLI returns no document at all may the sentence decide, and
+  only where the CLI itself wrote it: on stderr, or in a line of stdout that is
+  not an event of the stream (a line whose first character after leading
+  whitespace is `{` is one, whole or cut short, and holds a model's words).
+  A document with is_error false is never a wall, whatever the answer says and
+  whatever the exit code was — "You've hit your weekly limit" as an answer is
+  data, not a verdict, and a failed call that merely quotes it is a plain failure.
+
+Known limitations
+  * A wall without a structural marker (is_error true, but no api_error_status
+    429 and no rate_limit error type) is an ordinary failed call: exit 1, not 75.
+  * A real limit wall has never been observed live by this tool; the markers it
+    looks for come from a recorded CLI envelope (see c_lean_core.py), not
+    from a wall met here.
+  * The output cap. It is the CLI, not @TOOL@, that continues an answer cut at
+    the cap, and it does so at most 3 times (4 messages; measured on CLI
+    2.1.288). When the last of them is cut too, the call fails: exit 1,
+    nothing on stdout, the tokens are spent; the text of the cut messages is
+    saved to a file. Thinking counts against the cap, so a message can be
+    all thinking and no text. A continuation does not promise a complete
+    answer either: the model may stop early in it.
+  * A response stopped by a safety classifier is not joined. The CLI then
+    asks the model to go on without the withheld part, and whether the model
+    continues its text or starts again is not known. The same holds for any
+    request of the CLI that @TOOL@ does not know, and for a call where the CLI
+    took a message back: the `result` of the document is printed with a
+    WARN, and every text block is saved to a file. A message the CLI took
+    back without saying so in the stream cannot be told from one that
+    stands.
+  * With --schema nothing is joined: the structured output of the result
+    document is printed as it is. CONTINUED xN in the trailer is then the
+    only sign that the CLI went on with the answer, and a good call saves no
+    file, whatever text blocks came with it.
+  * The start window. Until the signal handlers are installed (the interpreter
+    starting, the imports, parsing the flags) no call has been made. A SIGTERM
+    or SIGHUP in this window (unless SIGHUP was ignored at start) ends the
+    process and the OS reports the signal.
+    A SIGINT there does the same, often with a KeyboardInterrupt traceback;
+    inside the interpreter's own start-up it can instead end it with exit 1 and
+    "Fatal Python error: init_…", and now and then CPython only reports the
+    KeyboardInterrupt and the call goes on as usual.
+  * The exit code of a stop. A signal that lands before the call has started
+    (@TOOL@ is still reading the prompt) gives 128+signal, and no call is made.
+    During a call 128+signal comes out only when the child itself dies of the
+    signal, and the claude CLI does not: it catches all three.
+    A signal sent to @TOOL@'s pid alone (kill PID) is seen by @TOOL@ only: its
+    handler kills the child with SIGKILL, and the exit is 137 (128+9), with
+    INTERRUPTED in the trailer. A signal sent to the whole process group
+    (Ctrl-C, a closed terminal, kill -- -PGID) reaches the CLI too, and the
+    CLI ends the call itself tens of milliseconds later (SIGINT: exit 0 with
+    an error_during_execution document; SIGTERM: 143; SIGHUP: 129). If that
+    comes before the handler's SIGKILL, @TOOL@ reports an ordinary failure,
+    exit 1 ("claude reported failure (rc=0 subtype=error_during_execution)"
+    or "the stream of claude ended with no `result` event (… rc=129)"); if
+    not, 137. When the child is in a
+    session of its own (SIGHUP ignored at start, see Guarantees), a SIGINT or
+    SIGTERM sent to the job reaches @TOOL@ alone: 137. After a stop of your own,
+    read 1 and 137 as "stopped, no answer", not as a failed prompt.
+  * Exit 120. When stdout or stderr can no longer be written (a closed
+    terminal, or a pipe whose reader has exited), the next write there fails.
+    The interpreter then cannot flush its streams on the way out, and @TOOL@
+    exits 120 whatever the call gave. The trailer goes to stderr before the
+    answer goes to stdout, so when stderr is the stream that fails, the
+    answer is not printed either; the usage-log line is written all the same,
+    and so is the file of text blocks of a call that saves them (it is
+    written before anything is printed). A good call saves nothing, so its
+    answer is lost with the stream.
+    Send both streams to files when the terminal may close or the reader may
+    go away.
+  * SIGQUIT (Ctrl-\\) and every other fatal signal @TOOL@ does not catch end it
+    on the spot: no trailer, no usage-log line. A child the signal did not
+    reach (kill -QUIT PID) runs its call to the end, and the answer is lost.
+
+Exit codes
+  0 ok · 1 the call failed (an empty answer counts, an answer still cut off
+    after the CLI's last continuation counts, and so does a call the claude
+    CLI ended on its own after a stop signal, see Known limitations) ·
+  64 usage (a bad flag value included) ·
+  69 the claude binary cannot be run (missing, no +x, bad format) ·
+  75 LIMIT WALL — not an ordinary failure · 124 timeout ·
+  120 stdout or stderr could no longer be written: a closed terminal, or a pipe
+    whose reader has exited (see Known limitations) ·
+  137 the child was killed with SIGKILL, as a rule by @TOOL@'s own handler on a
+    stop signal (see Known limitations) ·
+  130/143/129 stopped by SIGINT/SIGTERM/SIGHUP
+    — before the call starts, or when the child itself dies of the signal
+    (see Known limitations)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import c_lean_core as B  # noqa: E402
+
+__doc__ = (__doc__.replace("@TOOL@", B.TOOL_NAME).replace("@ENV@", B.ENV_PREFIX)
+           .replace("@PIECES@", B.PIECES_KEY))
+
+CHECK_MAX_INPUT = 1500
+CHECK_SYSTEM = ("You are a terse evaluator. Always answer in English. "
+                "Reply with exactly one word and nothing else.")
+CHECK_PROMPT = "Reply with the single word: OK"
+SEAM_CONTEXT = 40     # characters shown on each side of a seam in the NOTE
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse exits 2 on a value it cannot parse; 64 is what the help promises
+        print(f"{B.TOOL_NAME}: %s" % message, file=sys.stderr)
+        sys.exit(B.EXIT_USAGE)
+
+
+def build_parser():
+    p = Parser(
+        prog=B.TOOL_NAME, add_help=False,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__)
+    p.add_argument("prompt", nargs="*", help=argparse.SUPPRESS)
+    p.add_argument("-f", "--file", dest="files", action="append", default=[],
+                   help="read the prompt from FILE (repeatable)")
+    p.add_argument("-m", "--model", help="fable | opus | sonnet | haiku | full id (no default)")
+    p.add_argument("-e", "--effort", help="low | medium | high | xhigh | max")
+    p.add_argument("--system", help="system prompt text")
+    p.add_argument("--system-file", help="system prompt from a file")
+    p.add_argument("--schema", help="JSON Schema: a file path or inline JSON")
+    # No default here: None means "not given", and the limit then comes from
+    # the effort (B.timeout_plan). A number here could not be told from one
+    # the operator typed.
+    p.add_argument("--timeout", type=float, default=None,
+                   help="seconds for the whole call, must be > 0 (default: 1200, "
+                        "3600 at -e xhigh, 6000 at -e max)")
+    p.add_argument("--json", action="store_true", help="print the CLI's result document")
+    p.add_argument("--allow-empty", action="store_true",
+                   help="an empty answer is a valid result (default: a failure)")
+    p.add_argument("--tag", default="", help="tag written to the usage log")
+    p.add_argument("--backend", default="claude", help="model backend (only 'claude' for now)")
+    p.add_argument("--check", action="store_true", help="one live Haiku probe, then exit")
+    p.add_argument("-h", "--help", action="store_true")
+    return p
+
+
+def gather_prompt(args, parser) -> str:
+    parts = []
+    if args.prompt:
+        parts.append(" ".join(args.prompt))
+    for path in args.files:
+        if path == "-":
+            parts.append(sys.stdin.read())
+        else:
+            parts.append(B.read_file_arg("-f", path))
+    if not parts and not sys.stdin.isatty():
+        parts.append(sys.stdin.read())
+    text = "\n\n".join(x for x in parts if x.strip())
+    if not text.strip():
+        print(f"{B.TOOL_NAME}: empty prompt (give text, -f FILE, or pipe stdin)", file=sys.stderr)
+        sys.exit(B.EXIT_USAGE)
+    return text
+
+
+def gather_system(args) -> str:
+    if args.system and args.system_file:
+        print(f"{B.TOOL_NAME}: use --system or --system-file, not both", file=sys.stderr)
+        sys.exit(B.EXIT_USAGE)
+    if args.system_file:
+        return B.read_file_arg("--system-file", args.system_file)
+    return args.system or ""
+
+
+def do_check(args) -> int:
+    # the probe is always haiku at effort low, whatever -e says
+    timeout, _source = B.timeout_plan(args.timeout, "low")
+    r = B.call_model(CHECK_PROMPT, system=CHECK_SYSTEM, model="haiku", effort="low",
+                     timeout=timeout, backend=args.backend, tag="check", tool=B.TOOL_NAME + " --check")
+    sys.stderr.write(B.trailer(r, B.TOOL_NAME + " --check"))
+    # the answer as `c-lean` would print it: every block joined, else the result
+    seen = (B.splice(r.pieces)[0] if r.pieces else r.text) or ""
+    probe = {"ts": B.now_iso(), "kind": "check", "exit": r.exit, "wall": bool(r.wall),
+             "usage": r.usage, "total_in": r.total_in, "secs": round(r.secs or 0, 2),
+             "answer": seen[:200], "err": (r.err or "")[:300],
+             "tokens_unknown": bool(r.tokens_unknown),
+             "raw_keys": sorted((r.raw or {}).keys()) if isinstance(r.raw, dict) else None,
+             "raw_usage": (r.raw or {}).get("usage") if isinstance(r.raw, dict) else None}
+    probe_path = os.environ.get(B.ENV_PREFIX + "CHECK_PROBE_FILE")
+    if probe_path:
+        with open(probe_path, "a") as f:
+            f.write(json.dumps(probe, ensure_ascii=False) + "\n")
+
+    fails = []
+    if r.wall:
+        print(f"{B.TOOL_NAME} --check: LIMIT WALL — %s" % r.err, file=sys.stderr)
+        return B.EXIT_WALL
+    if r.interrupted:
+        print(f"{B.TOOL_NAME} --check: interrupted — %s" % r.err, file=sys.stderr)
+        return r.exit or B.EXIT_FAIL
+    if not r.ok:
+        fails.append("call failed: %s" % r.err)
+    elif not seen.strip():
+    # --check exists to prove the pipe works before a paid call; an empty
+        # answer is the pipe not working, and it used to print OK.
+        fails.append("empty answer — not a result")
+    if r.tokens_unknown or (r.ok and r.total_in == 0):
+        # The whole point of --check is the input-token number. When it cannot be
+        # read, `0 > 1500` is false and the guard reports OK — wide open in
+        # exactly the case it exists for (the CLI changing the shape of `usage`).
+        fails.append("usage counters unreadable (in %s cw %s cr %s out %s) — the prefix "
+                     "cannot be verified, so this is NOT a pass"
+                     % (r.usage.get("in"), r.usage.get("cw"), r.usage.get("cr"),
+                        r.usage.get("out")))
+    if r.total_in > CHECK_MAX_INPUT:
+        fails.append("prefix too fat: %d input tokens (in %s + cw %s + cr %s) > %d — "
+                     "the CLI probably grew a default context; re-measure"
+                     % (r.total_in, r.usage.get("in"), r.usage.get("cw"), r.usage.get("cr"),
+                        CHECK_MAX_INPUT))
+    if r.ok and not B.looks_english(seen):
+        fails.append("answer is not English (%r) — a language setting is leaking in" % seen[:60])
+    for f in fails:
+        print(f"{B.TOOL_NAME} --check: FAIL %s" % f, file=sys.stderr)
+    if fails:
+        return B.EXIT_FAIL
+    print(f"{B.TOOL_NAME} --check: OK · haiku · %d input tokens (limit %d) · answer %r · %.1fs"
+          % (r.total_in, CHECK_MAX_INPUT, seen[:40], r.secs or 0), file=sys.stderr)
+    return B.EXIT_OK
+
+
+def note_lines(r, answer, seams) -> list:
+    """The NOTE for an answer put together from several text blocks: why there
+    are several, and every seam. Nothing is put in at a seam, so the reader
+    has to see the places where a space or a newline may have been lost."""
+    if r.continued:
+        after = []
+        for kind in r.went_on:
+            if kind not in after:
+                after.append(kind)
+        why = ("the CLI continued the answer %d time%s (after %s), and its result document "
+               "carries only the last text block"
+               % (r.continued, "" if r.continued == 1 else "s",
+                  ", ".join("%s%s" % (k, (" x%d" % r.went_on.count(k))
+                                      if r.went_on.count(k) > 1 else "") for k in after)))
+    else:
+        # one message, several text blocks: nothing was continued, and the
+        # trailer must not say so
+        why = ("the answer came in %d text blocks of one message, and the result document of "
+               "the CLI carries only the last of them" % len(r.pieces))
+    if not seams:
+        return [f"{B.TOOL_NAME}: NOTE %s; all of the visible text is in one block, so nothing was "
+                "joined" % why]
+    lines = [f"{B.TOOL_NAME}: NOTE %s: %d pieces are printed joined exactly as they came. Nothing is put "
+             "in at a seam, so a space or a newline may be missing there — check each one:"
+             % (why, len(seams) + 1)]
+    for n, pos in enumerate(seams, 1):
+        # JSON strings: a newline shows as \n, and the edges of the context are visible
+        lines.append(f"{B.TOOL_NAME}: NOTE seam %d after %d characters: %s | %s"
+                     % (n, pos,
+                        json.dumps(answer[max(0, pos - SEAM_CONTEXT):pos], ensure_ascii=False),
+                        json.dumps(answer[pos:pos + SEAM_CONTEXT], ensure_ascii=False)))
+    return lines
+
+
+def to_keep(r) -> list:
+    """The text blocks of the call that are worth a file: all of them, unless
+    there is no visible text in any."""
+    return r.blocks if any(b.strip() for b in r.blocks) else []
+
+
+def settle(args, r, schema, timeout, limit_source):
+    """What the call comes to, with nothing printed yet: (exit code, lines for
+    stderr after the trailer, text for stdout or None, why its text blocks are
+    not all on stdout or None when they are)."""
+    say = []
+    if r.wall:
+        say.append(f"{B.TOOL_NAME}: LIMIT WALL — stop and wait for the window to reset. %s" % r.err)
+        return B.EXIT_WALL, say, None, r.why or "the call hit the limit wall"
+    if r.interrupted:
+        say.append(f"{B.TOOL_NAME}: stopped — %s" % (r.err or "interrupted"))
+        return r.exit or B.EXIT_FAIL, say, None, r.why or "the call was stopped by a signal"
+    if r.exit == B.EXIT_TIMEOUT:
+        say.append(f"{B.TOOL_NAME}: %s" % B.timeout_message(timeout, limit_source, r.finished,
+                                                  len(to_keep(r))))
+        return B.EXIT_TIMEOUT, say, None, r.why or "the call was killed by the timeout"
+    if not r.ok:
+        say.append(f"{B.TOOL_NAME}: %s" % (r.err or "failed"))
+        return r.exit or B.EXIT_FAIL, say, None, r.why or "the call failed"
+    if r.warn:
+        say.append(f"{B.TOOL_NAME}: WARN %s" % r.warn)
+    # What goes to stdout: every text block of an answer that came in several,
+    # or the `result` of the document, which is the last one.
+    answer, seams = B.splice(r.pieces) if r.pieces else (r.text, [])
+    if r.pieces:
+        say += note_lines(r, answer, seams)
+    # Which text blocks are NOT on stdout once this is printed. Joined pieces
+    # are all there. Without them stdout gets the `result` of the document,
+    # and that covers one block which is that `result` and nothing else: not
+    # blocks that were not joined, and not a block the document left out (the
+    # CLI leaves `result` empty when the last block of the answer is not text).
+    unprinted = None
+    if not r.pieces:
+        if len(r.blocks) > 1:
+            unprinted = ("%d text blocks came and were not joined: only the `result` of the "
+                         "CLI's document was printed" % len(r.blocks))
+        elif r.blocks and r.blocks[0].strip() != r.text:
+            unprinted = ("the only text block of the call is not the `result` of the CLI's "
+                         "document, and the `result` is what was printed")
+    empty = not answer.strip() and r.structured is None and not args.allow_empty
+    if empty:
+        # `c-lean … > answer.md` with an empty result left an empty file and exit 0,
+        # so the next step of the pipeline counted the step as done.
+        say.append(f"{B.TOOL_NAME}: empty answer — not a result (use --allow-empty if a blank "
+                   "answer is legitimate for this rubric)")
+        if not args.json:
+            return (B.EXIT_FAIL, say, None,
+                    "the `result` of the CLI's document is empty, and nothing was printed")
+        # --json asked for the CLI document, and the empty answer is precisely
+        # what it is needed to explain (cut off? refused? a wall?). Report the
+        # failure, but do not swallow the thing that was asked for.
+
+    if args.json:
+        # the document as the CLI gave it; its `result` is the last text block
+        # only, so the blocks of a joined answer ride along under one key. No
+        # key when nothing was joined: the document then is what was printed.
+        doc = dict(r.raw, **{B.PIECES_KEY: r.pieces}) if r.pieces else r.raw
+        out = json.dumps(doc, ensure_ascii=False, indent=2) + "\n"
+    elif schema:
+        if r.structured is None:
+            say.append(f"{B.TOOL_NAME}: --schema given but the CLI returned no structured_output")
+            return B.EXIT_FAIL, say, r.text + "\n", unprinted
+        out = json.dumps(r.structured, ensure_ascii=False) + "\n"
+    else:
+        out = answer + "\n"
+    if empty:
+        return B.EXIT_FAIL, say, out, unprinted
+    # A good call under a schema keeps nothing: its answer is the structured
+    # output, whatever text came with it.
+    return B.EXIT_OK, say, out, (None if schema else unprinted)
+
+
+def keep(r, prompt, reason) -> str:
+    """Save the text blocks that are not going to stdout and return the line
+    that says so. A file that cannot be written costs a warning and nothing
+    else: the exit code and the rest of the output stay what they were."""
+    blocks = to_keep(r)
+    size = ("%d characters in %d text block%s"
+            % (sum(len(b) for b in blocks), len(blocks), "" if len(blocks) == 1 else "s"))
+    try:
+        path = B.save_blocks(blocks, prompt, reason, model=r.model, effort=r.effort)
+    except Exception as e:  # noqa: BLE001 — keeping the text must not break the report of the call
+        try:
+            where = B.partial_dir()
+        except OSError:  # the place itself is what cannot be told
+            where = B.ENV_PREFIX + "PARTIAL_DIR"
+        return (f"{B.TOOL_NAME}: WARN could not save %s to %s: %s — that text is lost"
+                % (size, where, getattr(e, "strerror", None) or e))
+    return (f"{B.TOOL_NAME}: SAVED %s to %s — the text of an answer that did not finish or was not "
+            "printed, NOT a result" % (size, path))
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.help:
+        sys.stdout.write(__doc__)
+        return B.EXIT_OK
+    timeout, limit_source = B.timeout_plan(args.timeout, args.effort)
+    if not math.isfinite(timeout) or timeout <= 0:
+        # "0 = no limit" is the natural guess and it was a trap: the call was
+        # killed the moment it started. `nan` and `inf` pass a plain `<= 0` test
+        # and then blow up inside select() with a ValueError/OverflowError.
+        print(f"{B.TOOL_NAME}: --timeout must be > 0 seconds and finite (there is no 'unlimited' "
+              "value; nan and inf are not numbers of seconds)", file=sys.stderr)
+        return B.EXIT_USAGE
+    if timeout > B.MAX_TIMEOUT:
+        print(f"{B.TOOL_NAME}: --timeout is at most %d seconds (30 days)" % B.MAX_TIMEOUT, file=sys.stderr)
+        return B.EXIT_USAGE
+    if args.backend not in B.BACKENDS:
+        print(f"{B.TOOL_NAME}: unknown --backend %r (have: %s)"
+              % (args.backend, ", ".join(sorted(B.BACKENDS))), file=sys.stderr)
+        return B.EXIT_USAGE
+    B.install_signal_handlers()
+    if args.check:
+        return do_check(args)
+    if not args.model:
+        print(f"{B.TOOL_NAME}: -m MODEL is required (fable | opus | sonnet | haiku | full id); "
+              "there is no default on purpose", file=sys.stderr)
+        return B.EXIT_USAGE
+
+    try:
+        prompt = gather_prompt(args, parser)
+        system = gather_system(args)
+        schema = B.read_text_arg(args.schema) if args.schema else None
+    except B.BadArg as e:
+        print(f"{B.TOOL_NAME}: %s" % e, file=sys.stderr)
+        return B.EXIT_USAGE
+    # No warning for a missing system prompt: it is passed empty, and the CLI's
+    # built-in one never applies. Measured 2026-10-03 on haiku, CLI 2.1.288:
+    # 406 input tokens a call with an empty system prompt, 6,598 with the
+    # built-in one (10 in + 6,588 cache write), which is what a call without
+    # --system used to cost under a WARN line.
+
+    r = B.call_model(prompt, system=system, model=args.model, effort=args.effort,
+                     schema=schema, timeout=timeout, backend=args.backend,
+                     tag=args.tag, tool=B.TOOL_NAME)
+    code, say, out, unprinted = settle(args, r, schema, timeout, limit_source)
+    # The file comes first, before a single line is printed: a stream that can
+    # no longer be written (see Exit 120 in the help) must not cost the text too.
+    if unprinted and to_keep(r):
+        say.append(keep(r, prompt, unprinted))
+    if B.cap_over_note(r):
+        say.append(f"{B.TOOL_NAME}: WARN %s" % B.cap_over_note(r))
+    sys.stderr.write(B.trailer(r))
+    for line in say:
+        print(line, file=sys.stderr)
+    if out is not None:
+        # a lone surrogate (a half of a pair the model wrote) cannot be encoded
+        # to UTF-8: it goes out as the escape the saved file has, not as a traceback
+        sys.stdout.write(out.encode("utf-8", "backslashreplace").decode("utf-8"))
+    return code
+
+
+if __name__ == "__main__":
+    try:
+        rc = main()
+    finally:
+        # the exit code is decided, on every path: a signal landing during
+        # interpreter shutdown must not turn it into -2 / -15
+        B.ignore_stop_signals()
+    sys.exit(rc)

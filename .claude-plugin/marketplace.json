@@ -1,0 +1,14 @@
+{
+  "name": "c-lean",
+  "description": "The c-lean plugin for Claude Code",
+  "owner": {
+    "name": "zrk"
+  },
+  "plugins": [
+    {
+      "name": "c-lean",
+      "source": "./",
+      "description": "A one-shot model call with no agent harness, and two lean subagents that start without CLAUDE.md."
+    }
+  ]
+}

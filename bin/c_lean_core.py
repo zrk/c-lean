@@ -60,6 +60,7 @@ import re
 import selectors
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -169,7 +170,7 @@ WALL_TEXT_RE = re.compile(
     r"|\bout\s+of\s+usage(?:\s+credits)?\b"
     r"|\bupgrade\s+to\s+increase\s+your\s+usage\s+limit\b"
     r"|\blimit\s+reached\b[^\n]{0,40}\bresets?\b"
-    r"|\brate[_ ]limit(?:ed|_error)?\b)",
+    r"|\brate[_ -]limit(?:ed|_error)?\b)",
     re.I,
 )
 
@@ -533,7 +534,8 @@ def log_usage(rec: dict, path=None) -> None:
             _private_dir(parent)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
-            os.fchmod(fd, 0o600)
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                os.fchmod(fd, 0o600)
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:  # logging must never break a run
         # nor may a stderr that can no longer be written: the text blocks of
@@ -692,16 +694,18 @@ def _claude_cmd(binary, system_file, model, effort, schema):
 def _system_file(text) -> str:
     """Write a system prompt to a new private file and return its path.
 
-    mkstemp makes it in the temporary directory, not in the cwd of the call,
-    which stays empty. _call_claude removes it where it removes that cwd."""
-    fd, path = tempfile.mkstemp(prefix=TOOL_NAME + "-system-", suffix=".txt")
+    Its own directory protects the file even in a shared, non-sticky TMPDIR.
+    The cwd of the call stays empty. _call_claude removes both when it ends."""
+    directory = tempfile.mkdtemp(prefix=TOOL_NAME + "-system-")
     try:
+        os.chmod(directory, 0o700)  # a umask can take bits off the mode of mkdtemp
+        fd, path = tempfile.mkstemp(prefix=TOOL_NAME + "-system-", suffix=".txt", dir=directory)
         # the CLI reads it as UTF-8; a lone surrogate goes in as its escape
         with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace", newline="") as f:
             os.fchmod(fd, 0o600)  # a umask can take bits off the 0600 of mkstemp
             f.write(text)
     except BaseException:
-        os.unlink(path)
+        shutil.rmtree(directory, ignore_errors=True)
         raise
     return path
 
@@ -1331,7 +1335,7 @@ def _cannot_make(what, e, t0) -> Result:
     if getattr(e, "filename", None):
         reason += " (%s)" % e.filename
     return Result(ok=False, exit=EXIT_OSERR, text="", raw=None, wall=False,
-                  secs=(_dt.datetime.now() - t0).total_seconds(),
+                  secs=time.monotonic() - t0,
                   err="cannot start the call: %s: %s" % (what, reason))
 
 
@@ -1346,7 +1350,7 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
     # Ours alone: scrubbed_env() never lets the caller's value in, and what is
     # put here after it is not the caller's either (see OUTPUT_CAP).
     env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(OUTPUT_CAP)
-    t0 = _dt.datetime.now()
+    t0 = time.monotonic()
     proc = workdir = system_file = feed = None
     # What is being made for the call while it is made, None once it is: an
     # OSError (or a thread that cannot start) there is exit 71, not a
@@ -1355,6 +1359,7 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
     try:
         workdir = tempfile.mkdtemp(prefix=TOOL_NAME + "-run-")
         os.chmod(workdir, 0o700)
+        env["PWD"] = os.path.realpath(workdir)
         making = "the system-prompt file"
         system_file = _system_file(system) if system else None
         cmd = _claude_cmd(binary, system_file, model, effort, schema)
@@ -1407,18 +1412,20 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
         rc = proc.returncode
         cut = read_stream(stdout)
         if reason == "timeout" and not isinstance(cut.doc, dict) and not interrupted():
-            secs = (_dt.datetime.now() - t0).total_seconds()
+            secs = time.monotonic() - t0
             return Result(ok=False, exit=EXIT_TIMEOUT, text="", err="timeout after %ss" % timeout,
                           why="the call was killed by the timeout after %ss"
                               % seconds_shown(timeout),
                           finished=cut.finished, blocks=cut.texts(),
                           continued=cut.continued, went_on=cut.joined_after(),
                           secs=secs, wall=False, raw=None, tokens_unknown=True)
-        if reason == "pipes":
+        if reason == "pipes" or (reason == "timeout" and gone is not None):
             rc = gone
             linger = ("the claude CLI exited but a process it started still held its output "
-                      "open %ss later: its process tree was killed, and the call is judged "
-                      "by what it printed and its own exit code" % seconds_shown(RESULT_GRACE))
+                      "open %s: its process tree was killed, and the call is judged "
+                      "by what it printed and its own exit code"
+                      % (("%ss later" % seconds_shown(RESULT_GRACE)) if reason == "pipes"
+                         else "when the timeout of %ss ran out" % seconds_shown(timeout)))
         elif reason in ("result", "timeout"):
             rc = 0 if gone is None else gone
             linger = ("the claude CLI printed its `result` event and had not exited %s: it "
@@ -1457,7 +1464,11 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
                 os.unlink(system_file)
             except OSError:
                 pass
-    secs = (_dt.datetime.now() - t0).total_seconds()
+            try:
+                os.rmdir(os.path.dirname(system_file))
+            except OSError:
+                pass
+    secs = time.monotonic() - t0
 
     raw_out, raw_err = stdout or "", stderr or ""
     stream = read_stream(raw_out)
@@ -1528,6 +1539,9 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
             why = "the CLI printed no JSON"
             err = "no JSON from claude (rc=%d): %s" % (
                 rc, (raw_out + "\n" + raw_err)[-4000:].strip()[-400:])
+        if system_file and "unknown option '--system-prompt-file'" in raw_err:
+            err += ("; this claude CLI is too old for --system, --system-file and --check; "
+                    "update Claude Code")
         return Result(ok=False, exit=(EXIT_WALL if wall else EXIT_FAIL), text="", wall=wall,
                       err=err, why=why, blocks=blocks,
                       secs=secs, raw=None, tokens_unknown=True, continued=continued, linger=linger)

@@ -3965,6 +3965,270 @@ if _dir:
         self.assertEqual(os.listdir(tmp), [])
 
 
+    # --- environment, temporary files and diagnostics
+    def test_child_pwd_is_its_private_working_directory(self):
+        for pwd, pass_env in ((self.dir, None), (None, None), (self.dir, "PWD")):
+            with self.subTest(pwd=pwd, pass_env=pass_env):
+                p = run([CLI, "-m", "haiku", "hello"], mode="envdump", state=self.state,
+                        cwd=self.dir, extra_env=dict(self.env, PWD=pwd,
+                                                     C_LEAN_PASS_ENV=pass_env))
+                self.assertEqual(p.returncode, 0, p.stderr)
+                with open(os.path.join(self.state, "env.json")) as f:
+                    env = json.load(f)
+                self.assertEqual(env.get("PWD"), self.received()["cwd"],
+                                 "child PWD must name its private working directory")
+                self.assertNotEqual(env.get("PWD"), self.dir)
+
+    def test_call_durations_use_monotonic_time_when_wall_clock_steps(self):
+        class SteppingDatetime:
+            count = 0
+
+            @classmethod
+            def now(cls, tz=None):
+                cls.count += 1
+                return datetime(2026, 10, 29, 20 - cls.count, tzinfo=tz)
+
+        def read_all(proc, timeout):
+            out, err = proc.communicate(timeout=5)
+            return out, err, None, None
+
+        def timed_out(proc, timeout):
+            proc.communicate(timeout=5)
+            return "", "", "timeout", None
+
+        tmp = self.mktemp("c-lean-clock-")
+        for outcome, code in (("answer", 0), ("timeout", 124), ("setup", 71)):
+            with self.subTest(outcome=outcome), contextlib.ExitStack() as stack:
+                SteppingDatetime.count = 0
+                stack.enter_context(mock.patch.dict(os.environ,
+                    child_env("single", self.state, self.env)))
+                stack.enter_context(mock.patch.object(B, "_dt", types.SimpleNamespace(
+                    datetime=SteppingDatetime, timezone=timezone)))
+                stack.enter_context(mock.patch.object(B, "time", types.SimpleNamespace(
+                    monotonic=mock.Mock(side_effect=[1000.0, 1003.5]))))
+                stack.enter_context(mock.patch.object(tempfile, "tempdir", tmp))
+                stack.enter_context(mock.patch.object(B, "_communicate",
+                    timed_out if outcome == "timeout" else read_all))
+                if outcome == "setup":
+                    stack.enter_context(mock.patch.object(tempfile, "mkdtemp",
+                        side_effect=PermissionError("test directory denied")))
+                r = B._call_claude("p", None, "haiku", None, None, 5)
+                self.assertEqual(r.exit, code, r.err)
+                self.assertEqual(r.secs, 3.5,
+                                 "call duration must use monotonic time after a wall-clock step")
+                self.assertIn(" · 3.5s · ", B.trailer(r))
+                B.log_call(r, "p")
+                rec = self.jsonl(self.log)[-1]
+                self.assertEqual(rec["secs"], 3.5)
+                self.assertTrue(rec["ts"].startswith("2026-10-29T"))
+
+    def test_usage_log_to_dev_null_does_not_warn(self):
+        p = run([CLI, "-m", "haiku", "hello"], mode="single", state=self.state,
+                extra_env=dict(self.env, C_LEAN_USAGE_LOG="/dev/null"))
+        self.assertEqual((p.returncode, p.stdout), (0, "ECHO:hello\n"), p.stderr)
+        self.assertEqual(self.warns(p), [], "a usage log on /dev/null must not WARN")
+
+    def test_usage_log_fifo_is_written_without_changing_its_mode(self):
+        path = self.path("usage.fifo")
+        os.mkfifo(path, 0o640)
+        os.chmod(path, 0o640)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            B.log_usage({"probe": "fifo"}, path=path)
+            data = os.read(fd, 4096)
+        finally:
+            os.close(fd)
+        self.assertEqual(json.loads(data), {"probe": "fifo"})
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o640,
+                         "a FIFO usage log must keep its existing mode")
+
+    def test_an_existing_regular_usage_log_is_made_private(self):
+        self.write("usage.jsonl", "")
+        os.chmod(self.log, 0o666)
+        B.log_usage({"probe": "regular"}, path=self.log)
+        self.assertEqual(stat.S_IMODE(os.stat(self.log).st_mode), 0o600,
+                         "an existing regular usage log must become private")
+        self.assertEqual(self.jsonl(self.log), [{"probe": "regular"}])
+
+    @unittest.skipIf(sys.version_info < (3, 11), "PYTHONSAFEPATH needs Python 3.11+")
+    def test_symlink_with_python_safe_path_imports_the_core(self):
+        link = self.path("c-lean-link")
+        os.symlink(CLI, link)
+        p = run([link, "-m", "haiku", "hello"], mode="single", state=self.state,
+                cwd=self.dir, extra_env=dict(self.env, PYTHONSAFEPATH="1", PYTHONPATH=None))
+        self.assertEqual((p.returncode, p.stdout), (0, "ECHO:hello\n"),
+                         "a symlink under PYTHONSAFEPATH must import its core: " + p.stderr)
+
+    def test_hyphenated_rate_limits_in_cli_text_are_walls(self):
+        for text in ("rate-limit", "rate-limited"):
+            for channel in ("stderr", "stdout"):
+                with self.subTest(text=text, channel=channel):
+                    p = self.script([text] if channel == "stdout" else [], rc=1,
+                                    stderr=text if channel == "stderr" else "")
+                    self.assertEqual(p.returncode, 75,
+                                     "hyphenated rate limits in CLI text must be a wall")
+                    self.assertIn("LIMIT WALL", p.stderr)
+
+    def test_hyphenated_rate_limits_in_model_words_are_not_walls(self):
+        for text in ("rate-limit", "rate-limited"):
+            for kind, code in (("answer", 0), ("failure", 1), ("cut", 1)):
+                with self.subTest(text=text, kind=kind):
+                    events = [ev_text("1", text)]
+                    if kind != "cut":
+                        events.append(ev_result(text, is_error=kind == "failure"))
+                    p = self.script(events)
+                    self.assertNotIn("LIMIT WALL", p.stderr,
+                                     "hyphenated rate limits in model words must not be walls")
+                    self.assertEqual(p.returncode, code, p.stderr)
+
+    def test_system_file_has_its_own_private_directory_and_both_are_removed(self):
+        tmp = self.mktemp("c-lean-shared-tmp-")
+        os.chmod(tmp, 0o777)  # shared TMPDIR without the sticky bit
+        p = run([CLI, "-m", "haiku", "--system", "rubric", "hello"], mode="single",
+                state=self.state, extra_env=dict(self.env, TMPDIR=tmp))
+        self.assertEqual((p.returncode, p.stdout), (0, "ECHO:hello\n"), p.stderr)
+        got = self.received()
+        directory = got["system_file_dir"]
+        self.assertNotIn(directory, (os.path.realpath(tmp), os.path.realpath(got["cwd"])),
+                         "the system file needs its own directory outside TMPDIR and the cwd")
+        self.assertEqual(got["system_dir_mode"], 0o700,
+                         "the directory of the system file must have mode 0700")
+        self.assertEqual(got["system_file_mode"], 0o600)
+        self.assertFalse(os.path.exists(got["system_file"]), "the system file must be removed")
+        self.assertFalse(os.path.exists(directory), "the system directory must be removed")
+        self.assertEqual(os.listdir(tmp), [])
+
+    def test_system_directory_permissions_survive_restrictive_umask(self):
+        tmp = self.mktemp("c-lean-umask-")
+        mask = os.umask(0o777)
+        try:
+            with mock.patch.object(tempfile, "tempdir", tmp):
+                path = B._system_file("rubric")
+        finally:
+            os.umask(mask)
+        directory = os.path.dirname(path)
+        self.assertEqual(stat.S_IMODE(os.stat(directory).st_mode), 0o700,
+                         "the system directory must retain mode 0700 under a restrictive umask")
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+
+    def test_old_cli_system_file_error_explains_how_to_fix_it(self):
+        rubric = self.write("rubric.md", "rubric")
+        tmp = self.mktemp("c-lean-old-cli-")
+        for args in (["-m", "haiku", "--system", "rubric", "hello"],
+                     ["-m", "haiku", "--system-file", rubric, "hello"], ["--check"]):
+            with self.subTest(args=args):
+                p = run([CLI] + args, mode="single", state=self.state,
+                        extra_env=dict(self.env, TMPDIR=tmp,
+                                       C_LEAN_FAKE_UNKNOWN="--system-prompt-file"))
+                self.assertEqual((p.returncode, p.stdout), (1, ""), p.stderr)
+                self.assertIn("this claude CLI is too old for --system, --system-file and "
+                              "--check; update Claude Code", p.stderr,
+                              "an old CLI must name the affected flags and tell how to fix it")
+                self.assertIn("unknown option '--system-prompt-file'", p.stderr)
+                self.assertEqual(self.jsonl(self.log)[-1]["exit"], 1)
+                self.assertEqual(os.listdir(tmp), [])
+
+    def test_old_cli_without_a_system_prompt_still_works(self):
+        p = run([CLI, "-m", "haiku", "hello"], mode="single", state=self.state,
+                extra_env=dict(self.env, C_LEAN_FAKE_UNKNOWN="--system-prompt-file"))
+        self.assertEqual((p.returncode, p.stdout), (0, "ECHO:hello\n"), p.stderr)
+        self.assertEqual(self.received()["system_flags"], ["--system-prompt"])
+
+    def test_no_system_prompt_gets_no_old_cli_hint(self):
+        error = "error: unknown option '--system-prompt-file'"
+        plan = self.write("unknown-system-file.json", json.dumps({
+            "events": [], "rc": 1, "stderr": error + "\n"}))
+        p = run([CLI, "-m", "haiku", "hello"], mode="script", state=self.state,
+                extra_env=dict(self.env, C_LEAN_FAKE_SCRIPT=plan))
+        self.assertEqual((p.returncode, p.stdout), (1, ""), p.stderr)
+        got = self.received()
+        self.assertEqual(got["system_flags"], ["--system-prompt"])
+        self.assertEqual(got["argv"][got["argv"].index("--system-prompt") + 1], "")
+        self.assertIn(error, p.stderr)
+        self.assertNotIn("this claude CLI is too old", p.stderr,
+                         "a call without --system-prompt-file must not get the old CLI hint")
+        self.assertNotIn("update Claude Code", p.stderr)
+        self.assertEqual((self.trailer_exit(p), self.jsonl(self.log)[-1]["exit"]), (1, 1))
+
+    def test_timeout_after_cli_exit_warns_about_open_pipes(self):
+        def exited_with_open_pipes(proc, timeout):
+            out, err = proc.communicate(timeout=5)
+            return out, err, "timeout", proc.returncode
+
+        for code in (0, 1, -signal.SIGKILL):
+            with self.subTest(code=code):
+                plan = self.write("exited.json", json.dumps({
+                    "events": [ev_text("1", "answer"), ev_result("answer")],
+                    "rc": code if code >= 0 else 0,
+                    "end": "exit" if code >= 0 else "kill"}))
+                env = child_env("script", self.state, dict(self.env, C_LEAN_FAKE_SCRIPT=plan))
+                with mock.patch.dict(os.environ, env), \
+                        mock.patch.object(B, "_communicate", exited_with_open_pipes):
+                    r = B._call_claude("p", None, "haiku", None, None, 2)
+                self.assertEqual(r.linger,
+                    "the claude CLI exited but a process it started still held its output open "
+                    "when the timeout of 2s ran out: its process tree was killed, and the call "
+                    "is judged by what it printed and its own exit code",
+                    "a timeout after CLI exit must warn about open pipes and the CLI's own exit")
+                self.assertEqual(r.exit, code if code >= 0 else 128 - code)
+                self.assertEqual(r.ok, code == 0)
+
+    # --- documented prompt, schema and check paths
+    def test_good_prompt_from_file(self):
+        prompt = "File prompt: é — line one\nline two"
+        path = self.write("brief.md", prompt)
+        p = run([CLI, "-m", "haiku", "-f", path], mode="single", state=self.state,
+                extra_env=self.env)
+        self.assertEqual((p.returncode, p.stdout), (0, "ECHO:" + prompt + "\n"),
+                         "a good prompt from -f FILE must reach the CLI whole: " + p.stderr)
+        self.on_stdin(prompt)
+
+    def test_good_prompt_from_stdin(self):
+        prompt = "Stdin prompt: é — line one\nline two"
+        p = run([CLI, "-m", "haiku"], mode="single", state=self.state,
+                extra_env=self.env, stdin=prompt)
+        self.assertEqual((p.returncode, p.stdout), (0, "ECHO:" + prompt + "\n"),
+                         "a good prompt from stdin must reach the CLI whole: " + p.stderr)
+        self.on_stdin(prompt)
+
+    def test_good_prompt_from_file_dash(self):
+        prompt = "Dash prompt: é — line one\nline two"
+        p = run([CLI, "-m", "haiku", "-f", "-"], mode="single", state=self.state,
+                extra_env=self.env, stdin=prompt)
+        self.assertEqual((p.returncode, p.stdout), (0, "ECHO:" + prompt + "\n"),
+                         "a good prompt from -f - must reach the CLI whole: " + p.stderr)
+        self.on_stdin(prompt)
+
+    def test_schema_from_a_file_reaches_the_cli_as_json(self):
+        schema = '{"type":"object","properties":{"verdict":{"type":"string"}}}'
+        path = self.write("schema.json", schema)
+        p = run([CLI, "-m", "haiku", "--schema", path, "hello"], mode="schema",
+                state=self.state, extra_env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        argv = self.received()["argv"]
+        self.assertEqual(argv[argv.index("--json-schema") + 1], schema,
+                         "--schema FILE must pass the file's JSON to the CLI")
+        self.assertEqual(json.loads(p.stdout), {"verdict": "yes"})
+
+    def test_check_fails_above_its_input_token_limit(self):
+        for cache_read, code in ((250, 0), (251, 1)):
+            with self.subTest(cache_read=cache_read):
+                event = ev_result("OK", usage={"input_tokens": 1000,
+                    "cache_creation_input_tokens": 250, "cache_read_input_tokens": cache_read,
+                    "output_tokens": 1})
+                env = self.script_env([event])
+                p = run([CLI, "--check"], state=self.state, extra_env=env)
+                self.assertEqual(p.returncode, code,
+                                 "--check must fail only above 1500 total input tokens")
+                if code:
+                    self.assertIn("prefix too fat: 1501 input tokens (in 1000 + cw 250 + "
+                                  "cr 251) > 1500", p.stderr)
+                    self.assertNotIn("--check: OK", p.stderr)
+                self.assertEqual(p.stdout, "")
+                self.assertEqual((self.trailer_exit(p), self.jsonl(self.log)[-1]["exit"]),
+                                 (code, code))
+
+
 def tearDownModule():
     """The shared sandbox of saved files must be empty once every test has run:
     a test that forgot to point C_LEAN_PARTIAL_DIR at a directory of its own would

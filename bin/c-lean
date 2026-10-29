@@ -28,6 +28,21 @@ Usage
   @TOOL@ -m haiku --allow-empty "…"          an empty answer is a valid result
   @TOOL@ --check                             one live Haiku probe: prefix size + language
 
+Flags
+  -f, --file FILE       read a prompt file; repeatable, - reads stdin
+  -m, --model MODEL     model alias or full id; required unless --check
+  -e, --effort EFFORT   low | medium | high | xhigh | max (any case)
+  --system TEXT         use TEXT as the system prompt
+  --system-file FILE    read the system prompt from FILE
+  --schema JSON|FILE    JSON Schema inline or from a file
+  --timeout SEC         call limit; default 1200, xhigh 3600, max 6000 s
+  --json                print the CLI's result document
+  --allow-empty         accept an empty answer
+  --tag TAG             tag the usage-log line
+  --backend NAME        model backend; only claude
+  --check               run one fixed live Haiku probe, then exit
+  -h, --help            show this help
+
   There is no default model: model and effort are chosen per task, on purpose.
   --check makes one fixed Haiku probe: haiku at effort low, with a system
   prompt and a prompt of its own. It ignores the prompt and every flag
@@ -69,7 +84,13 @@ Guarantees
     system prompt goes in a file of its own, with mode 0600 and outside the
     cwd of the call, passed with --system-prompt-file. The file is removed
     when the call ends: after an answer, a failure, a timeout or a stop
-    signal. So a prompt that begins with "-" is not read as an option, no
+    signal. Its parent is a new private directory of mode 0700 in TMPDIR,
+    removed with the file. --system, --system-file and --check need a CLI
+    version that supports --system-prompt-file; update Claude Code if it
+    reports that option as unknown. With no system prompt it is not needed.
+    A @ENV@CLAUDE_BIN wrapper that sandboxes the file system must let the
+    CLI read this file in TMPDIR.
+    So a prompt that begins with "-" is not read as an option, no
     other user can read either text in the process list, and no limit of
     the command line applies to them (Linux refuses any one argument of
     128 KiB or more). The JSON schema of --schema does go on the command
@@ -167,7 +188,8 @@ Guarantees
     Thinking is never printed and never saved.
   * SIGINT/SIGTERM/SIGHUP kill the child with its tree and give exit
     128+signal (130/143/129), INTERRUPTED and NOT COUNTED. This also stops
-    a prompt read at once, including stdin, -f - and a FIFO: no call is made.
+    a read of the prompt, --system-file or --schema at once, including stdin,
+    -f - and a FIFO: no call is made.
     A good whole `result` already in the stream stands instead: a WARN says
     the stop came after the answer, and the call is judged by that event.
     Every stop signal inherited as SIG_IGN stays ignored. If any one was
@@ -309,7 +331,7 @@ import math
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import c_lean_core as B  # noqa: E402
 
 __doc__ = (__doc__.replace("@TOOL@", B.TOOL_NAME).replace("@ENV@", B.ENV_PREFIX)

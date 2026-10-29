@@ -369,7 +369,8 @@ def main():
             sys.stderr.write("error: cannot read the system prompt file %s: %s\n" % (path, e))
             return 1
         seen.update(system_file=path, system_file_mode=mode,
-                    system_file_dir=os.path.dirname(os.path.realpath(path)))
+                    system_file_dir=os.path.dirname(os.path.realpath(path)),
+                    system_dir_mode=stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode))
     else:
         system = opts.get("--system-prompt", "").encode("utf-8", "surrogateescape")
     seen.update(system_chars=len(system.decode("utf-8", "replace")), system_sha256=digest(system))

@@ -273,6 +273,9 @@ Known limitations
     and so is the file of text blocks of a call that saves them (it is
     written before anything is printed). A good call saves nothing, so its
     answer is lost with the stream.
+    A stderr closed from the start (`2>&-`) is not a stream that fails: its
+    lines are dropped, the answer is printed, and the exit stays what @TOOL@
+    decided.
     Send both streams to files when the terminal may close or the reader may
     go away.
   * SIGKILL, SIGQUIT (Ctrl-\\) and every other fatal signal @TOOL@ does not catch end it
@@ -322,7 +325,7 @@ SEAM_CONTEXT = 40     # characters shown on each side of a seam in the NOTE
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         # argparse exits 2 on a value it cannot parse; 64 is what the help promises
-        print(f"{B.TOOL_NAME}: %s" % message, file=sys.stderr)
+        B.print_err(f"{B.TOOL_NAME}: %s" % message)
         sys.exit(B.EXIT_USAGE)
 
 
@@ -369,14 +372,14 @@ def gather_prompt(args, parser) -> str:
         parts.append(B.read_stdin_arg("the prompt on stdin"))
     text = "\n\n".join(x for x in parts if x.strip())
     if not text.strip():
-        print(f"{B.TOOL_NAME}: empty prompt (give text, -f FILE, or pipe stdin)", file=sys.stderr)
+        B.print_err(f"{B.TOOL_NAME}: empty prompt (give text, -f FILE, or pipe stdin)")
         sys.exit(B.EXIT_USAGE)
     return text
 
 
 def gather_system(args) -> str:
     if args.system and args.system_file:
-        print(f"{B.TOOL_NAME}: use --system or --system-file, not both", file=sys.stderr)
+        B.print_err(f"{B.TOOL_NAME}: use --system or --system-file, not both")
         sys.exit(B.EXIT_USAGE)
     if args.system_file:
         return B.read_file_arg("--system-file", args.system_file)
@@ -613,7 +616,11 @@ def keep(r, prompt, reason) -> str:
 def write_end(err=None, out=None) -> bool:
     """Write `err` to stderr, then `out` to stdout; False when one of them can
     no longer be written (a pipe whose reader has exited, a closed terminal, a
-    full disk, a stream closed from the start). Nothing more is written then.
+    full disk, a stdout closed from the start). Nothing more is written then.
+
+    A stderr closed from the start (`2>&-`) is None and does not fail: `err`
+    is dropped, as print_err drops a line, and `out` is still written. It
+    used to cost the answer, a paid one included, and exit 120.
 
     `out` goes out as UTF-8 bytes whatever the encoding of stdout: under an
     ASCII one, a non-ASCII answer ended in a UnicodeEncodeError traceback and
@@ -622,10 +629,8 @@ def write_end(err=None, out=None) -> bool:
     writes it with backslashreplace, so no text fails there."""
     stream = None
     try:
-        if err is not None:
+        if err is not None and sys.stderr is not None:
             stream = sys.stderr
-            if stream is None:
-                return False
             stream.write(err)
             stream.flush()
         if out is not None:
@@ -674,8 +679,8 @@ def main(argv=None) -> int:
     if args.effort is not None and not args.check:  # --check ignores -e (see do_check)
         effort = args.effort.lower()
         if effort not in B.EFFORTS:
-            print(f"{B.TOOL_NAME}: unknown -e %r (have: %s, in any letter case)"
-                  % (args.effort, ", ".join(B.EFFORTS)), file=sys.stderr)
+            B.print_err(f"{B.TOOL_NAME}: unknown -e %r (have: %s, in any letter case)"
+                        % (args.effort, ", ".join(B.EFFORTS)))
             return B.EXIT_USAGE
         args.effort = effort
     timeout, limit_source = B.timeout_plan(args.timeout, args.effort)
@@ -683,22 +688,22 @@ def main(argv=None) -> int:
         # "0 = no limit" is the natural guess and it was a trap: the call was
         # killed the moment it started. `nan` and `inf` pass a plain `<= 0` test
         # and then blow up inside select() with a ValueError/OverflowError.
-        print(f"{B.TOOL_NAME}: --timeout must be > 0 seconds and finite (there is no 'unlimited' "
-              "value; nan and inf are not numbers of seconds)", file=sys.stderr)
+        B.print_err(f"{B.TOOL_NAME}: --timeout must be > 0 seconds and finite (there is no "
+                    "'unlimited' value; nan and inf are not numbers of seconds)")
         return B.EXIT_USAGE
     if timeout > B.MAX_TIMEOUT:
-        print(f"{B.TOOL_NAME}: --timeout is at most %d seconds (30 days)" % B.MAX_TIMEOUT, file=sys.stderr)
+        B.print_err(f"{B.TOOL_NAME}: --timeout is at most %d seconds (30 days)" % B.MAX_TIMEOUT)
         return B.EXIT_USAGE
     if args.backend not in B.BACKENDS:
-        print(f"{B.TOOL_NAME}: unknown --backend %r (have: %s)"
-              % (args.backend, ", ".join(sorted(B.BACKENDS))), file=sys.stderr)
+        B.print_err(f"{B.TOOL_NAME}: unknown --backend %r (have: %s)"
+                    % (args.backend, ", ".join(sorted(B.BACKENDS))))
         return B.EXIT_USAGE
     B.install_signal_handlers()
     if args.check:
         return do_check(args)
     if not args.model:
-        print(f"{B.TOOL_NAME}: -m MODEL is required (fable | opus | sonnet | haiku | full id); "
-              "there is no default on purpose", file=sys.stderr)
+        B.print_err(f"{B.TOOL_NAME}: -m MODEL is required (fable | opus | sonnet | haiku | "
+                    "full id); there is no default on purpose")
         return B.EXIT_USAGE
 
     try:
@@ -711,7 +716,7 @@ def main(argv=None) -> int:
     except B.PromptStopped:
         prompt, system, schema = "", None, None
     except B.BadArg as e:
-        print(f"{B.TOOL_NAME}: %s" % e, file=sys.stderr)
+        B.print_err(f"{B.TOOL_NAME}: %s" % e)
         return B.EXIT_USAGE
     # No warning for a missing system prompt: it is passed empty, and the CLI's
     # built-in one never applies. Measured 2026-10-03 on haiku, CLI 2.1.288:

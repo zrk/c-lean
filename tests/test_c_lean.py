@@ -3527,6 +3527,58 @@ if _dir:
                          "a closed stdin adds nothing to a prompt given otherwise")
         self.assertEqual(self.calls(), 1)
 
+    def no_stderr(self):
+        """preexec_fn: c-lean starts with stderr closed, as `c-lean 2>&-` does."""
+        default_sighup()
+        os.close(2)
+
+    def test_a_usage_error_with_stderr_closed_leaves_stdout_empty(self):
+        """With stderr closed (`c-lean 2>&-`) sys.stderr is None, and print()
+        to None writes to stdout: every usage error, argparse's included,
+        went to stdout, the channel of the answer."""
+        system = self.write("system.md", "S")
+        for args in (["--no-such-flag", "x"], ["-m"], ["-m", "haiku", "-e", "turbo", "x"],
+                     ["-m", "haiku", "--schema", "", "x"], ["-m", "haiku"], ["x"],
+                     ["-m", "haiku", "--timeout", "0", "x"],
+                     ["-m", "haiku", "--timeout", "99999999999", "x"],
+                     ["-m", "haiku", "--backend", "nope", "x"],
+                     ["-m", "haiku", "--system", "S", "--system-file", system, "x"],
+                     ["-m", "haiku", "-f", self.path("no-such-prompt.md")]):
+            with self.subTest(args=args):
+                p = self.run_bytes(args, stdin=b"", preexec_fn=self.no_stderr)
+                self.assertEqual((p.returncode, p.stdout), (64, b""),
+                                 "a usage error must not reach stdout when stderr is closed")
+        self.assertEqual(self.calls(), 0)
+
+    def test_a_warning_during_the_call_with_stderr_closed_keeps_the_answer(self):
+        """The WARN of a usage log that cannot be written went to stdout when
+        stderr was closed from the start, and then the run ended with 120
+        and no answer. Such a stderr does not fail: its lines are dropped."""
+        p = self.run_bytes(["-m", "haiku", "hello"], preexec_fn=self.no_stderr,
+                           extra_env={"C_LEAN_USAGE_LOG": self.mktemp("c-lean-log-")})
+        self.assertEqual((p.returncode, p.stdout), (0, b"ECHO:hello\n"),
+                         "with stderr closed, stdout must hold the answer and nothing else")
+        self.assertEqual(self.calls(), 1)
+
+    def test_a_good_call_with_stderr_closed_prints_the_answer(self):
+        """A stderr closed from the start (`c-lean 2>&-`) cost the answer of a
+        good call, paid for, and exit 120: the trailer could not be written."""
+        p = self.run_bytes(["-m", "haiku", "héllo"], preexec_fn=self.no_stderr)
+        self.assertEqual((p.returncode, p.stdout), (0, "ECHO:héllo\n".encode("utf-8")),
+                         "a stderr closed from the start must not cost the answer")
+        self.assertEqual(self.jsonl(self.log)[-1]["exit"], 0)
+
+    def test_check_with_stderr_closed_keeps_its_exit(self):
+        """--check with stderr closed from the start exited 120 after a good
+        probe. It prints nothing on stdout, then as now."""
+        probe = self.path("probe.jsonl")
+        env = child_env("usageinout", self.state, dict(self.env, C_LEAN_CHECK_PROBE_FILE=probe))
+        p = subprocess.run([sys.executable, CLI, "--check"], env=env, capture_output=True,
+                           timeout=120, preexec_fn=self.no_stderr)
+        self.assertEqual((p.returncode, p.stdout), (0, b""),
+                         "with stderr closed, --check must keep the exit it decided")
+        self.assertEqual((self.jsonl(self.log)[-1]["exit"], self.jsonl(probe)[-1]["exit"]), (0, 0))
+
     def test_an_empty_schema_is_a_usage_error(self):
         """--schema "" switched the schema off without a word, and a value of
         spaces alone was looked for as a file named "   "."""
@@ -3767,6 +3819,9 @@ if _dir:
                        "71 a local resource the call needs could not be made",
                        "c-lean: cannot start the call: <what>: <reason>",
                        "c-lean then prints nothing more and exits 120, without a traceback",
+                       "A stderr closed from the start (`2>&-`) is not a stream that fails: its "
+                       "lines are dropped, the answer is printed, and the exit stays what c-lean "
+                       "decided",
                        "so do the record of --check",
                        "a prompt on stdin are read as UTF-8 too",
                        "The answer goes to stdout as UTF-8 whatever the encoding of stdout"):
@@ -3880,6 +3935,33 @@ if _dir:
         self.assertEqual(after, before, "every pipe end of the call must be closed")
         self.assertEqual(len(seen), 1)
         self.wait_for(lambda: not self.alive(seen[0]), secs=5, what="the child to be killed")
+        self.assertEqual(os.listdir(tmp), [])
+
+    def test_the_command_line_goes_to_popen_as_utf8_bytes(self):
+        """Under a locale that is not UTF-8 (C on Linux, with Python's coercion
+        and UTF-8 mode off) Popen encoded each argument in ASCII, the
+        filesystem encoding there, and "é" in a --schema ended in a
+        UnicodeEncodeError traceback. macOS never showed it: its filesystem
+        encoding is UTF-8."""
+        seen = []
+
+        def popen(args, **kw):
+            seen.append(args)
+            raise FileNotFoundError(2, "No such file or directory")
+        schema = '{"type": "object", "description": "é — Привет"}'
+        # what Python makes of bytes on its command line that the locale cannot decode
+        model = "haiku-\udcc3\udca9"
+        tmp = self.mktemp("c-lean-tmp-")
+        with mock.patch.dict(os.environ, child_env("single", self.state, self.env)), \
+                mock.patch.object(tempfile, "tempdir", tmp), \
+                mock.patch.object(B.subprocess, "Popen", popen):
+            r = B._call_claude("p", "S", model, "low", schema, 5)
+        self.assertEqual((r.exit, len(seen)), (69, 1), r.err)
+        self.assertEqual([a for a in seen[0] if not isinstance(a, bytes)], [],
+                         "every argument must reach Popen as bytes")
+        self.assertIn(schema.encode("utf-8"), seen[0], "text must go out as UTF-8")
+        self.assertIn(b"haiku-\xc3\xa9", seen[0],
+                      "an argument with surrogate escapes must go out as the bytes it came as")
         self.assertEqual(os.listdir(tmp), [])
 
 

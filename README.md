@@ -75,7 +75,7 @@ c-lean --check
 | 69 | the `claude` binary cannot be run |
 | 71 | a local resource the call needs could not be made: its working directory, the system-prompt file, the stdin pipe or the thread that writes the prompt |
 | 75 | the limit wall, not an ordinary failure |
-| 120 | stdout or stderr could no longer be written |
+| 120 | stdout or stderr could no longer be written. A stderr closed from the start (`2>&-`) is not a stream that fails: its lines are dropped, the answer is printed, and the exit stays what `c-lean` decided |
 | 124 | timeout, before `claude -p` printed its result |
 | 128+N | stopped by signal N (130, 143, 129), or 137 when `claude -p` died of SIGKILL |
 

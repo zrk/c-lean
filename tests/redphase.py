@@ -2232,7 +2232,55 @@ M += [('F1 a WARN on a stderr that cannot be written never raises',
   '    if not text.strip():\n',
   '    if False:\n',
   'test_an_empty_schema_file_is_a_usage_error',
-  'an empty --schema file must be a usage error')]
+  'an empty --schema file must be a usage error'),
+ ('E13 the command line goes to Popen as str',
+  'c_lean_core.py',
+  '                _argv_bytes(cmd), stdin=stdin_end,',
+  '                cmd, stdin=stdin_end,',
+  'test_the_command_line_goes_to_popen_as_utf8_bytes',
+  'every argument must reach Popen as bytes'),
+ ('E13 an argument with surrogate escapes loses its bytes',
+  'c_lean_core.py',
+  '    return [a.encode("utf-8", "surrogateescape") for a in cmd]',
+  '    return [a.encode("utf-8", "replace") for a in cmd]',
+  'test_the_command_line_goes_to_popen_as_utf8_bytes',
+  'an argument with surrogate escapes must go out as the bytes it came as'),
+ ('E14 a usage error is printed on a stderr that is None',
+  'c_lean_core.py',
+  '    if sys.stderr is not None:\n        print(line, file=sys.stderr)',
+  '    print(line, file=sys.stderr)',
+  'test_a_usage_error_with_stderr_closed_leaves_stdout_empty',
+  'a usage error must not reach stdout when stderr is closed'),
+ ('E14 an argparse error bypasses the helper',
+  'c-lean',
+  '        B.print_err(f"{B.TOOL_NAME}: %s" % message)\n',
+  '        print(f"{B.TOOL_NAME}: %s" % message, file=sys.stderr)\n',
+  'test_a_usage_error_with_stderr_closed_leaves_stdout_empty',
+  "args=['--no-such-flag', 'x']"),
+ ('E14 a WARN during the call is printed on a stderr that is None',
+  'c_lean_core.py',
+  '    if sys.stderr is None:\n        return  # closed from the start: see print_err\n',
+  '',
+  'test_a_warning_during_the_call_with_stderr_closed_keeps_the_answer',
+  'with stderr closed, stdout must hold the answer and nothing else'),
+ ('E15 a stderr closed from the start costs the answer',
+  'c-lean',
+  '        if err is not None and sys.stderr is not None:\n'
+  '            stream = sys.stderr\n',
+  '        if err is not None:\n'
+  '            stream = sys.stderr\n'
+  '            if stream is None:\n'
+  '                return False\n',
+  'test_a_good_call_with_stderr_closed_prints_the_answer',
+  'a stderr closed from the start must not cost the answer'),
+ ('E15 -h says nothing of a stderr closed from the start',
+  'c-lean',
+  '    A stderr closed from the start (`2>&-`) is not a stream that fails: its\n'
+  '    lines are dropped, the answer is printed, and the exit stays what @TOOL@\n'
+  '    decided.\n',
+  '',
+  'test_help_describes_check_and_the_exit_codes_of_the_error_paths',
+  'c-lean -h must say: A stderr closed from the start')]
 
 def apply(src, old, new):
     pairs = old if isinstance(old, tuple) else ((old, new),)

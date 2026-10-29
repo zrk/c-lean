@@ -732,12 +732,31 @@ def _too_long(binary, cmd, env, why) -> str:
                if name == ARG_SOURCES["--json-schema"] else ""))
 
 
+def _argv_bytes(cmd) -> list:
+    """The command line as UTF-8 bytes, whatever the filesystem encoding.
+
+    Under a locale that is not UTF-8 (C on Linux, with Python's coercion and
+    UTF-8 mode off) Popen encoded a str argument as ASCII, so "é" in a
+    --schema ended in a UnicodeEncodeError traceback. An argument that came
+    from our own command line holds its undecodable bytes as surrogate
+    escapes: they go out as the bytes they were."""
+    return [a.encode("utf-8", "surrogateescape") for a in cmd]
+
+
 def _nul_arg(cmd):
     """What holds a NUL character on the command line, or None when nothing does."""
     for i, a in enumerate(cmd):
         if "\0" in a:
             return _arg_name(cmd, i)
     return None
+
+
+def print_err(line) -> None:
+    """Print one line on stderr. A stderr closed from the start (`2>&-`) is
+    None, and print() to None writes to stdout, the channel of the answer:
+    the line is dropped then."""
+    if sys.stderr is not None:
+        print(line, file=sys.stderr)
 
 
 def _say_during_call(line) -> None:
@@ -749,6 +768,8 @@ def _say_during_call(line) -> None:
     run ended with exit 120 and no usage-log line. Such a line is lost, and the
     call is still judged and logged. A RuntimeError is a write that a signal
     handler started while the main thread was in the middle of one."""
+    if sys.stderr is None:
+        return  # closed from the start: see print_err
     try:
         print(line, file=sys.stderr)
     except (OSError, ValueError, RuntimeError):
@@ -1346,7 +1367,7 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
             # of its own shields it from those signals sent to the whole job.
             own_session = stop_signal_ignored()
             proc = subprocess.Popen(
-                cmd, stdin=stdin_end, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                _argv_bytes(cmd), stdin=stdin_end, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", errors="backslashreplace", cwd=workdir, env=env,
                 start_new_session=own_session,
             )

@@ -600,10 +600,12 @@ def main(argv=None) -> int:
         return B.EXIT_USAGE
 
     try:
+        # A FIFO given to --system-file or --schema can wait for its writer as
+        # long as one given to -f: a stop must end each of these reads at once.
         with B.reading_prompt():
             prompt = gather_prompt(args, parser)
-        system = gather_system(args)
-        schema = B.read_text_arg(args.schema) if args.schema else None
+            system = gather_system(args)
+            schema = B.read_text_arg(args.schema) if args.schema else None
     except B.PromptStopped:
         prompt, system, schema = "", None, None
     except B.BadArg as e:

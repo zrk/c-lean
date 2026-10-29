@@ -12,6 +12,7 @@ purpose (the rule "never trust a test you have not seen fail") — redphase.py
 replays those breakages on a throwaway copy.
 """
 import atexit
+import contextlib
 import hashlib
 import json
 import os
@@ -2760,6 +2761,163 @@ if _dir:
                          "pgrep failure must warn once per run")
         self.assertIn("pgrep exited 3", err.getvalue())
 
+    def test_a_tree_warning_on_a_stderr_that_cannot_be_written_never_raises(self):
+        """The WARN of a failed process listing is printed from the signal
+        handler (interrupt -> _kill_tree -> _descendants). On a stderr that can
+        no longer be written it raised out of the handler, and the run ended
+        with exit 120 and no usage-log line."""
+        read_end, write_end = os.pipe()
+        os.close(read_end)
+        # line-buffered like sys.stderr: the write itself meets EPIPE
+        no_reader = os.fdopen(write_end, "w", buffering=1)
+        closed = open(os.devnull, "w")
+        closed.close()
+
+        class Reentrant:
+            """A write that a signal handler starts in the middle of another one."""
+            def write(self, text):
+                raise RuntimeError("reentrant call inside <_io.BufferedWriter name='<stderr>'>")
+
+            def flush(self):
+                pass
+        try:
+            for name, stream in (("a pipe with no reader", no_reader), ("a closed file", closed),
+                                 ("a write under way", Reentrant())):
+                with self.subTest(stderr=name):
+                    proc = mock.Mock(pid=101, c_lean_own_session=False, c_lean_killed_at=None)
+                    with mock.patch.object(B.sys, "platform", "linux"), \
+                            mock.patch.object(B.os, "scandir",
+                                              side_effect=PermissionError("unreadable")), \
+                            mock.patch.object(B, "_TREE_WARNED", False), \
+                            mock.patch.object(B.sys, "stderr", stream):
+                        try:
+                            B._kill_tree(proc)
+                        except (OSError, ValueError, RuntimeError) as e:
+                            self.fail("a WARN on a stderr that cannot be written must not raise "
+                                      "(%s): %r" % (name, e))
+                    self.assertEqual(proc.kill.call_count, 1,
+                                     "the child must be killed whatever stderr does")
+        finally:
+            try:
+                no_reader.close()
+            except OSError:
+                pass
+
+    def proc_listing(self, stats):
+        """A /proc of these (name, bytes of stat) entries, listed in this order;
+        bytes None is an entry whose stat cannot be opened (a directory)."""
+        procdir = self.mktemp("c-lean-proc-")
+        for name, data in stats:
+            os.mkdir(os.path.join(procdir, name))
+            if data is None:
+                os.mkdir(os.path.join(procdir, name, "stat"))
+            else:
+                with open(os.path.join(procdir, name, "stat"), "wb") as f:
+                    f.write(data)
+        found = {e.name: e for e in os.scandir(procdir)}
+        entries = [found[name] for name, _data in stats]
+        return lambda path: contextlib.nullcontext(entries)
+
+    def test_a_proc_entry_that_cannot_be_read_costs_that_entry_alone(self):
+        """A process that exits between open() and read() of its stat gives an
+        empty or cut read. That raised IndexError, which the per-entry handler
+        did not catch: a WARN for a listing that worked, and every entry after
+        it was lost, so their processes were not killed."""
+        listing = self.proc_listing([
+            ("999", b""),                       # exited before the read
+            ("998", b"998 (cut sh"),            # cut inside comm
+            ("997", b"997 (x) S"),              # cut before ppid
+            ("996", b"996 (x) S nan 0 0\n"),    # no number where ppid stands
+            ("995", None),                      # stat cannot be opened
+            ("101", b"101 (fake) S 1 0 0\n"),
+            ("102", b"102 (sleep) S 101 0 0\n")])
+        import io
+        err = io.StringIO()
+        with mock.patch.object(B.sys, "platform", "linux"), \
+                mock.patch.object(B.os, "scandir", listing), \
+                mock.patch.object(B, "_TREE_WARNED", False), \
+                mock.patch.object(B.sys, "stderr", err):
+            found = B._descendants(101)
+        self.assertEqual(found, [102], "an entry of /proc that cannot be read must cost that "
+                         "entry alone, not the rest of the snapshot")
+        self.assertEqual(err.getvalue(), "", "a /proc that could be listed needs no WARN")
+
+    def test_a_proc_stat_in_no_encoding_is_still_parsed(self):
+        """comm holds whatever bytes a process set. The stat file was read in
+        the encoding of the locale: one such process anywhere on the machine
+        raised UnicodeDecodeError, every snapshot got a WARN and lost the
+        entries after it. Here the locale is UTF-8 for those reads, and the
+        processes under the call have such names too: skipping them would lose
+        their children."""
+        listing = self.proc_listing([
+            ("100", b"100 (caf\xe9) S 1 0 0\n"),          # elsewhere on the machine
+            ("101", b"101 (fake) S 1 0 0\n"),
+            ("102", b"102 (\xff\xfe) x)) S 101 0 0\n"),   # under the call
+            ("103", b"103 (sleep) S 102 0 0\n")])
+        real_open = open
+
+        def utf8_locale(path, mode="r", *args, **kw):
+            if "b" not in mode:
+                kw.setdefault("encoding", "utf-8")
+            return real_open(path, mode, *args, **kw)
+        import io
+        err = io.StringIO()
+        with mock.patch.object(B.sys, "platform", "linux"), \
+                mock.patch.object(B.os, "scandir", listing), \
+                mock.patch.object(B, "open", utf8_locale, create=True), \
+                mock.patch.object(B, "_TREE_WARNED", False), \
+                mock.patch.object(B.sys, "stderr", err):
+            found = B._descendants(101)
+        self.assertEqual(found, [102, 103], "a stat whose comm is in no encoding must still give "
+                         "its ppid")
+        self.assertEqual(err.getvalue(), "", "a /proc that could be listed needs no WARN")
+
+    def pgrep_walk(self, failing):
+        """_descendants(101) off /proc, over the tree 101 -> 102, 103 and
+        103 -> 104, with pgrep -P 102 ending in `failing`: (found, parents
+        asked, what was printed on stderr)."""
+        tree = {"101": "102\n103\n", "102": "", "103": "104\n", "104": ""}
+        asked = []
+
+        def run_pgrep(cmd, **kw):
+            asked.append(cmd[2])
+            if cmd[2] == "102":
+                if isinstance(failing, BaseException):
+                    raise failing
+                return subprocess.CompletedProcess(cmd, failing, "", "")
+            out = tree[cmd[2]]
+            return subprocess.CompletedProcess(cmd, 0 if out else 1, out, "")
+        import io
+        err = io.StringIO()
+        with mock.patch.object(B.sys, "platform", "darwin"), \
+                mock.patch.object(B.shutil, "which", return_value="/usr/bin/pgrep"), \
+                mock.patch.object(B.subprocess, "run", run_pgrep), \
+                mock.patch.object(B, "_TREE_WARNED", False), \
+                mock.patch.object(B.sys, "stderr", err):
+            found = B._descendants(101)
+        return found, asked, err.getvalue()
+
+    def test_one_failed_pgrep_costs_the_subtree_of_its_parent_alone(self):
+        """One pgrep -P that failed ended the whole walk: the subtrees of the
+        parents still in the queue were never asked for and were left alive."""
+        for name, failing in (("exit 3", 3), ("a signal", -9),
+                              ("an OSError", OSError("Resource temporarily unavailable"))):
+            with self.subTest(failure=name):
+                found, asked, err = self.pgrep_walk(failing)
+                self.assertEqual(found, [102, 103, 104], "a failed pgrep for one parent must "
+                                 "not cost the subtrees of the parents after it")
+                self.assertEqual(asked, ["101", "102", "103", "104"])
+                self.assertEqual(err.count("WARN could not list the processes of the call"), 1,
+                                 "a failed pgrep must warn once per run")
+
+    def test_a_pgrep_that_times_out_ends_the_walk_with_what_was_found(self):
+        """Each pgrep may take up to its timeout: after one that ran out, the
+        walk stops, so that one kill waits for at most one timeout."""
+        found, asked, err = self.pgrep_walk(subprocess.TimeoutExpired(["pgrep"], 5))
+        self.assertEqual(asked, ["101", "102"], "after a pgrep that timed out no other may run")
+        self.assertEqual(found, [102, 103], "what was found before the timeout must be kept")
+        self.assertEqual(err.count("WARN could not list the processes of the call"), 1)
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc discovery")
     def test_linux_timeout_kills_the_tree_without_pgrep(self):
         bindir = self.mktemp("c-lean-no-pgrep-")
@@ -2899,8 +3057,43 @@ if _dir:
             self.assertEqual((proc.returncode, out), (0, "ECHO:hello\n"),
                              "a good result before a stop must stand: " + err)
             self.assertIn("came after the answer", err, "a stop after the answer needs a WARN")
+            self.assertIn("the call was killed with its process tree", err,
+                          "a CLI that c-lean killed after its answer must be said to be killed")
             self.assertNotIn("INTERRUPTED", err)
             self.assertFalse(self.jsonl(self.log)[-1]["tokens_unknown"])
+
+    def site(self, body):
+        """A directory for PYTHONPATH: its sitecustomize.py imports the core
+        under test as B, then runs `body` in the process of c-lean."""
+        site = self.mktemp("c-lean-site-")
+        with open(os.path.join(site, "sitecustomize.py"), "w") as f:
+            f.write("import os, signal, sys\nsys.path.insert(0, %r)\nimport c_lean_core as B\n%s"
+                    % (BIN, body))
+        return site
+
+    def test_a_stop_after_the_cli_exited_does_not_say_it_was_killed(self):
+        """A stop after a good `result` lets the answer stand. Its WARN said
+        that the call was killed with its process tree even when the CLI had
+        exited by itself and nothing was killed. Here the stop comes right
+        after the read loop, from a CLI that exited by itself."""
+        site = self.site("real = B._communicate\n"
+                         "def read_then_stop(proc, timeout):\n"
+                         "    got = real(proc, timeout)\n"
+                         "    os.kill(os.getpid(), int(os.environ['STOP_WITH']))\n"
+                         "    return got\n"
+                         "B._communicate = read_then_stop\n")
+        for sig in STOP_SIGNALS:
+            with self.subTest(signal=sig):
+                env = child_env("single", self.state,
+                                dict(self.env, PYTHONPATH=site, STOP_WITH=str(int(sig))))
+                p = subprocess.run([sys.executable, CLI, "-m", "haiku", "hello"], env=env,
+                                   capture_output=True, text=True, timeout=60,
+                                   preexec_fn=default_sighup)
+                self.assertEqual((p.returncode, p.stdout), (0, "ECHO:hello\n"), p.stderr)
+                self.assertEqual(self.warns(p), ["c-lean: WARN the stop (signal %d) came after the "
+                                                 "answer, and the answer stands" % sig],
+                                 "a stop after a CLI that exited by itself must not say that "
+                                 "the call was killed")
 
     def test_a_stop_interrupts_prompt_reads_without_eof(self):
         # Mark handler installation; stdin is kept open throughout communicate().
@@ -2957,6 +3150,47 @@ if _dir:
                     rec = self.jsonl(self.log)[-1]
                     self.assertEqual((rec["exit"], rec["interrupted"]), (128 + sig, True))
                     self.assertEqual(self.calls(), 0)
+
+    def test_a_stop_ends_a_read_of_the_system_file_or_the_schema(self):
+        """--system-file and --schema were read after the prompt, outside the
+        reads that a stop ends at once. A stop while c-lean waited on a FIFO
+        given to either (`--system-file <(slow command)`) was recorded, and the
+        read went on: with no writer c-lean waited until SIGKILL."""
+        site = self.site("real = B.install_signal_handlers\n"
+                         "def install():\n"
+                         "    real()\n"
+                         "    open(os.environ['PROMPT_READY'], 'w').close()\n"
+                         "B.install_signal_handlers = install\n")
+        for flag in ("--system-file", "--schema"):
+            with self.subTest(flag=flag):
+                fifo, ready = self.path("fifo" + flag), self.path("ready" + flag)
+                os.mkfifo(fifo)  # nobody ever writes it
+                env = child_env("ok", self.state, dict(self.env, PYTHONPATH=site, PROMPT_READY=ready))
+                proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", flag, fifo, "hello"],
+                                        env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True, preexec_fn=default_sighup)
+                try:
+                    self.wait_for(lambda: os.path.exists(ready), what="the signal handlers")
+                    # the prompt is an argument: c-lean now waits on the FIFO
+                    time.sleep(0.3)
+                    os.kill(proc.pid, signal.SIGINT)
+                    try:
+                        out, err = proc.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self.fail("a stop must end a read of %s on a FIFO with no writer at once"
+                                  % flag)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate()
+                self.assertEqual(proc.returncode, 130, "a stop during the read of %s must exit "
+                                 "128+signal: %s" % (flag, err))
+                self.assertIn("stopped before the call (signal 2)", err)
+                self.assertNotIn("Traceback", err)
+                self.assertEqual(out, "")
+                rec = self.jsonl(self.log)[-1]
+                self.assertEqual((rec["exit"], rec["interrupted"]), (130, True))
+                self.assertEqual(self.calls(), 0)
 
     def pipeholder(self, ending, sig=None, timeout="40", rc=0):
         env = child_env("pipeholder", self.state,
@@ -3022,6 +3256,133 @@ if _dir:
         self.assertLess(took, 2 + B.KILL_DRAIN + 2, "a timeout must drain for at most KILL_DRAIN")
         self.assertEqual(p.returncode, 124, p.stderr)
         self.assertIn("its output open after 3s; it may still run", p.stderr)
+
+    def kill_recorded(self):
+        """Kill every process the fake recorded that is still alive."""
+        pids = []
+        for name in ("hang.pids", "pids.log", "orphan.pid"):
+            path = os.path.join(self.state, name)
+            if os.path.exists(path):
+                with open(path) as f:
+                    pids += f.read().split()
+        for pid in pids:
+            if self.alive(pid):
+                os.kill(int(pid), signal.SIGKILL)
+
+    def broken_stderr(self):
+        """The write end of a pipe whose reader has exited: every write meets EPIPE."""
+        read_end, write_end = os.pipe()
+        os.close(read_end)
+        return write_end
+
+    def test_the_drain_warning_on_a_broken_stderr_keeps_the_usage_line(self):
+        """The WARN about a process that still holds the output after a kill
+        is printed while the call runs. On a stderr that could no longer be
+        written it raised out of the read loop: exit 120 and no usage-log
+        line, where -h says that line still gives the exit code c-lean decided."""
+        env = child_env("pipeholder", self.state, dict(self.env, C_LEAN_FAKE_HOLDER_END="hang"))
+        stderr = self.broken_stderr()
+        try:
+            subprocess.run([sys.executable, CLI, "-m", "haiku", "--timeout", "2", "hello"],
+                           env=env, stdout=subprocess.PIPE, stderr=stderr, text=True, timeout=60,
+                           preexec_fn=default_sighup)
+        finally:
+            os.close(stderr)
+            self.kill_recorded()
+        self.assertTrue(os.path.exists(os.path.join(self.state, "orphan.pid")),
+                        "the orphan must have held the output through the drain")
+        self.assertEqual([r["exit"] for r in self.jsonl(self.log)], [124],
+                         "the drain WARN on a broken stderr must not cost the usage-log line")
+
+    def test_a_stop_whose_tree_warning_cannot_be_written_keeps_the_usage_line(self):
+        """A stop kills the call from the signal handler, and a process listing
+        that fails prints its WARN from there. On a stderr that could no longer
+        be written that WARN raised out of the handler: exit 120 and no
+        usage-log line. Here the listing is made to fail by the test."""
+        site = self.site("real = B._descendants\n"
+                         "def failing(pid):\n"
+                         "    B._tree_warning('made to fail by the test')\n"
+                         "    return real(pid)\n"
+                         "B._descendants = failing\n")
+        env = child_env("hang", self.state, dict(self.env, PYTHONPATH=site))
+        stderr = self.broken_stderr()
+        proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--timeout", "60", "hello"],
+                                env=env, stdout=subprocess.PIPE, stderr=stderr, text=True,
+                                preexec_fn=default_sighup)
+        os.close(stderr)
+        try:
+            self.wait_for(lambda: os.path.exists(os.path.join(self.state, "hang.pids")),
+                          what="the call")
+            os.kill(proc.pid, signal.SIGTERM)
+            proc.communicate(timeout=20)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+            self.kill_recorded()
+        self.assertEqual([(r["exit"], r["interrupted"]) for r in self.jsonl(self.log)],
+                         [(143, True)], "the tree WARN on a broken stderr must not cost the "
+                         "usage-log line of the stop")
+
+    def test_a_stop_during_the_drain_after_a_kill_keeps_no_warn_of_that_kill(self):
+        """A stop that lands while c-lean drains the output after a kill of its
+        own ends the call with 128+N, INTERRUPTED. The WARN of that kill stayed
+        and said what was no longer true: that the call was judged by its
+        `result` event (after a timeout with no `result` at all), or by what
+        the CLI printed and its own exit code. Here the stop is sent right
+        after the first kill of the call, i.e. at the start of its drain."""
+        site = self.site("real = B._kill_tree\n"
+                         "def kill_then_stop(proc):\n"
+                         "    real(proc)\n"
+                         "    if not B.interrupted():\n"
+                         "        os.kill(os.getpid(), signal.SIGTERM)\n"
+                         "B._kill_tree = kill_then_stop\n")
+        script = self.path("error-then-no-exit.json")
+        with open(script, "w") as f:
+            json.dump({"events": [ev_result("", is_error=True, subtype="error_during_execution")],
+                       "end": "hang"}, f)
+        for reason, mode, args, extra in (
+                ("timeout", "hang", ["--timeout", "1"], {}),
+                ("result", "script", [], {"C_LEAN_FAKE_SCRIPT": script}),
+                ("pipes", "pipeholder", [], {"C_LEAN_FAKE_HOLDER_END": "exit"})):
+            with self.subTest(kill=reason):
+                self.state = self.mktemp("c-lean-drain-stop-")
+                env = child_env(mode, self.state, dict(self.env, PYTHONPATH=site, **extra))
+                try:
+                    p = subprocess.run([sys.executable, CLI, "-m", "haiku"] + args + ["hello"],
+                                       env=env, capture_output=True, text=True, timeout=60,
+                                       preexec_fn=default_sighup)
+                finally:
+                    self.kill_recorded()
+                self.assertEqual(p.returncode, 143, p.stderr)
+                self.assertIn("c-lean: stopped — call stopped by signal 15", p.stderr)
+                self.assertEqual([w for w in self.warns(p) if "judged by" in w], [],
+                                 "a stop after a %s kill must leave no WARN of that kill: %s"
+                                 % (reason, p.stderr[-600:]))
+
+    def test_open_pipes_after_a_death_by_signal_still_warn(self):
+        """The CLI died of a signal that c-lean did not catch (SIGTERM to the
+        CLI alone), and a process it started still held its output. After the
+        exit grace its tree was killed and drained, exit 143, but no WARN said
+        so: the return for a death by signal dropped the line every other
+        return keeps."""
+        proc = self.start_call([CLI, "-m", "haiku", "--timeout", "40", "hello"], "sleeper")
+        try:
+            self.wait_for(lambda: self.sleeper_pids(), what="the CLI and its child")
+            os.kill(int(self.sleeper_pids()[0][0]), signal.SIGTERM)
+            out, err = proc.communicate(timeout=B.RESULT_GRACE + B.KILL_DRAIN + 10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+            self.kill_leftovers()
+        self.assertEqual((proc.returncode, out), (143, ""), err)
+        self.assertIn("c-lean: stopped — call killed by signal 15", err)
+        self.assertIn("c-lean: WARN the claude CLI exited but a process it started still held "
+                      "its output open %ss later: its process tree was killed, and the call is "
+                      "judged by what it printed and its own exit code"
+                      % B.seconds_shown(B.RESULT_GRACE), err.splitlines(),
+                      "open pipes after a death by signal must still get their WARN")
 
     def test_a_result_without_a_newline_starts_the_exit_grace(self):
         t0 = time.monotonic()

@@ -555,7 +555,8 @@ def stop_signal_ignored() -> bool:
 
 
 class PromptStopped(Exception):
-    """A stop interrupted a prompt read, including opening a FIFO."""
+    """A stop interrupted a read of the prompt, --system-file or --schema,
+    including opening a FIFO."""
 
 
 @contextmanager
@@ -732,12 +733,26 @@ def _nul_arg(cmd):
     return None
 
 
+def _say_during_call(line) -> None:
+    """Print one line on stderr while a call runs or from a signal handler.
+
+    A stderr that can no longer be written (a pipe whose reader has exited, a
+    closed stream) raised out of the read loop or the signal handler, and the
+    run ended with exit 120 and no usage-log line. Such a line is lost, and the
+    call is still judged and logged. A RuntimeError is a write that a signal
+    handler started while the main thread was in the middle of one."""
+    try:
+        print(line, file=sys.stderr)
+    except (OSError, ValueError, RuntimeError):
+        pass
+
+
 def _tree_warning(reason) -> None:
     global _TREE_WARNED
     if not _TREE_WARNED:
         _TREE_WARNED = True
-        print(f"{TOOL_NAME}: WARN could not list the processes of the call "
-              "(%s); some may still run" % reason, file=sys.stderr)
+        _say_during_call(f"{TOOL_NAME}: WARN could not list the processes of the call "
+                         "(%s); some may still run" % reason)
 
 
 def _descendants(pid: int) -> list:
@@ -750,14 +765,17 @@ def _descendants(pid: int) -> list:
                     if not entry.name.isdigit():
                         continue
                     try:
-                        with open(entry.path + "/stat") as f:
+                        # Bytes: comm is whatever the process set, in no encoding.
+                        with open(entry.path + "/stat", "rb") as f:
                             # comm can contain spaces and parentheses. After its
                             # LAST ')' come state and ppid, in that order.
-                            parent = int(f.read().rsplit(")", 1)[1].split()[1])
+                            parent = int(f.read().rsplit(b")", 1)[1].split()[1])
                         children.setdefault(parent, []).append(int(entry.name))
-                    except (FileNotFoundError, ProcessLookupError):
-                        continue  # exited during the snapshot
-        except (OSError, ValueError, IndexError) as e:
+                    except (OSError, ValueError, IndexError):
+                        # exited during the snapshot (a read can then come back
+                        # empty or cut short), or not readable: this entry only
+                        continue
+        except OSError as e:
             _tree_warning("/proc: %s" % e)
     found, todo, seen = [], [pid], {pid}
     pgrep = None if sys.platform.startswith("linux") else (
@@ -771,9 +789,13 @@ def _descendants(pid: int) -> list:
                 if out.returncode >= 2 or out.returncode < 0:
                     raise OSError("pgrep exited %d" % out.returncode)
                 kids = [int(t) for t in out.stdout.split() if t.isdigit()]
-            except (OSError, subprocess.SubprocessError) as e:
+            except subprocess.TimeoutExpired as e:
+                # what was found is kept: one kill waits for at most one timeout
                 _tree_warning(str(e))
                 break
+            except (OSError, subprocess.SubprocessError) as e:
+                _tree_warning(str(e))
+                continue  # the parents after this one in the queue are still asked
         for kid in kids:
             if kid not in seen:
                 seen.add(kid)
@@ -1232,9 +1254,9 @@ def _communicate(proc, timeout):
                     deadline = killed_at + KILL_DRAIN
                     if now >= deadline:
                         if selector.get_map():
-                            print(f"{TOOL_NAME}: WARN a process started by the call still held "
-                                  "its output open after %ss; it may still run"
-                                  % seconds_shown(KILL_DRAIN), file=sys.stderr)
+                            _say_during_call(f"{TOOL_NAME}: WARN a process started by the call "
+                                             "still held its output open after %ss; it may "
+                                             "still run" % seconds_shown(KILL_DRAIN))
                         break
                 else:
                     deadlines = [end]
@@ -1386,14 +1408,24 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
     good_result = isinstance(stream.doc, dict) and not stream.doc.get("is_error")
     if caught and good_result:
         rc = 0
-        linger = ("the stop (signal %d) came after the answer: the call was killed with its "
-                  "process tree, and the call is judged by its `result` event" % caught)
+        # c-lean killed the CLI only when the CLI died of the SIGKILL of a kill
+        # made in this call. One that had exited by itself keeps its own code:
+        # a stop that came later killed nothing.
+        killed = (getattr(proc, "c_lean_killed_at", None) is not None
+                  and proc.returncode == -signal.SIGKILL)
+        if killed:
+            linger = ("the stop (signal %d) came after the answer: the call was killed with its "
+                      "process tree, and the call is judged by its `result` event" % caught)
+        else:
+            linger = "the stop (signal %d) came after the answer, and the answer stands" % caught
     if caught and not good_result:
+        # The stop line alone says what happened: a WARN of the kill before
+        # the stop would say the call is judged by something it is not.
         return Result(ok=False, exit=SIGNAL_EXIT_BASE + caught, text="", wall=False, raw=None,
                       err="call stopped by signal %d" % caught, secs=secs, interrupted=True,
                       why="the call was stopped by signal %d" % caught, blocks=blocks,
                       continued=stream.continued, went_on=stream.joined_after(),
-                      tokens_unknown=True, linger=linger)
+                      tokens_unknown=True)
 
     if rc is not None and rc < 0:
         # Killed by a signal — our own stop, or the Ctrl-C that reached the whole
@@ -1402,7 +1434,7 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
         # have spent tokens by then, and no document says how many.
         return Result(ok=False, exit=SIGNAL_EXIT_BASE - rc, text="", wall=False, raw=None,
                       err="call killed by signal %d" % (-rc), secs=secs, interrupted=True,
-                      why="the call was killed by signal %d" % (-rc), blocks=blocks,
+                      why="the call was killed by signal %d" % (-rc), blocks=blocks, linger=linger,
                       continued=stream.continued, went_on=stream.joined_after(),
                       tokens_unknown=True)
 

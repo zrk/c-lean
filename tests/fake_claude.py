@@ -15,7 +15,8 @@ env.json. received.jsonl has one line per run for what the fake was given: the
 argv, where the prompt came from, the system prompt (length and sha256), and
 the mode bits and directory of the --system-prompt-file file (see note).
 C_LEAN_FAKE_SCRIPT supplies exact events and optional stderr, tail_hex and
-end (exit, hang or kill). C_LEAN_FAKE_SLEEP controls signal scenarios;
+end (exit, hang or kill). The `linger` mode prints a whole answer and then
+does not exit, with a child of its own. C_LEAN_FAKE_SLEEP controls signal scenarios;
 C_LEAN_FAKE_RC and C_LEAN_FAKE_WALL_RC control selected exit codes.
 C_LEAN_FAKE_ASSERT_ENV refuses leaked credentials or an unexpected output cap.
 C_LEAN_FAKE_UNKNOWN="--a,--b" names flags this run does not know, as an older
@@ -513,7 +514,11 @@ def main():
     if MODE == "usageinout":
         return emit("OK", usage_doc={"input_tokens": 575, "output_tokens": 3})
 
-    if MODE == "hang":
+    if MODE in ("hang", "linger"):
+        if MODE == "linger":
+            # the whole answer, `result` included, and then no exit
+            emit("ECHO:" + prompt.strip()[:200])
+            sys.stdout.flush()
         kid = subprocess.Popen(["/bin/sleep", "45"])
         with open(os.path.join(STATE, "hang.pids"), "w") as f:
             f.write("%d %d\n" % (os.getpid(), kid.pid))

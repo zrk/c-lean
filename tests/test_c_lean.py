@@ -2042,8 +2042,8 @@ if _dir:
         def boom(proc, *a, **kw):
             if FAKE not in (proc.args if isinstance(proc.args, (list, tuple)) else [proc.args]):
                 return real(proc, *a, **kw)  # pgrep and the like are not the call
-            # the prompt comes on stdin: the fake starts its work once stdin ends
-            proc.stdin.close()
+            # the prompt comes on stdin from a thread of the tool, which closes
+            # it: the fake starts its work once stdin ends
             path = os.path.join(self.state, "hang.pids")
             self.wait_for(lambda: os.path.exists(path) and len(open(path).read().split()) == 2,
                           what="the fake to start its grandchild")
@@ -2511,6 +2511,204 @@ if _dir:
                              "the fake must refuse %r as the CLI does" % argv)
         p = fake("-p", "--version", "--model", "haiku")
         self.assertEqual((p.returncode, p.stdout), (0, "0.0.0-fake (Claude Code)\n"))
+
+    # --- the accounting: nothing in a usage document fails the call, a total
+    # is exact only when every count in it is, and the trailer and the usage
+    # log give the exit code of the process
+    def trailer_line(self, p):
+        lines = [l for l in p.stderr.splitlines() if l.startswith("[c-lean")]
+        self.assertEqual(len(lines), 1, "one trailer is wanted: %r" % p.stderr[-300:])
+        return lines[0]
+
+    def trailer_exit(self, p):
+        return int(re.search(r" · exit (\d+)", self.trailer_line(p)).group(1))
+
+    def test_a_usage_document_that_holds_no_counts_cannot_fail_the_call(self):
+        """`iterations` that was not a list raised a TypeError, and a count of
+        1e999 (infinity) an OverflowError: exit 1, and the answer that had
+        come was lost, with no usage-log line and no file. A value that is not
+        a JSON integer of 0 or more is no count: the total is NOT COUNTED, and
+        the answer is printed and its text saved as for any other call."""
+        inf = "INFINITE-COUNT"  # written as 1e999 in the stream: JSON has no infinity
+        shapes = [{"iterations": 5}, {"iterations": "many"},
+                  {"iterations": {"input_tokens": 5, "output_tokens": 7}}, {"iterations": [5, None]},
+                  {"input_tokens": inf, "output_tokens": 7}, {"input_tokens": 5, "output_tokens": True},
+                  {"input_tokens": -5, "output_tokens": 7}, {"input_tokens": 5.5, "output_tokens": 7},
+                  {"input_tokens": "5", "output_tokens": 7},
+                  {"input_tokens": 5, "output_tokens": 7, "cache_read_input_tokens": inf},
+                  {"input_tokens": 5, "output_tokens": 7, "cache_creation_input_tokens": -1},
+                  {"input_tokens": 5, "output_tokens": 7,
+                   "output_tokens_details": {"reasoning_tokens": inf}},
+                  {"iterations": [{"input_tokens": inf, "output_tokens": 7}]}]
+        for n, usage in enumerate(shapes, 1):
+            shutil.rmtree(self.partial, ignore_errors=True)
+            line = json.dumps(ev_result("FINAL two", usage=usage)).replace('"%s"' % inf, "1e999")
+            # two messages with nothing between them are not joined: a file is saved
+            p = self.script([ev_text("1", "DRAFT one"), ev_text("2", "FINAL two"), line])
+            what = "usage %s: %s" % (json.dumps(usage), p.stderr[-300:])
+            self.assertNotIn("Traceback", p.stderr, "a usage document must not fail the call: " + what)
+            self.assertEqual((p.returncode, p.stdout), (0, "FINAL two\n"), what)
+            self.assertIn("NOT COUNTED", self.trailer_line(p), "the trailer must say NOT COUNTED: "
+                          + what)
+            recs = self.jsonl(self.log)
+            self.assertEqual(len(recs), n, "every call must leave its usage-log line: " + what)
+            self.assertEqual((recs[-1]["exit"], recs[-1]["tokens_unknown"]), (0, True), what)
+            for k in ("in", "cw", "cr", "out", "think"):
+                v = recs[-1][k]
+                self.assertTrue(type(v) is int and v >= 0, "%s must be a count: %r, %s" % (k, v, what))
+            self.assertEqual(self.saved_blocks(), [["DRAFT one", "FINAL two"]],
+                             "the text blocks must be saved as for any other answer: " + what)
+
+    def test_a_total_over_messages_that_lack_a_counter_is_not_exact(self):
+        """With no flat totals the counts are summed over `iterations`. When
+        some entries lacked a counter, the others were summed and the sum was
+        logged as exact. It is a lower bound: NOT COUNTED. A counter that no
+        entry has is no gap (nothing was cached), and the sum stays exact."""
+        both = {"input_tokens": 100, "output_tokens": 20}
+        for entries, want, unknown in (
+                ([both, {"input_tokens": 200}], (300, 20), True),
+                ([both, {"output_tokens": 30}], (100, 50), True),
+                ([dict(both, cache_read_input_tokens=50), both], (200, 40), True),
+                ([dict(both, output_tokens_details={"reasoning_tokens": 5}), both], (200, 40), True),
+                ([both, "an entry that is not a dict"], (100, 20), True),
+                ([both, {"input_tokens": 200, "output_tokens": 30}], (300, 50), False)):
+            p = self.script([ev_text("1", "ans"), ev_result("ans", usage={"iterations": entries})])
+            what = "iterations %s: %s" % (json.dumps(entries), p.stderr[-300:])
+            self.assertEqual((p.returncode, p.stdout), (0, "ans\n"), what)
+            rec = self.jsonl(self.log)[-1]
+            self.assertEqual((rec["in"], rec["out"]), want, what)
+            self.assertEqual(rec["tokens_unknown"], unknown, "a sum over messages that do not all "
+                             "have the counter is a lower bound, not an exact total: " + what)
+            self.assertEqual("NOT COUNTED" in self.trailer_line(p), unknown, what)
+
+    def test_a_call_killed_by_a_signal_is_not_counted(self):
+        """A call that died of a signal was logged as an exact zero, though the
+        model may have spent tokens by then and no document says how many."""
+        p = self.call("sigdeath")
+        self.assertEqual(p.returncode, 137, p.stderr)
+        trailer = self.trailer_line(p)
+        self.assertIn("INTERRUPTED", trailer)
+        self.assertIn("NOT COUNTED", trailer, "the trailer of a call killed by a signal must say "
+                      "NOT COUNTED: %s" % trailer)
+        rec = self.jsonl(self.log)[0]
+        self.assertEqual((rec["exit"], rec["interrupted"], rec["tokens_unknown"]), (137, True, True),
+                         "a call killed by a signal must not be logged as an exact zero")
+
+    def test_the_trailer_and_the_log_give_the_exit_of_the_process(self):
+        """An empty answer, and no structured_output under --schema, are
+        decided after the call: the process exited 1 while the trailer and
+        the usage-log line said exit 0."""
+        for mode, args, want in (("emptysingle", (), 1), ("emptysingle", ("--json",), 1),
+                                 ("single", ("--schema", self.SCHEMA), 1),
+                                 ("emptysingle", ("--allow-empty",), 0), ("single", (), 0)):
+            p = self.call(mode, *args)
+            what = "%s %s: %s" % (mode, " ".join(args), p.stderr[-300:])
+            self.assertEqual(p.returncode, want, what)
+            self.assertEqual((self.trailer_exit(p), self.jsonl(self.log)[-1]["exit"]), (want, want),
+                             "the trailer and the usage log must give the exit code of the "
+                             "process: " + what)
+
+    def test_check_gives_its_own_exit_in_the_trailer_and_the_log(self):
+        """--check fails a probe whose call went through (counters that cannot
+        be read, an empty answer) with exit 1: the trailer and the usage-log
+        line said exit 0."""
+        for mode, want in (("usagenone", 1), ("emptysingle", 1), ("usageinout", 0)):
+            p = run([CLI, "--check"], mode=mode, state=self.state, extra_env=self.env)
+            what = "%s: %s" % (mode, p.stderr[-300:])
+            self.assertEqual(p.returncode, want, what)
+            rec = self.jsonl(self.log)[-1]
+            self.assertEqual((self.trailer_exit(p), rec["exit"], rec["tool"]),
+                             (want, want, "c-lean --check"), "the trailer and the usage log of "
+                             "--check must give the exit code of the process: " + what)
+
+    # --- a CLI that does not exit after its `result` event
+    def lingered(self, how):
+        return ("c-lean: WARN the claude CLI printed its `result` event and had not exited %s: it "
+                "was killed with its process tree, and the call is judged by that event" % how)
+
+    def test_a_cli_that_does_not_exit_after_its_result_still_gives_the_answer(self):
+        """The CLI printed its whole `result` event and then did not exit: the
+        call ran into the timeout, exit 124, NOT COUNTED, and the answer that
+        had come was lost. Now the CLI has RESULT_GRACE seconds to exit; then
+        it is killed with its process tree, one WARN says so, and the call is
+        judged by that event as if the CLI had exited."""
+        t0 = time.monotonic()
+        p = self.call("linger", "--timeout", "40")
+        took = time.monotonic() - t0
+        pids = os.path.join(self.state, "hang.pids")
+        pids = open(pids).read().split() if os.path.exists(pids) else []
+        try:
+            self.wait_for(lambda: not any(self.alive(pid) for pid in pids), secs=10,
+                          what="the CLI and its child to be killed")
+        finally:
+            for pid in pids:
+                if self.alive(pid):
+                    os.kill(int(pid), signal.SIGKILL)
+        self.assertEqual((p.returncode, p.stdout), (0, "ECHO:hello\n"), "the answer of a CLI that "
+                         "did not exit after its `result` must be printed: %s" % p.stderr[-300:])
+        self.assertLess(took, 25, "the CLI must have %ss to exit after its `result`, not the whole "
+                        "timeout: the call took %.1fs" % (B.RESULT_GRACE, took))
+        self.assertEqual(self.warns(p), [self.lingered("%ss later" % B.RESULT_GRACE)],
+                         "one WARN must say that the CLI was killed after its `result`")
+        rec = self.jsonl(self.log)[0]
+        self.assertEqual((rec["exit"], rec["tokens_unknown"], rec["in"], rec["out"]),
+                         (0, False, 575, 40), "the call is judged by its `result` event")
+        self.assertNotIn("NOT COUNTED", self.trailer_line(p))
+
+    def test_a_timeout_after_the_result_event_still_gives_the_answer(self):
+        """The timeout ran out after the CLI had printed its whole `result`
+        event, before the CLI's time to exit was up. The answer is in hand:
+        the call is judged by that event, not reported as exit 124."""
+        p = self.script([ev_text("1", "ans"), ev_result("ans")], "--timeout", "3", end="hang")
+        self.assertEqual((p.returncode, p.stdout), (0, "ans\n"), "a call whose `result` event had "
+                         "come must not be lost to the timeout: %s" % p.stderr[-300:])
+        self.assertEqual(self.warns(p), [self.lingered("when the timeout of 3s ran out")])
+        self.assertNotIn("timeout after", p.stderr)
+        rec = self.jsonl(self.log)[0]
+        self.assertEqual((rec["exit"], rec["tokens_unknown"], rec["in"], rec["out"]), (0, False, 5, 7))
+
+    def test_the_pipes_of_the_child_are_utf8_whatever_the_locale(self):
+        """The pipes to the child were opened in the encoding of the locale,
+        and the CLI reads and writes UTF-8: under a locale that is not UTF-8
+        a prompt with "é" reached it as "caf\\xe9", and what it printed was
+        decoded in the locale too. Here the locale is C with Python's coercion
+        and UTF-8 mode off, i.e. ASCII; the tool's own stdin and stdout stay
+        UTF-8."""
+        env = dict(self.env, LC_ALL="C", LANG="C", PYTHONCOERCECLOCALE="0", PYTHONUTF8="0",
+                   PYTHONIOENCODING="utf-8")
+        probe = subprocess.run([sys.executable, "-c", "import locale; "
+                                "print(locale.getpreferredencoding(False))"], capture_output=True,
+                               text=True, timeout=60, env=child_env("single", self.state, env))
+        if probe.stdout.strip().lower().replace("-", "") in ("utf8", ""):
+            self.skipTest("the C locale of this system is UTF-8: %r" % probe.stdout)
+        prompt = "café — Привет"
+        p = run([CLI, "-m", "haiku"], mode="single", state=self.state, extra_env=env, stdin=prompt)
+        self.assertEqual(self.received()["prompt_sha256"],
+                         hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                         "the prompt must reach the CLI as UTF-8 whatever the locale")
+        # read in the locale, UTF-8 in a JSON string becomes escapes JSON does
+        # not have, and no event parses: exit 1
+        self.assertEqual((p.returncode, p.stdout), (0, "ECHO:%s\n" % prompt),
+                         "what the CLI prints must be read as UTF-8 whatever the locale: %s"
+                         % p.stderr[-300:])
+
+    def test_help_describes_the_accounting_and_a_cli_that_does_not_exit(self):
+        h = " ".join(run([CLI, "-h"], state=self.state, extra_env=self.env).stdout.split())
+        for phrase in ("NOT COUNTED in the trailer, and tokens_unknown true in the usage log, mean "
+                       "that the numbers are not exact: read them as a lower bound",
+                       "a count that is not a whole number of 0 or more",
+                       "an entry lacks the input or the output count, or an entry lacks a count "
+                       "that another entry has",
+                       "for every call the timeout or a signal killed",
+                       "Nothing in the usage document fails a call",
+                       "the exit code in the trailer and in the usage-log line is the exit code "
+                       "of the process",
+                       "If it has not exited 5 s after that, it is killed with its process tree",
+                       "judged by that event as if the CLI had exited",
+                       "124 timeout, before the CLI printed its `result` event",
+                       "The usage-log line still gives the exit code c-lean had decided, not 120",
+                       "The prompt goes to the CLI as UTF-8"):
+            self.assertIn(phrase, h, "c-lean -h must say: %s" % phrase)
 
 
 def tearDownModule():

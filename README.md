@@ -52,12 +52,13 @@ c-lean --check
 ```
 
 - There is no default model. Choose model and effort for each task.
-- stdout carries only the answer. stderr carries a trailer with token counts.
+- stdout carries only the answer. stderr carries a trailer with token counts and the exit code of the process. `NOT COUNTED` in the trailer means the counts are not exact, so read them as a lower bound: the usage report of `claude -p` was missing or malformed, or the call was stopped by the timeout or a signal. A malformed usage report never costs the answer.
+- Each call has a timeout: `--timeout SEC`, by default 1200 s, 3600 s at `-e xhigh` and 6000 s at `-e max`. If `claude -p` has printed its result and does not exit within 5 seconds, `c-lean` stops it, prints the answer and a warning.
 - Each call runs `claude -p` in a fresh private empty directory with an empty system prompt, no tools, no settings files, no MCP servers and no slash commands.
-- The prompt goes to `claude -p` on stdin, never on its command line. A system prompt from `--system` or `--system-file` goes in a temporary file with mode 0600, outside that directory, and the file is removed when the call ends. So a prompt that begins with `-` is not read as an option, other local users cannot read either text in the process list, and the command-line length limit does not apply to them. A `--schema` still goes on the command line; one too long for it is a usage error (exit 64).
+- The prompt goes to `claude -p` on stdin as UTF-8, never on its command line. A system prompt from `--system` or `--system-file` goes in a temporary file with mode 0600, outside that directory, and the file is removed when the call ends. So a prompt that begins with `-` is not read as an option, other local users cannot read either text in the process list, and the command-line length limit does not apply to them. A `--schema` still goes on the command line; one too long for it is a usage error (exit 64).
 - The child process gets an allow-listed environment. Every `ANTHROPIC_*`, `CLAUDE_*` and cloud-provider variable is dropped, so an API key or a provider setting in the calling shell cannot move the call off your subscription. A proxy or an extra CA certificate passes only when you name it in `C_LEAN_PASS_ENV`.
 - When the model's answer is cut and continued, the pieces are joined. Text that could not be printed as an answer is saved under `$XDG_STATE_HOME/c-lean/partial`, by default `~/.local/state/c-lean/partial`.
-- Each call appends one line of counters to `$XDG_STATE_HOME/c-lean/usage.jsonl`. The line stores a sha256 hash of the prompt, not the prompt. That is not anonymization: anyone who holds a candidate prompt can confirm it against the hash.
+- Each call appends one line of counters to `$XDG_STATE_HOME/c-lean/usage.jsonl`, with the same exit code as the trailer, and with `tokens_unknown: true` when the trailer says `NOT COUNTED`. The line stores a sha256 hash of the prompt, not the prompt. That is not anonymization: anyone who holds a candidate prompt can confirm it against the hash.
 - `c-lean --check` makes one live call to Haiku and reports the size of the start-up context.
 - `c-lean -h` lists every flag, exit code and environment variable.
 

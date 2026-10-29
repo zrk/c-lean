@@ -68,7 +68,9 @@ Guarantees
     the command line applies to them (Linux refuses any one argument of
     128 KiB or more). The JSON schema of --schema does go on the command
     line: one too long for it, or one that holds a NUL character, is a
-    usage error (exit 64).
+    usage error (exit 64). The prompt goes to the CLI as UTF-8, and what
+    the CLI prints is read as UTF-8, whatever the locale: the CLI reads and
+    writes UTF-8.
   * the usage log stores a sha256 hash of the prompt, never the prompt text.
     This is not anonymization: anyone who holds a candidate prompt can confirm
     it against the hash. @ENV@USAGE_LOG overrides the default log path.
@@ -90,6 +92,11 @@ Guarantees
     many messages of the model had finished by then; what was spent is
     billed. The message that was still being written is lost; the text
     blocks that had come whole are saved to a file (see below).
+    A CLI that has printed its whole `result` event has given its answer.
+    If it has not exited 5 s after that, it is killed with its process
+    tree, a WARN says so, and the call is judged by that event as if the
+    CLI had exited. The same holds when the timeout runs out in those 5 s:
+    the answer is printed, and the exit is not 124.
   * an answer is printed whole, not from its last text block alone. The
     result document of the CLI carries ONE text block, the last one. For an
     ordinary call that is the whole answer. It is not when the model's
@@ -163,6 +170,19 @@ Guarantees
     brackets: out 61 (think 55) means 61 output tokens, 55 of them thinking.
     The trailer also names the binary that ran, because it is chosen by
     @ENV@CLAUDE_BIN or by the parent's PATH.
+  * NOT COUNTED in the trailer, and tokens_unknown true in the usage log,
+    mean that the numbers are not exact: read them as a lower bound. That
+    is so when the result document gives no input or output count, or a
+    count that is not a whole number of 0 or more; when the counts come
+    from its `iterations` and those are not a list, an entry lacks the
+    input or the output count, or an entry lacks a count that another
+    entry has; and for every call the timeout or a signal killed. Nothing
+    in the usage document fails a call: the answer is printed and its text
+    kept as for any other.
+  * the exit code in the trailer and in the usage-log line is the exit code
+    of the process: an empty answer, or no structured output under
+    --schema, is exit 1 in all three places. Exit 120 is the one exception
+    (see Known limitations).
   * an empty answer is a failure, not a result (--allow-empty turns that off):
     `@TOOL@ … > answer.md` used to leave an empty file behind and exit 0.
 
@@ -230,7 +250,10 @@ Known limitations
   * Exit 120. When stdout or stderr can no longer be written (a closed
     terminal, or a pipe whose reader has exited), the next write there fails.
     The interpreter then cannot flush its streams on the way out, and @TOOL@
-    exits 120 whatever the call gave. The trailer goes to stderr before the
+    exits 120 whatever the call gave. The usage-log line still gives the
+    exit code @TOOL@ had decided, not 120, and so does the trailer when
+    stderr can still be written: both are written before the answer is
+    printed. The trailer goes to stderr before the
     answer goes to stdout, so when stderr is the stream that fails, the
     answer is not printed either; the usage-log line is written all the same,
     and so is the file of text blocks of a call that saves them (it is
@@ -251,7 +274,8 @@ Exit codes
   64 usage (a bad flag value included, and a --schema the command line
     cannot carry) ·
   69 the claude binary cannot be run (missing, no +x, bad format) ·
-  75 LIMIT WALL — not an ordinary failure · 124 timeout ·
+  75 LIMIT WALL — not an ordinary failure ·
+  124 timeout, before the CLI printed its `result` event ·
   120 stdout or stderr could no longer be written: a closed terminal, or a pipe
     whose reader has exited (see Known limitations) ·
   137 the child was killed with SIGKILL, as a rule by @TOOL@'s own handler on a
@@ -347,9 +371,9 @@ def gather_system(args) -> str:
 def do_check(args) -> int:
     # the probe is always haiku at effort low, whatever -e says
     timeout, _source = B.timeout_plan(args.timeout, "low")
+    tool = B.TOOL_NAME + " --check"
     r = B.call_model(CHECK_PROMPT, system=CHECK_SYSTEM, model="haiku", effort="low",
-                     timeout=timeout, backend=args.backend, tag="check", tool=B.TOOL_NAME + " --check")
-    sys.stderr.write(B.trailer(r, B.TOOL_NAME + " --check"))
+                     timeout=timeout, backend=args.backend, tag="check", tool=tool, log=False)
     # the answer as `c-lean` would print it: every block joined, else the result
     seen = (B.splice(r.pieces)[0] if r.pieces else r.text) or ""
     probe = {"ts": B.now_iso(), "kind": "check", "exit": r.exit, "wall": bool(r.wall),
@@ -358,18 +382,33 @@ def do_check(args) -> int:
              "tokens_unknown": bool(r.tokens_unknown),
              "raw_keys": sorted((r.raw or {}).keys()) if isinstance(r.raw, dict) else None,
              "raw_usage": (r.raw or {}).get("usage") if isinstance(r.raw, dict) else None}
+    code, say = check_verdict(r, seen)
+    # a probe that fails is exit 1 whatever the call gave, and the trailer and
+    # the usage log must say so
+    r.exit = code
+    B.log_call(r, CHECK_PROMPT, tag="check", tool=tool)
+    sys.stderr.write(B.trailer(r, B.TOOL_NAME + " --check"))
+    for line in say:
+        print(line, file=sys.stderr)
+    # last, so that a probe file that cannot be written costs neither the
+    # usage log nor the trailer
     probe_path = os.environ.get(B.ENV_PREFIX + "CHECK_PROBE_FILE")
     if probe_path:
         with open(probe_path, "a") as f:
             f.write(json.dumps(probe, ensure_ascii=False) + "\n")
+    return code
 
-    fails = []
+
+def check_verdict(r, seen):
+    """(exit code, lines for stderr after the trailer) of the --check probe."""
+    say = [f"{B.TOOL_NAME} --check: WARN %s" % r.linger] if r.linger else []
     if r.wall:
-        print(f"{B.TOOL_NAME} --check: LIMIT WALL — %s" % r.err, file=sys.stderr)
-        return B.EXIT_WALL
+        say.append(f"{B.TOOL_NAME} --check: LIMIT WALL — %s" % r.err)
+        return B.EXIT_WALL, say
     if r.interrupted:
-        print(f"{B.TOOL_NAME} --check: interrupted — %s" % r.err, file=sys.stderr)
-        return r.exit or B.EXIT_FAIL
+        say.append(f"{B.TOOL_NAME} --check: interrupted — %s" % r.err)
+        return r.exit or B.EXIT_FAIL, say
+    fails = []
     if not r.ok:
         fails.append("call failed: %s" % r.err)
     elif not seen.strip():
@@ -391,13 +430,11 @@ def do_check(args) -> int:
                         CHECK_MAX_INPUT))
     if r.ok and not B.looks_english(seen):
         fails.append("answer is not English (%r) — a language setting is leaking in" % seen[:60])
-    for f in fails:
-        print(f"{B.TOOL_NAME} --check: FAIL %s" % f, file=sys.stderr)
     if fails:
-        return B.EXIT_FAIL
-    print(f"{B.TOOL_NAME} --check: OK · haiku · %d input tokens (limit %d) · answer %r · %.1fs"
-          % (r.total_in, CHECK_MAX_INPUT, seen[:40], r.secs or 0), file=sys.stderr)
-    return B.EXIT_OK
+        return B.EXIT_FAIL, say + [f"{B.TOOL_NAME} --check: FAIL %s" % f for f in fails]
+    say.append(f"{B.TOOL_NAME} --check: OK · haiku · %d input tokens (limit %d) · answer %r · %.1fs"
+               % (r.total_in, CHECK_MAX_INPUT, seen[:40], r.secs or 0))
+    return B.EXIT_OK, say
 
 
 def note_lines(r, answer, seams) -> list:
@@ -444,7 +481,7 @@ def settle(args, r, schema, timeout, limit_source):
     """What the call comes to, with nothing printed yet: (exit code, lines for
     stderr after the trailer, text for stdout or None, why its text blocks are
     not all on stdout or None when they are)."""
-    say = []
+    say = [f"{B.TOOL_NAME}: WARN %s" % r.linger] if r.linger else []
     if r.wall:
         say.append(f"{B.TOOL_NAME}: LIMIT WALL — stop and wait for the window to reset. %s" % r.err)
         return B.EXIT_WALL, say, None, r.why or "the call hit the limit wall"
@@ -575,8 +612,12 @@ def main(argv=None) -> int:
 
     r = B.call_model(prompt, system=system, model=args.model, effort=args.effort,
                      schema=schema, timeout=timeout, backend=args.backend,
-                     tag=args.tag, tool=B.TOOL_NAME)
+                     tag=args.tag, tool=B.TOOL_NAME, log=False)
     code, say, out, unprinted = settle(args, r, schema, timeout, limit_source)
+    # Some exits are decided here, not by the call (an empty answer, a missing
+    # structured output): the trailer and the usage log must say this one.
+    r.exit = code
+    B.log_call(r, prompt, tag=args.tag, tool=B.TOOL_NAME)
     # The file comes first, before a single line is printed: a stream that can
     # no longer be written (see Exit 120 in the help) must not cost the text too.
     if unprinted and to_keep(r):

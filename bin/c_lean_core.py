@@ -15,12 +15,16 @@ Hard rules encoded here:
   * the prompt is never on the command line: it goes to the child on stdin. A
     system prompt goes in a private file outside that directory, and
     `--system-prompt ""` is passed when the caller gave none: left out, the
-    CLI puts its own built-in prompt in (see _claude_cmd).
+    CLI puts its own built-in prompt in (see _claude_cmd). The prompt goes
+    in as UTF-8 and the output is read as UTF-8, whatever the locale: that
+    is what the CLI reads and writes.
   * the CLI is asked for its event stream, and the call is read from it after
     the process has ended: the `result` event is the document everything is
     decided by, and the `assistant` events are the only place that holds the
     whole text of an answer: `result` is the LAST text block alone (see
-    read_stream).
+    read_stream). A CLI that has printed a whole `result` event and has not
+    exited RESULT_GRACE seconds later is killed, and the call is judged by
+    that event as if the CLI had exited (see _communicate).
   * no text block the model wrote is dropped: Result.blocks holds every one of
     them on every outcome where the CLI's stdout was read, so a caller can
     keep what it did not print (see save_blocks). Thinking is never kept.
@@ -32,9 +36,17 @@ Hard rules encoded here:
     Result.interrupted, not a failure: retrying it would spend a real call
     after the operator already said stop.
   * counters that could not be read are never silently reported as zero:
-    Result.tokens_unknown travels into the usage log. The log stores a sha256
-    hash of the prompt, not its text. This is not anonymization: anyone who
-    holds a candidate prompt can confirm it against the hash.
+    Result.tokens_unknown travels into the usage log. It is set when a count
+    is missing or is not an integer of 0 or more, when `iterations` is not a
+    list or its messages do not all carry a counter, and for every call that
+    the timeout or a signal killed. Nothing in a usage document can fail the
+    call (see extract_usage). The log stores a sha256 hash of the prompt, not
+    its text. This is not anonymization: anyone who holds a candidate prompt
+    can confirm it against the hash.
+  * the exit code in the trailer and in the usage log is the one the caller
+    sets in Result.exit before it writes them: `c-lean` decides some exits
+    after the call (an empty answer, a missing structured output), so it
+    calls call_model(log=False) and log_call() itself.
 """
 from __future__ import annotations
 
@@ -306,12 +318,15 @@ class Result:
     `finished` is set on a timeout only: see Stream.finished.
     `cap_over` is (model id, number) when the document named a default output
     cap above OUTPUT_CAP for that model, i.e. our number held it down; None
-    when it did not or nothing could be read (see over_cap)."""
+    when it did not or nothing could be read (see over_cap).
+    `linger` is a line for stderr when the CLI had not exited after its
+    `result` event and was killed, and the call was judged by that event;
+    None otherwise."""
     __slots__ = ("ok", "exit", "text", "structured", "usage", "secs", "wall",
                  "err", "raw", "model", "effort", "backend", "interrupted",
                  "tokens_unknown", "binary", "transport",
                  "continued", "pieces", "warn", "finished", "blocks", "why",
-                 "went_on", "cap_over")
+                 "went_on", "cap_over", "linger")
 
     def __init__(self, **kw):
         for s in self.__slots__:
@@ -405,18 +420,28 @@ _USAGE_FIELDS = {
     "out": ("output_tokens",),
 }
 _THINK_NAMES = ("thinking_tokens", "reasoning_output_tokens", "reasoning_tokens")
+# A counter the document holds under a known name, with a value that is no
+# count (see _count). Such a total is not exact.
+_BAD = object()
+
+
+def _count(v) -> bool:
+    """Is `v` a count of tokens: a JSON integer that is not negative? A float
+    is none (1e999 is infinity), and neither is a bool, which Python takes for
+    the integer 1."""
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
 def _top(d, names):
-    """An integer taken from THIS dict only — no descent into nested values."""
+    """The count under the first of `names` that THIS dict holds, with no
+    descent into nested values: None when it holds none of them (null counts
+    as not there), _BAD when the value there is not a count."""
     if not isinstance(d, dict):
         return None
     for n in names:
         v = d.get(n)
-        if isinstance(v, bool):
-            continue
-        if isinstance(v, (int, float)):
-            return int(v)
+        if v is not None:
+            return v if _count(v) else _BAD
     return None
 
 
@@ -435,8 +460,21 @@ def _think_of(d):
     return None
 
 
+def _total(per_message):
+    """(count, exact) of a whole call from the count of each of its messages.
+    The count is None when no message has one, else the sum of the counts
+    there are. That sum is exact only when every message has a count: one
+    that lacks it, or holds a value that is no count, makes it a lower bound."""
+    got = [v for v in per_message if _count(v)]
+    if all(v is None for v in per_message):
+        return None, True
+    return sum(got), len(got) == len(per_message)
+
+
 def extract_usage(doc: dict):
-    """(counters, tokens_unknown) for one CLI answer.
+    """(counters, tokens_unknown) for one CLI answer. The counters are always
+    integers of 0 or more, and nothing a usage document holds raises here: a
+    value that cannot be counted makes tokens_unknown true instead.
 
     Flat keys are read from the TOP level of `usage` only. The old code searched
     the whole tree for the first matching number, so a format where the totals
@@ -444,29 +482,32 @@ def extract_usage(doc: dict):
     iteration as the whole call (100 of 300 input tokens) without a word. Now:
     top level first, else the sum over `iterations`, else tokens_unknown.
     """
-    u = (doc or {}).get("usage")
+    u = doc.get("usage") if isinstance(doc, dict) else None
     if not isinstance(u, dict):
         return dict(ZERO_USAGE), True
     vals = {k: _top(u, names) for k, names in _USAGE_FIELDS.items()}
-    think = _think_of(u)
-    if vals["in"] is None and vals["out"] is None:
-        iters = [i for i in (u.get("iterations") or []) if isinstance(i, dict)]
-        if iters:
-            for k, names in _USAGE_FIELDS.items():
-                got = [_top(i, names) for i in iters]
-                vals[k] = sum(v for v in got if v is not None) if any(
-                    v is not None for v in got) else None
-            per = [_think_of(i) for i in iters]
-            if think is None and any(v is not None for v in per):
-                think = sum(v for v in per if v is not None)
+    vals["think"] = _think_of(u)
+    exact = True
+    iters = u.get("iterations")
+    # An entry that is not a dict has none of the counters: see _total.
+    if vals["in"] is None and vals["out"] is None and isinstance(iters, list):
+        for k, names in _USAGE_FIELDS.items():
+            vals[k], whole = _total([_top(i, names) for i in iters])
+            exact = exact and whole
+        if vals["think"] is None:
+            vals["think"], whole = _total([_think_of(i) for i in iters])
+            exact = exact and whole
     # A missing `in` or `out` makes the whole line a lower bound. The old rule
     # wanted BOTH to be missing, so a document that kept input_tokens and lost
     # output_tokens was logged as an exact "out 0". The cache counters are
     # different: a CLI that reports none has simply nothing cached, and treating
     # their absence as "unreadable" turned --check red on a healthy pipe.
     unknown = vals["in"] is None or vals["out"] is None
-    counters = {k: int(v or 0) for k, v in vals.items()}
-    counters["think"] = int(think or 0)
+    # So does a value that is no count (counted as 0), and a sum over messages
+    # that do not all have a count.
+    if not exact or any(v is _BAD for v in vals.values()):
+        unknown = True
+    counters = {k: (v if _count(v) else 0) for k, v in vals.items()}
     return counters, unknown
 
 
@@ -1054,29 +1095,76 @@ def _text(data) -> str:
     return data or ""
 
 
-WAIT_SLICE = 86400  # seconds: one wait of communicate() is never longer than a day
+# Seconds between two looks at what the child has printed so far (see
+# _communicate). It also keeps every wait far below the ~24 days at which the
+# poll() under communicate() overflows: it takes milliseconds in a C int.
+WATCH_SLICE = 0.5
+# Seconds the CLI has to exit once it has printed a whole `result` event. The
+# answer is in that event: a CLI still alive after this is killed rather than
+# waited for until the timeout, which would cost the answer.
+RESULT_GRACE = 5
 
 
-def _communicate(proc, data, timeout):
-    """proc.communicate(data, timeout=timeout) in slices. The poll() under it
-    takes milliseconds in a C int, so one wait of more than ~24 days raises an
-    OverflowError, and --timeout allows 30. A slice that runs out is not the
-    end: the output read so far is kept by communicate() and the next slice
-    goes on, until the whole limit has passed (then TimeoutExpired, as before)."""
+class Lingered(subprocess.TimeoutExpired):
+    """The child printed a whole `result` event and was still running
+    RESULT_GRACE seconds later."""
+
+
+def _feed(fd, data) -> None:
+    """Write the prompt to the child's stdin and close it. This runs in a
+    thread of its own because communicate() runs in short slices, and
+    CPython does not go on writing the input in the slice after one that
+    ran out. A child that exits before it has read all of it (EPIPE) costs
+    nothing here: the run is judged by its exit code and stderr."""
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _holds_result(lines: bytes) -> bool:
+    """Do these whole lines of stdout hold a `result` event?"""
+    for line in lines.split(b"\n"):
+        try:
+            ev = json.loads(line)
+        except Exception:  # noqa: BLE001 — whatever it is, it is not an event
+            continue
+        if isinstance(ev, dict) and ev.get("type") == "result":
+            return True
+    return False
+
+
+def _communicate(proc, timeout):
+    """proc.communicate(timeout=timeout) in slices of WATCH_SLICE seconds,
+    each followed by a look at the lines of stdout that came whole since the
+    last one. The output read so far is kept by communicate() from one slice
+    to the next. Returns (stdout, stderr) once the child has exited. Raises
+    TimeoutExpired when the whole limit has passed, and Lingered when the
+    child printed a whole `result` event and had not exited RESULT_GRACE
+    seconds later. The child still runs in both cases."""
     if not 0 <= timeout <= MAX_TIMEOUT:  # nan would never run out below
         raise ValueError("timeout must be between 0 and %d seconds, got %r" % (MAX_TIMEOUT, timeout))
     end = time.monotonic() + timeout
-    first = True
+    scanned, result_at = 0, None
     while True:
-        left = end - time.monotonic()
         try:
-            out = proc.communicate(input=data if first else None,
-                                   timeout=max(0.0, min(left, WAIT_SLICE)))
-            return out
-        except subprocess.TimeoutExpired:
-            first = False
-            if end - time.monotonic() <= 0:
+            return proc.communicate(timeout=max(0.0, min(end - time.monotonic(), WATCH_SLICE)))
+        except subprocess.TimeoutExpired as e:
+            now = time.monotonic()
+            if now >= end:
                 raise
+            if result_at is None:
+                out = e.stdout or b""
+                whole = out.rfind(b"\n") + 1
+                if _holds_result(out[scanned:whole]):
+                    result_at = now
+                scanned = max(scanned, whole)
+            elif now - result_at >= RESULT_GRACE:
+                raise Lingered(e.cmd, e.timeout, e.stdout, e.stderr) from None
 
 
 def _call_claude(prompt, system, model, effort, schema, timeout):
@@ -1093,10 +1181,12 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
     t0 = _dt.datetime.now()
     workdir = tempfile.mkdtemp(prefix=TOOL_NAME + "-run-")
     os.chmod(workdir, 0o700)
-    proc = system_file = None
+    proc = system_file = feed = None
     try:
         system_file = _system_file(system) if system else None
         cmd = _claude_cmd(binary, system_file, model, effort, schema)
+        # stdin is a pipe of our own: _feed writes the prompt into it
+        stdin_end, feed = os.pipe()
         try:
             # Under nohup the child leaves the job for a session of its own. The
             # claude CLI puts its own SIGHUP handler over the SIG_IGN it inherits
@@ -1104,8 +1194,8 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
             # a closed terminal sends to the whole job lost every call in flight.
             # SIGINT/SIGTERM still stop it: our handlers kill it via _kill_tree.
             proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, errors="backslashreplace", cwd=workdir, env=env,
+                cmd, stdin=stdin_end, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="backslashreplace", cwd=workdir, env=env,
                 start_new_session=sighup_ignored(),
             )
         except OSError as e:
@@ -1127,40 +1217,57 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
             return Result(ok=False, exit=EXIT_USAGE, text="", raw=None, secs=0.0, wall=False,
                           err="cannot start the claude binary %s: %s holds a NUL character, "
                               "and a command line cannot carry one" % (binary, where))
+        finally:
+            os.close(stdin_end)
         with _LIVE_LOCK:
             _LIVE.add(proc)
         if interrupted():  # the signal landed between Popen and the registration
             _kill_tree(proc)
+        threading.Thread(target=_feed, args=(feed, prompt.encode("utf-8", "backslashreplace")),
+                         name=TOOL_NAME + "-stdin", daemon=True).start()
+        feed = None  # the thread closes it
+        linger = None
         try:
-            # communicate() writes the prompt as the child reads it, under the
-            # same timeout, and a child that exits before it has read all of it
-            # (EPIPE) costs nothing here: the run is judged by its exit code
-            # and stderr, like any other.
-            stdout, stderr = _communicate(proc, prompt, timeout)
+            stdout, stderr = _communicate(proc, timeout)
             rc = proc.returncode
         except subprocess.TimeoutExpired as e:
+            # None when the child still runs; else it had exited, and only
+            # something it left behind kept the pipes open
+            gone = proc.poll()
             _kill_tree(proc)
-            # What the CLI had printed by then is read for two things: how far
-            # the model had got, and the text blocks that had come whole, which
-            # the caller keeps. No answer is ever taken from a killed call.
-            partial = e.stdout
+            # What the CLI had printed by then is read for how far the model
+            # had got and for the text blocks that had come whole, which the
+            # caller keeps. No answer is taken from a killed call, unless a
+            # whole `result` event had come: then the answer is in hand.
+            stdout, stderr = e.stdout, e.stderr
             try:
-                partial = proc.communicate(timeout=15)[0]
+                stdout, stderr = proc.communicate(timeout=15)
             except subprocess.TimeoutExpired as e2:
-                partial = e2.stdout
+                stdout, stderr = e2.stdout, e2.stderr
             except Exception:
                 pass
-            secs = (_dt.datetime.now() - t0).total_seconds()
-            # The work was done and billed on the model side; reporting a clean
-            # zero here would understate the spend of a timed-out call.
-            cut = read_stream(_text(partial))
-            return Result(ok=False, exit=EXIT_TIMEOUT, text="", err="timeout after %ss" % timeout,
-                          why="the call was killed by the timeout after %ss"
-                              % seconds_shown(timeout),
-                          finished=cut.finished, blocks=cut.texts(),
-                          continued=cut.continued, went_on=cut.joined_after(),
-                          secs=secs, wall=False, raw=None, tokens_unknown=True)
+            stdout, stderr = _text(stdout), _text(stderr)
+            cut = read_stream(stdout)
+            if not isinstance(cut.doc, dict):
+                secs = (_dt.datetime.now() - t0).total_seconds()
+                # The work was done and billed on the model side; reporting a clean
+                # zero here would understate the spend of a timed-out call.
+                return Result(ok=False, exit=EXIT_TIMEOUT, text="", err="timeout after %ss" % timeout,
+                              why="the call was killed by the timeout after %ss"
+                                  % seconds_shown(timeout),
+                              finished=cut.finished, blocks=cut.texts(),
+                              continued=cut.continued, went_on=cut.joined_after(),
+                              secs=secs, wall=False, raw=None, tokens_unknown=True)
+            # Judged by that event as if the CLI had exited by itself: with
+            # the code it had exited with, else as a clean exit.
+            rc = 0 if gone is None else gone
+            linger = ("the claude CLI printed its `result` event and had not exited %s: it "
+                      "was killed with its process tree, and the call is judged by that event"
+                      % (("%ss later" % seconds_shown(RESULT_GRACE)) if isinstance(e, Lingered)
+                         else "when the timeout of %ss ran out" % seconds_shown(timeout)))
     finally:
+        if feed is not None:
+            os.close(feed)
         if proc is not None:
             # Whatever left communicate() (an OverflowError on a huge timeout,
             # anything unforeseen), the child must not go on being computed and
@@ -1189,11 +1296,13 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
     if rc is not None and rc < 0:
         # Killed by a signal — our own stop, or the Ctrl-C that reached the whole
         # process group. Not an ordinary failure: retrying it would be a real,
-        # paid call made after the operator already said stop.
+        # paid call made after the operator already said stop. The model may
+        # have spent tokens by then, and no document says how many.
         return Result(ok=False, exit=SIGNAL_EXIT_BASE - rc, text="", wall=False, raw=None,
                       err="call killed by signal %d" % (-rc), secs=secs, interrupted=True,
                       why="the call was killed by signal %d" % (-rc), blocks=blocks,
-                      continued=stream.continued, went_on=stream.joined_after())
+                      continued=stream.continued, went_on=stream.joined_after(),
+                      tokens_unknown=True)
 
     # The document of the call is the last `result` event of the stream. What
     # was decided by the single document of `--output-format json` is decided
@@ -1239,7 +1348,7 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
     # what every outcome below has in common
     common = dict(text=text, structured=structured, usage=usage, secs=secs, raw=doc,
                   tokens_unknown=tokens_unknown, continued=continued, blocks=blocks,
-                  went_on=stream.joined_after(), cap_over=over_cap(doc))
+                  went_on=stream.joined_after(), cap_over=over_cap(doc), linger=linger)
 
     if is_wall(doc):
         return Result(ok=False, exit=EXIT_WALL, wall=True, why="the call hit the limit wall",
@@ -1287,7 +1396,9 @@ def call_model(prompt, *, system=None, model=None, effort=None, schema=None,
 
     Returns a Result. Appends counters and the prompt's sha256 hash to the
     usage log (see usage_log). This is not anonymization: anyone who holds a
-    candidate prompt can confirm it against the hash.
+    candidate prompt can confirm it against the hash. With log=False the
+    caller writes that line itself with log_call(), once it has decided the
+    exit code.
     """
     fn = BACKENDS.get(backend)
     if fn is None:
@@ -1298,27 +1409,34 @@ def call_model(prompt, *, system=None, model=None, effort=None, schema=None,
         r.binary = claude_bin()
         r.transport = transport_notes(scrubbed_env())
     if log:
-        log_usage({
-            "ts": now_iso(), "tool": tool, "tag": tag, "backend": backend,
-            "model": model or "", "effort": effort or "",
-            "in": r.usage.get("in", 0), "cw": r.usage.get("cw", 0),
-            "cr": r.usage.get("cr", 0), "out": r.usage.get("out", 0),
-            "think": r.usage.get("think", 0),
-            "tokens_unknown": bool(r.tokens_unknown),
-            "interrupted": bool(r.interrupted),
-            # times the CLI went on with the answer (the output cap, as a
-            # rule): the tokens of such a call are sums over all of its messages
-            "continued": int(r.continued or 0),
-            "secs": round(r.secs or 0.0, 2), "exit": r.exit, "wall": bool(r.wall),
-            "prompt_sha256": sha256(prompt),
-            "prompt_chars": len(prompt),
-        })
+        log_call(r, prompt, tag=tag, tool=tool)
     return r
+
+
+def log_call(r: Result, prompt, tag="", tool=TOOL_NAME) -> None:
+    """Append the usage-log line of one call, with r.exit as its exit code."""
+    log_usage({
+        "ts": now_iso(), "tool": tool, "tag": tag, "backend": r.backend or "",
+        "model": r.model or "", "effort": r.effort or "",
+        "in": r.usage.get("in", 0), "cw": r.usage.get("cw", 0),
+        "cr": r.usage.get("cr", 0), "out": r.usage.get("out", 0),
+        "think": r.usage.get("think", 0),
+        "tokens_unknown": bool(r.tokens_unknown),
+        "interrupted": bool(r.interrupted),
+        # times the CLI went on with the answer (the output cap, as a
+        # rule): the tokens of such a call are sums over all of its messages
+        "continued": int(r.continued or 0),
+        "secs": round(r.secs or 0.0, 2), "exit": r.exit, "wall": bool(r.wall),
+        "prompt_sha256": sha256(prompt),
+        "prompt_chars": len(prompt),
+    })
 
 
 def trailer(r: Result, tool=TOOL_NAME) -> str:
     """`think` is part of `out`, so it is printed inside brackets: a reader who
-    added the two numbers would overstate the spend."""
+    added the two numbers would overstate the spend. NOT COUNTED means the
+    numbers are not exact (Result.tokens_unknown). The exit code is r.exit,
+    which the caller sets to the exit code of the process first."""
     u = r.usage
     return ("[%s] %s%s · tokens in %s cw %s cr %s out %s (think %s)%s · %.1fs · exit %d%s%s%s%s\n"
             % (tool, r.model or "?", ("/" + r.effort) if r.effort else "",

@@ -55,10 +55,20 @@ Guarantees
     The system prompt is what --system or --system-file gave, and empty when
     neither is given (text that is whitespace only counts as none). The CLI's
     built-in system prompt, the Claude Code persona, never applies:
-    --system-prompt is always passed. What is left is the floor the CLI adds
-    on its own, ~0.6K input tokens (measured 2026-10-27 on CLI 2.1.311 with
-    haiku: 579 with an empty system prompt; on CLI 2.1.288 the built-in one
-    gave 6,598).
+    --system-prompt "" is passed when there is none. What is left is the floor
+    the CLI adds on its own, ~0.6K input tokens (measured 2026-10-27 on CLI
+    2.1.311 with haiku: 579 with an empty system prompt; on CLI 2.1.288 the
+    built-in one gave 6,598).
+  * the prompt is never on the command line of the CLI: it goes on stdin. A
+    system prompt goes in a file of its own, with mode 0600 and outside the
+    cwd of the call, passed with --system-prompt-file. The file is removed
+    when the call ends: after an answer, a failure, a timeout or a stop
+    signal. So a prompt that begins with "-" is not read as an option, no
+    other user can read either text in the process list, and no limit of
+    the command line applies to them (Linux refuses any one argument of
+    128 KiB or more). The JSON schema of --schema does go on the command
+    line: one too long for it, or one that holds a NUL character, is a
+    usage error (exit 64).
   * the usage log stores a sha256 hash of the prompt, never the prompt text.
     This is not anonymization: anyone who holds a candidate prompt can confirm
     it against the hash. @ENV@USAGE_LOG overrides the default log path.
@@ -229,14 +239,17 @@ Known limitations
     Send both streams to files when the terminal may close or the reader may
     go away.
   * SIGQUIT (Ctrl-\\) and every other fatal signal @TOOL@ does not catch end it
-    on the spot: no trailer, no usage-log line. A child the signal did not
-    reach (kill -QUIT PID) runs its call to the end, and the answer is lost.
+    on the spot: no trailer, no usage-log line, and the file of the system
+    prompt stays in the temporary directory (so it does after a SIGKILL). A
+    child the signal did not reach (kill -QUIT PID) runs its call to the
+    end, and the answer is lost.
 
 Exit codes
   0 ok · 1 the call failed (an empty answer counts, an answer still cut off
     after the CLI's last continuation counts, and so does a call the claude
     CLI ended on its own after a stop signal, see Known limitations) ·
-  64 usage (a bad flag value included) ·
+  64 usage (a bad flag value included, and a --schema the command line
+    cannot carry) ·
   69 the claude binary cannot be run (missing, no +x, bad format) ·
   75 LIMIT WALL — not an ordinary failure · 124 timeout ·
   120 stdout or stderr could no longer be written: a closed terminal, or a pipe

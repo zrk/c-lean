@@ -12,8 +12,10 @@ Hard rules encoded here:
     subscription login.
   * every call runs in a fresh private empty directory, so no project CLAUDE.md,
     AGENTS.md or settings file is picked up.
-  * `--system-prompt` is always passed, empty when the caller gave none: left
-    out, the CLI puts its own built-in prompt in (see _claude_cmd).
+  * the prompt is never on the command line: it goes to the child on stdin. A
+    system prompt goes in a private file outside that directory, and
+    `--system-prompt ""` is passed when the caller gave none: left out, the
+    CLI puts its own built-in prompt in (see _claude_cmd).
   * the CLI is asked for its event stream, and the call is read from it after
     the process has ended: the `result` event is the document everything is
     decided by, and the `assistant` events are the only place that holds the
@@ -37,6 +39,7 @@ Hard rules encoded here:
 from __future__ import annotations
 
 import datetime as _dt
+import errno
 import hashlib
 import json
 import os
@@ -190,9 +193,6 @@ def is_wall(doc, blob: str = "") -> bool:
         return (api_error_status(doc) in WALL_HTTP_STATUS
                 or bool(WALL_ERROR_TYPE_RE.search(error_type(doc))))
     return bool(WALL_TEXT_RE.search(blob or ""))
-
-# Prompts bigger than this go in on stdin instead of argv (macOS ARG_MAX 1 MiB).
-ARGV_PROMPT_MAX = 180_000
 
 # The CLI reports why the answer ended. A healthy call says stop_reason
 # "end_turn" / terminal_reason "completed" (measured live on haiku 2026-09-17,
@@ -583,13 +583,19 @@ def claude_bin() -> str:
 
 
 def system_prompt_arg(system) -> str:
-    """The value for --system-prompt. Whitespace alone becomes the empty string:
-    the API refuses a system block with no non-whitespace text (HTTP 400), while
-    the CLI takes "" as an empty prompt of its own."""
+    """The system prompt the CLI is given. Whitespace alone becomes the empty
+    string: the API refuses a system block with no non-whitespace text (HTTP
+    400), while the CLI takes "" as an empty prompt of its own."""
     return system if (system or "").strip() else ""
 
 
-def _claude_cmd(binary, prompt_on_argv, prompt, system, model, effort, schema):
+def _claude_cmd(binary, system_file, model, effort, schema):
+    """The command line of one call. Neither the prompt nor the system prompt
+    is on it: the prompt goes to the child on stdin, and a system prompt is
+    the file `system_file` (see _system_file). On the command line the CLI
+    took a prompt that begins with "-" for an option of its own, Linux refuses
+    any one argument of 128 KiB or more, and every local user can read it in
+    the process list. The JSON schema is the one value of any size left on it."""
     cmd = [binary, "-p",
            "--tools", "",
            "--setting-sources", "",
@@ -599,20 +605,72 @@ def _claude_cmd(binary, prompt_on_argv, prompt, system, model, effort, schema):
            # One JSON line per event. The single document of `json` carries only
            # the LAST message of an answer the CLI continued after the output
            # cap; the events carry them all (see read_stream).
-           "--output-format", "stream-json", "--verbose",
-           # Always, even when empty. Without the flag the CLI puts in its own
-           # built-in prompt, the Claude Code persona: 6,598 input tokens a call
-           # against 406 with "" (measured 2026-10-03 on haiku, CLI 2.1.288).
-           "--system-prompt", system_prompt_arg(system)]
+           "--output-format", "stream-json", "--verbose"]
+    if system_file:
+        cmd += ["--system-prompt-file", system_file]
+    else:
+        # Always, even when empty. Without the flag the CLI puts in its own
+        # built-in prompt, the Claude Code persona: 6,598 input tokens a call
+        # against 406 with "" (measured 2026-10-03 on haiku, CLI 2.1.288).
+        cmd += ["--system-prompt", ""]
     if model:
         cmd += ["--model", model]
     if effort:
         cmd += ["--effort", effort]
     if schema:
         cmd += ["--json-schema", schema]
-    if prompt_on_argv:
-        cmd.append(prompt)
     return cmd
+
+
+def _system_file(text) -> str:
+    """Write a system prompt to a new private file and return its path.
+
+    mkstemp makes it in the temporary directory, not in the cwd of the call,
+    which stays empty. _call_claude removes it where it removes that cwd."""
+    fd, path = tempfile.mkstemp(prefix=TOOL_NAME + "-system-", suffix=".txt")
+    try:
+        # the CLI reads it as UTF-8; a lone surrogate goes in as its escape
+        with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace", newline="") as f:
+            os.fchmod(fd, 0o600)  # a umask can take bits off the 0600 of mkstemp
+            f.write(text)
+    except BaseException:
+        os.unlink(path)
+        raise
+    return path
+
+
+# What a value on the command line comes from, in the words of the operator.
+ARG_SOURCES = {"--json-schema": "the JSON schema of --schema", "--model": "the model of -m",
+               "--effort": "the effort of -e",
+               "--system-prompt-file": "the path of the system prompt file"}
+
+
+def _arg_name(cmd, i) -> str:
+    return ARG_SOURCES.get(cmd[i - 1] if i else "") or "argument %d of the command line" % i
+
+
+def _too_long(binary, cmd, env, why) -> str:
+    """The message for a command line the system refused as too long (E2BIG):
+    its biggest part, and how big that is. The prompt and the system prompt are
+    never on it, so as a rule that part is the JSON schema."""
+    sizes = [len(a.encode("utf-8", "replace")) for a in cmd]
+    i = max(range(len(cmd)), key=sizes.__getitem__)
+    env_size = sum(len(("%s=%s" % kv).encode("utf-8", "replace")) for kv in env.items())
+    name, size = ("the environment", env_size) if env_size > sizes[i] else (_arg_name(cmd, i),
+                                                                             sizes[i])
+    return ("cannot start the claude binary %s: its command line is too long (%s). The biggest "
+            "part of it is %s, %d bytes%s"
+            % (binary, why, name, size,
+               ": a schema goes on the command line whole, so make it smaller"
+               if name == ARG_SOURCES["--json-schema"] else ""))
+
+
+def _nul_arg(cmd):
+    """What holds a NUL character on the command line, or None when nothing does."""
+    for i, a in enumerate(cmd):
+        if "\0" in a:
+            return _arg_name(cmd, i)
+    return None
 
 
 def _descendants(pid: int, depth: int = 0) -> list:
@@ -1027,8 +1085,7 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
                       err="stopped before the call (signal %d)" % interrupted(),
                       secs=0.0, raw=None, interrupted=True)
     binary = claude_bin()
-    on_argv = len(prompt) <= ARGV_PROMPT_MAX
-    cmd = _claude_cmd(binary, on_argv, prompt, system, model, effort, schema)
+    system = system_prompt_arg(system)
     env = scrubbed_env()
     # Ours alone: scrubbed_env() never lets the caller's value in, and what is
     # put here after it is not the caller's either (see OUTPUT_CAP).
@@ -1036,8 +1093,10 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
     t0 = _dt.datetime.now()
     workdir = tempfile.mkdtemp(prefix=TOOL_NAME + "-run-")
     os.chmod(workdir, 0o700)
-    proc = None
+    proc = system_file = None
     try:
+        system_file = _system_file(system) if system else None
+        cmd = _claude_cmd(binary, system_file, model, effort, schema)
         try:
             # Under nohup the child leaves the job for a session of its own. The
             # claude CLI puts its own SIGHUP handler over the SIG_IGN it inherits
@@ -1050,18 +1109,34 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
                 start_new_session=sighup_ignored(),
             )
         except OSError as e:
+            if e.errno == errno.E2BIG:
+                # Not the binary: a value the operator gave, the schema as a rule
+                return Result(ok=False, exit=EXIT_USAGE, text="", raw=None, secs=0.0, wall=False,
+                              err=_too_long(binary, cmd, env, e.strerror or e))
             # Not just "not found": no +x after a cp or a restore, a broken
             # shebang (Exec format error), a path that is a directory. Each of
             # those must report exit 69 instead of a traceback.
             return Result(ok=False, exit=EXIT_NOBIN, text="", raw=None, secs=0.0, wall=False,
                           err="cannot run the claude binary %s: %s"
                               % (binary, e.strerror or e))
+        except ValueError:
+            # A file given to --schema can hold a NUL character; a command line cannot.
+            where = _nul_arg(cmd)
+            if where is None:
+                raise
+            return Result(ok=False, exit=EXIT_USAGE, text="", raw=None, secs=0.0, wall=False,
+                          err="cannot start the claude binary %s: %s holds a NUL character, "
+                              "and a command line cannot carry one" % (binary, where))
         with _LIVE_LOCK:
             _LIVE.add(proc)
         if interrupted():  # the signal landed between Popen and the registration
             _kill_tree(proc)
         try:
-            stdout, stderr = _communicate(proc, "" if on_argv else prompt, timeout)
+            # communicate() writes the prompt as the child reads it, under the
+            # same timeout, and a child that exits before it has read all of it
+            # (EPIPE) costs nothing here: the run is judged by its exit code
+            # and stderr, like any other.
+            stdout, stderr = _communicate(proc, prompt, timeout)
             rc = proc.returncode
         except subprocess.TimeoutExpired as e:
             _kill_tree(proc)
@@ -1099,6 +1174,11 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
             with _LIVE_LOCK:
                 _LIVE.discard(proc)
         shutil.rmtree(workdir, ignore_errors=True)
+        if system_file:
+            try:
+                os.unlink(system_file)
+            except OSError:
+                pass
     secs = (_dt.datetime.now() - t0).total_seconds()
 
     raw_out, raw_err = stdout or "", stderr or ""

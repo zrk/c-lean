@@ -54,6 +54,7 @@ c-lean --check
 - There is no default model. Choose model and effort for each task.
 - stdout carries only the answer. stderr carries a trailer with token counts.
 - Each call runs `claude -p` in a fresh private empty directory with an empty system prompt, no tools, no settings files, no MCP servers and no slash commands.
+- The prompt goes to `claude -p` on stdin, never on its command line. A system prompt from `--system` or `--system-file` goes in a temporary file with mode 0600, outside that directory, and the file is removed when the call ends. So a prompt that begins with `-` is not read as an option, other local users cannot read either text in the process list, and the command-line length limit does not apply to them. A `--schema` still goes on the command line; one too long for it is a usage error (exit 64).
 - The child process gets an allow-listed environment. Every `ANTHROPIC_*`, `CLAUDE_*` and cloud-provider variable is dropped, so an API key or a provider setting in the calling shell cannot move the call off your subscription. A proxy or an extra CA certificate passes only when you name it in `C_LEAN_PASS_ENV`.
 - When the model's answer is cut and continued, the pieces are joined. Text that could not be printed as an answer is saved under `$XDG_STATE_HOME/c-lean/partial`, by default `~/.local/state/c-lean/partial`.
 - Each call appends one line of counters to `$XDG_STATE_HOME/c-lean/usage.jsonl`. The line stores a sha256 hash of the prompt, not the prompt. That is not anonymization: anyone who holds a candidate prompt can confirm it against the hash.
@@ -96,13 +97,13 @@ env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
   claude -p --model sonnet --effort high \
     --setting-sources "" --strict-mcp-config --disable-slash-commands \
     --tools "Read,Grep,Glob" --allowedTools "Read,Grep,Glob" \
-    --system-prompt "$(cat worker-prompt.md)" \
+    --system-prompt-file worker-prompt.md \
     --output-format stream-json --verbose \
     < brief.md > run.jsonl
 ```
 
 - `--setting-sources ""` loads no settings files and no CLAUDE.md. `--strict-mcp-config` with no `--mcp-config` starts no MCP servers.
-- `--system-prompt` replaces the Claude Code system prompt with your own.
+- `--system-prompt-file` replaces the Claude Code system prompt with the text of the file. Passed as `--system-prompt "$(cat ...)"`, the text would be on the command line, where Linux refuses an argument of 128 KiB or more and other local users can read it.
 - `--tools` limits the tool set. `--allowedTools` pre-approves the same tools, so the run never stops at a permission prompt.
 - `env -u` keeps a stray API key from moving the run off your subscription.
 - The brief comes on stdin, so its length is not limited by the command line.

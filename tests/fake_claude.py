@@ -7,15 +7,25 @@ assistant event per content block, result last. JSON mode returns the result
 alone. Continuation, truncation, signals, timeouts, schema output and malformed
 streams all use the same event writer, so the stream reader is always exercised.
 
-C_LEAN_FAKE_STATE holds calls.count, cwd.log, argv.jsonl and env.json.
+The command line is read as the CLI reads it (see parse): a positional
+argument is the prompt, and without one the prompt is read from stdin.
+
+C_LEAN_FAKE_STATE holds calls.count, cwd.log, argv.jsonl, received.jsonl and
+env.json. received.jsonl has one line per run for what the fake was given: the
+argv, where the prompt came from, the system prompt (length and sha256), and
+the mode bits and directory of the --system-prompt-file file (see note).
 C_LEAN_FAKE_SCRIPT supplies exact events and optional stderr, tail_hex and
 end (exit, hang or kill). C_LEAN_FAKE_SLEEP controls signal scenarios;
 C_LEAN_FAKE_RC and C_LEAN_FAKE_WALL_RC control selected exit codes.
 C_LEAN_FAKE_ASSERT_ENV refuses leaked credentials or an unexpected output cap.
+C_LEAN_FAKE_UNKNOWN="--a,--b" names flags this run does not know, as an older
+CLI would not: it then exits 1 before it reads stdin.
 """
+import hashlib
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -35,15 +45,19 @@ BANNED = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
           "CLAUDE_ENV_FILE", "MAX_THINKING_TOKENS", "LEAK_CANARY_TOKEN")
 
 
-def stream_asked(argv):
-    """Was `--output-format stream-json` given? Then stdout is one event a line."""
-    for i, a in enumerate(argv[:-1]):
-        if a == "--output-format":
-            return argv[i + 1] == "stream-json"
-    return False
-
-
-STREAM = stream_asked(sys.argv[1:])
+# Every flag c_lean_core._claude_cmd passes, as the CLI knows it: True when it
+# takes a value, False when it does not.
+FLAGS = {"-p": False, "--print": False, "--verbose": False, "--strict-mcp-config": False,
+         "--disable-slash-commands": False, "--no-session-persistence": False,
+         "--tools": True, "--setting-sources": True, "--output-format": True,
+         "--system-prompt": True, "--system-prompt-file": True, "--model": True,
+         "--effort": True, "--json-schema": True}
+# Flags the CLI acts on as soon as it meets them: it prints, and exits 0.
+VERSION = "0.0.0-fake (Claude Code)"
+USAGE = "Usage: claude [options] [command] [prompt]"
+AT_ONCE = {"-v": VERSION, "--version": VERSION, "-h": USAGE, "--help": USAGE}
+# Set by main(): `--output-format stream-json` makes stdout one event a line.
+STREAM = False
 SESSION = "5e55104d-fa4e-4000-8000-00000000fa4e"
 # What the CLI says to the model when it goes on with an answer by itself:
 # constants of CLI 2.1.288, whole. `isSynthetic` marks the event as the CLI's
@@ -255,7 +269,56 @@ def list_children():
     return 0 if children else 1
 
 
+class Leave(Exception):
+    """The CLI ends the run while it reads its command line, before it reads
+    stdin: (text, exit code). An error goes to stderr with exit 1; --version
+    and --help go to stdout with exit 0."""
+
+
+def parse(argv, unknown=()):
+    """(options, positional arguments) of argv, read as the CLI's parser
+    (commander) reads it. A flag that takes a value takes the part after `=`
+    or the next argument, whatever that is. `--` ends the options, and "-"
+    alone is an argument. Anything else that begins with "-" and is not a
+    known flag is an unknown option. `unknown` names flags to treat as unknown."""
+    opts, words, rest = {}, [], list(argv)
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--":
+            words += rest
+            break
+        if len(arg) < 2 or not arg.startswith("-"):
+            words.append(arg)
+            continue
+        if arg in AT_ONCE:
+            raise Leave(AT_ONCE[arg], 0)
+        name, eq, value = arg.partition("=") if arg.startswith("--") else (arg, "", "")
+        takes = None if name in unknown else FLAGS.get(name)
+        if takes is None or (eq and not takes):
+            raise Leave("error: unknown option '%s'" % arg, 1)
+        if not takes:
+            opts[name] = True
+        elif eq:
+            opts[name] = value
+        elif rest:
+            opts[name] = rest.pop(0)
+        else:
+            raise Leave("error: option '%s <value>' argument missing" % name, 1)
+    return opts, words
+
+
+def note(seen):
+    """Append what this run was given to received.jsonl."""
+    with open(os.path.join(STATE, "received.jsonl"), "a") as f:
+        f.write(json.dumps(seen) + "\n")
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
 def main():
+    global STREAM
     argv = sys.argv[1:]
     if os.environ.get("C_LEAN_FAKE_ASSERT_ENV"):
         for k in BANNED:
@@ -270,11 +333,43 @@ def main():
         sys.stderr.write("fake_claude: API-key-only mode must never be used\n")
         return 91
     bump("calls.count")
-    prompt = argv[-1] if argv and not argv[-1].startswith("-") else sys.stdin.read()
     with open(os.path.join(STATE, "cwd.log"), "a") as f:
         f.write(os.getcwd() + "\n")
     with open(os.path.join(STATE, "argv.jsonl"), "a") as f:
         f.write(json.dumps(argv, ensure_ascii=False) + "\n")
+    seen = {"argv": argv, "cwd": os.getcwd(), "cwd_entries": sorted(os.listdir("."))}
+    unknown = [n.strip() for n in os.environ.get("C_LEAN_FAKE_UNKNOWN", "").split(",") if n.strip()]
+    try:
+        opts, words = parse(argv, unknown)
+    except Leave as e:
+        said, code = e.args
+        note(dict(seen, refused=said, exit=code))
+        (sys.stderr if code else sys.stdout).write(said + "\n")
+        return code
+    STREAM = opts.get("--output-format") == "stream-json"
+    if words:
+        raw, seen["prompt_via"] = words[0].encode("utf-8", "surrogateescape"), "argv"
+    else:
+        raw, seen["prompt_via"] = sys.stdin.buffer.read(), "stdin"
+    prompt = raw.decode("utf-8", "replace")
+    seen.update(prompt_chars=len(prompt), prompt_sha256=digest(raw),
+                system_flags=[n for n in ("--system-prompt", "--system-prompt-file") if n in opts])
+    path = opts.get("--system-prompt-file")
+    if path is not None:
+        try:
+            with open(path, "rb") as f:
+                system = f.read()
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError as e:
+            note(dict(seen, refused=str(e), exit=1))
+            sys.stderr.write("error: cannot read the system prompt file %s: %s\n" % (path, e))
+            return 1
+        seen.update(system_file=path, system_file_mode=mode,
+                    system_file_dir=os.path.dirname(os.path.realpath(path)))
+    else:
+        system = opts.get("--system-prompt", "").encode("utf-8", "surrogateescape")
+    seen.update(system_chars=len(system.decode("utf-8", "replace")), system_sha256=digest(system))
+    note(seen)
     if MODE not in ("noise", "noisewall"):
         # the live CLI prints `system/init` before it calls the model: whatever
         # a mode does next, the stream has begun

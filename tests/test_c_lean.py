@@ -874,6 +874,13 @@ if _dir:
         argv = self.argv(n)
         return argv[argv.index(name) + 1] if name in argv else None
 
+    def received(self, n=-1):
+        """What the fake binary was given in call number n: its argv, where
+        the prompt came from, the system prompt and its file (fake_claude.note)."""
+        got = self.jsonl(os.path.join(self.state, "received.jsonl"))
+        self.assertTrue(got, "the fake binary recorded no call")
+        return got[n]
+
     def call(self, mode, *args):
         return run([CLI, "-m", "haiku", "--system", "S"] + list(args) + ["hello"], mode=mode,
                    state=self.state, extra_env=self.env)
@@ -907,12 +914,18 @@ if _dir:
         `c-lean` used to leave the flag out and print a WARN that nobody read."""
         p = run([CLI, "-m", "haiku", "hello"], mode="single", state=self.state, extra_env=self.env)
         self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("--system-prompt-file", self.argv(),
+                         "with no system prompt there is no file to pass, only --system-prompt \"\"")
         self.assertIn("--system-prompt", self.argv(),
                       "--system-prompt must be passed even when no system prompt is given")
         self.assertEqual(self.flag("--system-prompt"), "",
                          "with no --system the system prompt must be passed empty")
         p = self.call("single")
-        self.assertEqual(self.flag("--system-prompt"), "S", "a given system prompt travels as it is")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        got = self.received()
+        self.assertEqual((got["system_flags"], got["system_sha256"]),
+                         (["--system-prompt-file"], hashlib.sha256(b"S").hexdigest()),
+                         "a given system prompt travels as it is, in a file")
 
     def test_whitespace_only_system_prompt_is_passed_empty(self):
         """A system prompt of one space is refused by the API (HTTP 400: text
@@ -1852,7 +1865,9 @@ if _dir:
         p = run([CLI, "-m", "haiku", "--system", "  Rubric.\n", "hello"], mode="single",
                 state=self.state, extra_env=self.env)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(self.flag("--system-prompt"), "  Rubric.\n",
+        got = self.received()
+        self.assertEqual((got["system_chars"], got["system_sha256"]),
+                         (10, hashlib.sha256(b"  Rubric.\n").hexdigest()),
                          "the system prompt must reach the CLI byte for byte")
 
     def test_the_last_result_event_is_the_document(self):
@@ -1927,7 +1942,12 @@ if _dir:
     def test_help_describes_the_big_call(self):
         s = run([CLI, "-h"], state=self.state, extra_env=self.env).stdout
         for phrase in ("and empty when\n    neither is given", "never applies",
-                       "--system-prompt is always passed", "~0.6K input tokens",
+                       '--system-prompt "" is passed when there is none', "~0.6K input tokens",
+                       # how the prompt and the system prompt reach the CLI
+                       "the prompt is never on the command line of the CLI: it goes on stdin",
+                       "with mode 0600 and outside the\n    cwd of the call, passed with "
+                       "--system-prompt-file", "The file is removed\n    when the call ends",
+                       "The JSON schema of --schema does go on the command\n    line",
                        "The trailer says\n    CONTINUED xN", "c_lean_pieces",
                        "the key is there only when the blocks were joined",
                        "A whitespace character can be\n    lost at a seam",
@@ -1955,7 +1975,8 @@ if _dir:
                        "a half-written one is removed"):
             self.assertIn(phrase, s, "c-lean -h must say: %s" % phrase)
         for stale in ("~0.4K", "6.7K", "raw JSON", "only\n    the last message is printed",
-                      "gives no answer at all", "no JSON from claude"):
+                      "gives no answer at all", "no JSON from claude",
+                      "--system-prompt is always passed"):
             self.assertNotIn(stale, s, "c-lean -h must not say %s any more" % stale)
 
     def check_blank_result_not_joined(self, events, blocks):
@@ -2021,6 +2042,8 @@ if _dir:
         def boom(proc, *a, **kw):
             if FAKE not in (proc.args if isinstance(proc.args, (list, tuple)) else [proc.args]):
                 return real(proc, *a, **kw)  # pgrep and the like are not the call
+            # the prompt comes on stdin: the fake starts its work once stdin ends
+            proc.stdin.close()
             path = os.path.join(self.state, "hang.pids")
             self.wait_for(lambda: os.path.exists(path) and len(open(path).read().split()) == 2,
                           what="the fake to start its grandchild")
@@ -2274,6 +2297,220 @@ if _dir:
         for phrase in ("sha256 hash of the prompt", "This is not anonymization:",
                        "anyone who holds a candidate prompt can confirm it against the hash"):
             self.assertIn(phrase, help_text, "help must explain prompt hash privacy: " + phrase)
+
+    # --- neither the prompt nor the system prompt is on the command line
+    def on_stdin(self, prompt, got=None):
+        """The fake got `prompt` whole on stdin, and no argument holds it."""
+        got = got or self.received()
+        self.assertEqual(got.get("prompt_via"), "stdin",
+                         "the prompt must reach the CLI on stdin, not on its command line")
+        self.assertEqual((got["prompt_chars"], got["prompt_sha256"]),
+                         (len(prompt), hashlib.sha256(prompt.encode("utf-8")).hexdigest()),
+                         "the prompt must reach the CLI whole")
+        self.assertEqual([a[:60] for a in got["argv"] if prompt[:200] in a], [],
+                         "no argument of the command line may hold the prompt")
+
+    def write(self, name, text):
+        path = self.path(name)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        return path
+
+    def test_a_prompt_that_begins_with_a_dash_reaches_the_cli_whole(self):
+        """The prompt was the last argument of the command line, with no `--`
+        before it, and the CLI read it as an option: `- item one` gave "error:
+        unknown option" and exit 1, `--version` printed the version of the CLI
+        instead of an answer."""
+        for args, prompt in ((["- item one"], "- item one"), (["--", "--version"], "--version")):
+            p = run([CLI, "-m", "haiku"] + args, mode="single", state=self.state,
+                    extra_env=self.env)
+            self.assertEqual((p.returncode, p.stdout), (0, "ECHO:%s\n" % prompt),
+                             "%r: %s" % (prompt, p.stderr[-300:]))
+            self.on_stdin(prompt)
+
+    def test_a_prompt_too_long_for_one_argument_arrives_whole_on_stdin(self):
+        """Prompts of up to 180,000 characters went on the command line, and
+        Linux refuses any one argument of 131,072 bytes or more: exit 69,
+        "Argument list too long". Any local user could read them there, too."""
+        prompt = "".join("Item %06d: é — needs a verdict.\n" % n for n in range(6000))[:150000]
+        self.assertEqual(len(prompt), 150000)
+        self.assertGreater(len(prompt.encode("utf-8")), 131072)
+        p = run([CLI, "-m", "haiku", "-f", self.write("long-prompt.txt", prompt)], mode="single",
+                state=self.state, extra_env=self.env)
+        self.assertEqual(p.returncode, 0, "the prompt must reach the CLI on stdin, whatever its "
+                         "length: %s" % p.stderr[-300:])
+        self.on_stdin(prompt)
+
+    def test_a_nul_in_the_prompt_or_the_system_prompt_reaches_the_cli(self):
+        """On the command line a NUL character ended the run in a ValueError
+        traceback. stdin and a file carry it."""
+        prompt, system = "before\0after", "rubric\0tail"
+        p = run([CLI, "-m", "haiku", "--system-file", self.write("nul-rubric.md", system),
+                 "-f", self.write("nul-prompt.txt", prompt)], mode="single", state=self.state,
+                extra_env=self.env)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(p.returncode, 0, p.stderr[-300:])
+        self.on_stdin(prompt)
+        self.assertEqual(self.received()["system_sha256"],
+                         hashlib.sha256(system.encode("utf-8")).hexdigest())
+
+    def test_a_big_system_prompt_goes_in_a_private_file_outside_the_cwd(self):
+        """The system prompt was the value of --system-prompt: Linux refused it
+        over 128 KiB, macOS over about 1 MiB, and the process list showed it to
+        any local user. Now it is a file of mode 0600 outside the cwd of the
+        call, which stays empty, and the file is gone when the call ends."""
+        system = "".join("Rubric line %07d: é — keep to it.\n" % n for n in range(60000))
+        self.assertGreater(len(system.encode("utf-8")), 2 << 20)
+        # a temporary directory of the test's own: nothing may be left in the real one
+        p = run([CLI, "-m", "haiku", "--system-file", self.write("rubric.md", system), "hello"],
+                mode="single", state=self.state,
+                extra_env=dict(self.env, TMPDIR=self.mktemp("c-lean-tmp-")))
+        self.assertEqual((p.returncode, p.stdout), (0, "ECHO:hello\n"), p.stderr[-300:])
+        got = self.received()
+        self.assertEqual(got["system_flags"], ["--system-prompt-file"],
+                         "the system prompt must come in a file, not as --system-prompt")
+        self.assertEqual([a[:60] for a in got["argv"] if system[:200] in a], [],
+                         "no argument of the command line may hold the system prompt")
+        self.assertEqual((got["system_chars"], got["system_sha256"]),
+                         (len(system), hashlib.sha256(system.encode("utf-8")).hexdigest()),
+                         "the system prompt must reach the CLI whole")
+        self.assertEqual(got["system_file_mode"], 0o600,
+                         "the file of the system prompt must be private: mode 0600")
+        cwd, where = os.path.realpath(got["cwd"]), got["system_file_dir"]
+        self.assertFalse(where == cwd or where.startswith(cwd + os.sep),
+                         "the file of the system prompt must be outside the cwd of the call: "
+                         "%s in %s" % (where, cwd))
+        self.assertEqual(got["cwd_entries"], [], "the cwd of the call must stay empty")
+        self.assertFalse(os.path.exists(got["system_file"]),
+                         "the file of the system prompt must be removed when the call ends")
+        self.on_stdin("hello", got)
+
+    def test_the_system_file_is_removed_after_a_timeout(self):
+        p = run([CLI, "-m", "haiku", "--system", "A rubric for a call that hangs.",
+                 "--timeout", "2", "x"], mode="hang", state=self.state,
+                extra_env=dict(self.env, TMPDIR=self.mktemp("c-lean-tmp-")))
+        pids = os.path.join(self.state, "hang.pids")
+        for pid in (open(pids).read().split() if os.path.exists(pids) else []):
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except OSError:
+                pass
+        self.assertEqual(p.returncode, 124, p.stderr[-300:])
+        got = self.received()
+        self.assertEqual(got["system_flags"], ["--system-prompt-file"])
+        self.assertFalse(os.path.exists(got["system_file"]),
+                         "the file of the system prompt must be removed after a timeout")
+
+    def test_the_system_file_is_removed_after_a_signal(self):
+        self.env["TMPDIR"] = self.mktemp("c-lean-tmp-")
+        proc = self.start_call([CLI, "-m", "haiku", "--system", "A rubric for a call that is "
+                                "stopped.", "hello"], mode="sleeper")
+        try:
+            self.wait_for(lambda: len(self.sleeper_pids()) >= 1, what="the live child")
+            got = self.received()
+            self.assertTrue(os.path.exists(got["system_file"]),
+                            "the file of the system prompt must be there while the call runs")
+            os.kill(proc.pid, signal.SIGTERM)
+            _o, err = proc.communicate(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+            self.kill_leftovers()
+        self.assertEqual(proc.returncode, 128 + signal.SIGKILL, err[-300:])
+        self.assertFalse(os.path.exists(got["system_file"]),
+                         "the file of the system prompt must be removed after a stop signal")
+
+    def test_a_schema_too_long_for_the_command_line_is_a_usage_error(self):
+        """The schema is the one value of any size left on the command line,
+        and one of 2 MiB is too long for it on Linux and on macOS alike. That
+        is the operator's value, not a broken binary: exit 64, not 69."""
+        schema = json.dumps({"type": "object", "properties": {"verdict": {"type": "string"}},
+                             "description": "d" * (2 << 20)})
+        tmp = self.mktemp("c-lean-tmp-")
+        p = run([CLI, "-m", "haiku", "--system", "S", "--schema",
+                 self.write("big-schema.json", schema), "hello"], mode="schema",
+                state=self.state, extra_env=dict(self.env, TMPDIR=tmp))
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(p.returncode, 64, "a schema too long for the command line must be exit "
+                         "64: %s" % p.stderr[-400:])
+        self.assertNotIn("cannot run the claude binary", p.stderr)
+        self.assertIn("its command line is too long", p.stderr)
+        self.assertIn("The biggest part of it is the JSON schema of --schema, %d bytes"
+                      % len(schema), p.stderr)
+        self.assertEqual(self.calls(), 0)
+        self.assertEqual(os.listdir(tmp), [], "the run directory and the file of the system "
+                         "prompt must be removed when the call cannot start")
+
+    def test_a_nul_in_the_schema_is_a_usage_error(self):
+        """A file given to --schema can hold a NUL character, and a command line
+        cannot: exit 64 with a message, not a ValueError traceback."""
+        tmp = self.mktemp("c-lean-tmp-")
+        p = run([CLI, "-m", "haiku", "--system", "S", "--schema",
+                 self.write("nul-schema.json", '{"type": "object", "description": "a\0b"}'),
+                 "hello"], mode="schema", state=self.state, extra_env=dict(self.env, TMPDIR=tmp))
+        self.assertNotIn("Traceback", p.stderr, "a NUL in the schema must not end in a traceback")
+        self.assertEqual(p.returncode, 64, p.stderr[-300:])
+        self.assertIn("the JSON schema of --schema holds a NUL character", p.stderr)
+        self.assertEqual(self.calls(), 0)
+        self.assertEqual(os.listdir(tmp), [])
+
+    def test_a_missing_binary_is_still_69(self):
+        """E2BIG is the one OSError of the start that comes from the operator's
+        value; every other one is still 69, and nothing is left behind."""
+        missing = self.path("no-such-claude")
+        tmp = self.mktemp("c-lean-tmp-")
+        p = run([CLI, "-m", "haiku", "--system", "S", "hello"], state=self.state,
+                extra_env=dict(self.env, C_LEAN_CLAUDE_BIN=missing, TMPDIR=tmp))
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(p.returncode, 69, "a missing binary must still be exit 69: %s"
+                         % p.stderr[-300:])
+        self.assertIn("cannot run the claude binary %s: No such file or directory" % missing,
+                      p.stderr)
+        self.assertEqual(os.listdir(tmp), [], "the run directory and the file of the system "
+                         "prompt must be removed when the binary cannot be run")
+
+    def test_a_cli_that_exits_before_it_reads_the_prompt_is_judged_by_its_exit_code(self):
+        """A CLI too old for --system-prompt-file refuses the command line and
+        exits 1 before it reads stdin, so a 2 MiB prompt meets a closed pipe
+        (EPIPE). That is a plain failure in the CLI's own words."""
+        p = run([CLI, "-m", "haiku", "--system", "S", "-f",
+                 self.write("big-prompt.txt", "q" * (2 << 20))], mode="single",
+                state=self.state, extra_env=dict(self.env, C_LEAN_FAKE_UNKNOWN="--system-prompt-file"))
+        self.assertNotIn("Traceback", p.stderr, "a closed stdin pipe must not end in a traceback: "
+                         "%s" % p.stderr[-500:])
+        self.assertEqual(p.returncode, 1, p.stderr[-300:])
+        self.assertIn("no JSON from claude (rc=1): error: unknown option '--system-prompt-file'",
+                      p.stderr)
+        argv = self.received()["argv"]
+        self.assertFalse(os.path.exists(argv[argv.index("--system-prompt-file") + 1]))
+
+    def test_the_fake_reads_its_command_line_as_the_cli_does(self):
+        """The fake took its last argument for the prompt unless it began with
+        "-": `--model haiku` made "haiku" the prompt of a call that came on
+        stdin, and a prompt the CLI reads as an option went through. This one
+        checks the FAKE, so that the tests above test what the CLI would do."""
+        env = child_env("single", self.state, self.env)
+        del env["C_LEAN_FAKE_ASSERT_ENV"]
+
+        def fake(*argv, stdin=""):
+            return subprocess.run([sys.executable, FAKE] + list(argv), input=stdin, env=env,
+                                  capture_output=True, text=True, timeout=60)
+        p = fake("-p", "--model", "haiku", "--output-format", "json", stdin="from stdin")
+        self.assertEqual((p.returncode, json.loads(p.stdout or "{}").get("result")),
+                         (0, "ECHO:from stdin"), p.stderr)
+        self.assertEqual(self.received()["prompt_via"], "stdin")
+        p = fake("-p", "--output-format=json", "--", "--version", stdin="never read")
+        self.assertEqual(json.loads(p.stdout or "{}").get("result"), "ECHO:--version", p.stderr)
+        self.assertEqual(self.received()["prompt_via"], "argv")
+        for argv, said in ((["-p", "- item one"], "error: unknown option '- item one'\n"),
+                           (["-p", "--verbose=yes"], "error: unknown option '--verbose=yes'\n"),
+                           (["-p", "--model"], "error: option '--model <value>' argument missing\n")):
+            p = fake(*argv, stdin="never read")
+            self.assertEqual((p.returncode, p.stdout, p.stderr), (1, "", said),
+                             "the fake must refuse %r as the CLI does" % argv)
+        p = fake("-p", "--version", "--model", "haiku")
+        self.assertEqual((p.returncode, p.stdout), (0, "0.0.0-fake (Claude Code)\n"))
 
 
 def tearDownModule():

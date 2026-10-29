@@ -20,7 +20,7 @@ Usage
   cat brief.md | @TOOL@ -m opus              prompt from stdin
   @TOOL@ -m haiku --system-file rubric.md …  rubric as the whole system prompt
   @TOOL@ -m haiku --system "Answer in English." "…"
-  @TOOL@ -m fable -e high "…"                effort: low|medium|high|xhigh|max
+  @TOOL@ -m fable -e high "…"                effort: low|medium|high|xhigh|max (any case)
   @TOOL@ -m haiku --schema s.json "…"        structured output (prints the JSON)
   @TOOL@ -m haiku --schema '{"type":…}' "…"  schema inline
   @TOOL@ -m haiku --json "…"                 the CLI's result document instead of the answer
@@ -29,6 +29,12 @@ Usage
   @TOOL@ --check                             one live Haiku probe: prefix size + language
 
   There is no default model: model and effort are chosen per task, on purpose.
+  --check makes one fixed Haiku probe: haiku at effort low, with a system
+  prompt and a prompt of its own. It ignores the prompt and every flag
+  except --timeout and --backend. It exits 0 or 1 (a failed check), or 69,
+  71, 75, 124 or 128+N as a call would. @ENV@CHECK_PROBE_FILE=PATH appends
+  a JSON record of the probe to PATH (a new file gets mode 0600) with the
+  exit code --check gives; a record that cannot be written costs one WARN.
 
 Guarantees
   * subscription only — the child gets an ALLOW-listed environment (PATH, HOME,
@@ -70,7 +76,10 @@ Guarantees
     line: one too long for it, or one that holds a NUL character, is a
     usage error (exit 64). The prompt goes to the CLI as UTF-8, and what
     the CLI prints is read as UTF-8, whatever the locale: the CLI reads and
-    writes UTF-8.
+    writes UTF-8. The files of -f, --system-file and --schema and a prompt
+    on stdin are read as UTF-8 too, and bytes that are not UTF-8 there are
+    a usage error (exit 64) that names the first of them. The answer goes
+    to stdout as UTF-8 whatever the encoding of stdout.
   * the usage log stores a sha256 hash of the prompt, never the prompt text.
     This is not anonymization: anyone who holds a candidate prompt can confirm
     it against the hash. @ENV@USAGE_LOG overrides the default log path.
@@ -254,11 +263,11 @@ Known limitations
     (128+N). Signals landing after the exit has been decided cannot change it.
   * Exit 120. When stdout or stderr can no longer be written (a closed
     terminal, or a pipe whose reader has exited), the next write there fails.
-    The interpreter then cannot flush its streams on the way out, and @TOOL@
-    exits 120 whatever the call gave. The usage-log line still gives the
-    exit code @TOOL@ had decided, not 120, and so does the trailer when
-    stderr can still be written: both are written before the answer is
-    printed. The trailer goes to stderr before the
+    @TOOL@ then prints nothing more and exits 120, without a traceback,
+    whatever the call gave. The usage-log line still gives the
+    exit code @TOOL@ had decided, not 120, and so do the record of --check
+    and the trailer when stderr can still be written: all are written
+    before the answer is printed. The trailer goes to stderr before the
     answer goes to stdout, so when stderr is the stream that fails, the
     answer is not printed either; the usage-log line is written all the same,
     and so is the file of text blocks of a call that saves them (it is
@@ -275,9 +284,12 @@ Known limitations
 Exit codes
   0 ok · 1 the call failed (an empty answer counts, and an answer still cut
     off after the CLI's last continuation counts) ·
-  64 usage (a bad flag value included, and a --schema the command line
-    cannot carry) ·
+  64 usage (a bad flag value included, a file or a prompt on stdin that is
+    not UTF-8, and a --schema the command line cannot carry) ·
   69 the claude binary cannot be run (missing, no +x, bad format) ·
+  71 a local resource the call needs could not be made (its working
+    directory, the system-prompt file, the stdin pipe, the thread that
+    writes the prompt): `@TOOL@: cannot start the call: <what>: <reason>` ·
   75 LIMIT WALL — not an ordinary failure ·
   124 timeout, before the CLI printed its `result` event ·
   120 stdout or stderr could no longer be written: a closed terminal, or a pipe
@@ -349,11 +361,12 @@ def gather_prompt(args, parser) -> str:
         parts.append(" ".join(args.prompt))
     for path in args.files:
         if path == "-":
-            parts.append(sys.stdin.read())
+            parts.append(B.read_stdin_arg("-f - (stdin)"))
         else:
             parts.append(B.read_file_arg("-f", path))
-    if not parts and not sys.stdin.isatty():
-        parts.append(sys.stdin.read())
+    # a closed stdin (`<&-`) is None and holds no prompt: an empty one, not a traceback
+    if not parts and sys.stdin is not None and not sys.stdin.isatty():
+        parts.append(B.read_stdin_arg("the prompt on stdin"))
     text = "\n\n".join(x for x in parts if x.strip())
     if not text.strip():
         print(f"{B.TOOL_NAME}: empty prompt (give text, -f FILE, or pipe stdin)", file=sys.stderr)
@@ -385,20 +398,41 @@ def do_check(args) -> int:
              "raw_keys": sorted((r.raw or {}).keys()) if isinstance(r.raw, dict) else None,
              "raw_usage": (r.raw or {}).get("usage") if isinstance(r.raw, dict) else None}
     code, say = check_verdict(r, seen)
-    # a probe that fails is exit 1 whatever the call gave, and the trailer and
-    # the usage log must say so
+    # a probe that fails is exit 1 whatever the call gave, and the trailer, the
+    # usage log and the probe record must say so
     r.exit = code
     B.log_call(r, CHECK_PROMPT, tag="check", tool=tool)
-    sys.stderr.write(B.trailer(r, B.TOOL_NAME + " --check"))
-    for line in say:
-        print(line, file=sys.stderr)
-    # last, so that a probe file that cannot be written costs neither the
-    # usage log nor the trailer
+    probe["exit"] = code
+    # Before anything is printed, as the usage-log line is: a stream that can
+    # no longer be written must not cost the record. A record that cannot be
+    # written costs one WARN and nothing else.
     probe_path = os.environ.get(B.ENV_PREFIX + "CHECK_PROBE_FILE")
     if probe_path:
-        with open(probe_path, "a") as f:
+        warn = write_probe(probe_path, probe)
+        if warn:
+            say.append(warn)
+    return finish(code, B.trailer(r, tool), say)
+
+
+def write_probe(path, probe):
+    """Append the record of the probe to `path`; None, or a WARN line when it
+    cannot be written. A file made here gets mode 0600, as the usage log does;
+    a file that is already there keeps its mode."""
+    try:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o600)
+            made = True
+        except FileExistsError:
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+            made = False
+        with os.fdopen(fd, "a", encoding="utf-8", errors="backslashreplace") as f:
+            if made:
+                os.fchmod(fd, 0o600)  # a umask can take bits off the mode given to open
             f.write(json.dumps(probe, ensure_ascii=False) + "\n")
-    return code
+    except Exception as e:  # noqa: BLE001 — the record must not change the exit or end in a traceback
+        return (f"{B.TOOL_NAME} --check: WARN could not write the probe record to %s: %s"
+                % (path, getattr(e, "strerror", None) or e))
+    return None
 
 
 def check_verdict(r, seen):
@@ -433,7 +467,13 @@ def check_verdict(r, seen):
     if r.ok and not B.looks_english(seen):
         fails.append("answer is not English (%r) — a language setting is leaking in" % seen[:60])
     if fails:
-        return B.EXIT_FAIL, say + [f"{B.TOOL_NAME} --check: FAIL %s" % f for f in fails]
+        # A binary that cannot be run, a call that cannot be started and a
+        # timeout keep their own codes, as for any call: a script that runs
+        # --check first has to tell them from a probe that came back wrong.
+        # Every other failed check is 1.
+        code = (r.exit if not r.ok and r.exit in (B.EXIT_NOBIN, B.EXIT_OSERR, B.EXIT_TIMEOUT)
+                else B.EXIT_FAIL)
+        return code, say + [f"{B.TOOL_NAME} --check: FAIL %s" % f for f in fails]
     say.append(f"{B.TOOL_NAME} --check: OK · haiku · %d input tokens (limit %d) · answer %r · %.1fs"
                % (r.total_in, CHECK_MAX_INPUT, seen[:40], r.secs or 0))
     return B.EXIT_OK, say
@@ -570,12 +610,74 @@ def keep(r, prompt, reason) -> str:
             "printed, NOT a result" % (size, path))
 
 
+def write_end(err=None, out=None) -> bool:
+    """Write `err` to stderr, then `out` to stdout; False when one of them can
+    no longer be written (a pipe whose reader has exited, a closed terminal, a
+    full disk, a stream closed from the start). Nothing more is written then.
+
+    `out` goes out as UTF-8 bytes whatever the encoding of stdout: under an
+    ASCII one, a non-ASCII answer ended in a UnicodeEncodeError traceback and
+    was lost. A lone surrogate (half of a pair the model wrote) goes out as
+    the escape the saved file has. stderr keeps its own encoding: Python
+    writes it with backslashreplace, so no text fails there."""
+    stream = None
+    try:
+        if err is not None:
+            stream = sys.stderr
+            if stream is None:
+                return False
+            stream.write(err)
+            stream.flush()
+        if out is not None:
+            stream = sys.stdout
+            if stream is None:
+                return False
+            stream.flush()  # whatever the text layer holds goes first
+            stream.buffer.write(out.encode("utf-8", "backslashreplace"))
+            stream.buffer.flush()
+    except OSError:
+        silence(stream)
+        return False
+    return True
+
+
+def silence(stream) -> None:
+    """Point a stream that can no longer be written at /dev/null, as the Python
+    docs advise for a broken pipe: what is still in its buffer would fail
+    again when the interpreter flushes it on the way out, with a second
+    error on stderr."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, stream.fileno())
+        finally:
+            os.close(devnull)
+        stream.flush()
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def finish(code, trailer, say, out=None) -> int:
+    """Print the end of a run, the trailer and the lines of `say` on stderr
+    and then the answer on stdout, and return the exit code: `code`, or 120
+    when a stream could no longer be written (see Exit 120 in the help)."""
+    if not write_end(trailer + "".join(line + "\n" for line in say), out):
+        return B.EXIT_STREAM
+    return code
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.help:
-        sys.stdout.write(__doc__)
-        return B.EXIT_OK
+        return B.EXIT_OK if write_end(out=__doc__) else B.EXIT_STREAM
+    if args.effort is not None and not args.check:  # --check ignores -e (see do_check)
+        effort = args.effort.lower()
+        if effort not in B.EFFORTS:
+            print(f"{B.TOOL_NAME}: unknown -e %r (have: %s, in any letter case)"
+                  % (args.effort, ", ".join(B.EFFORTS)), file=sys.stderr)
+            return B.EXIT_USAGE
+        args.effort = effort
     timeout, limit_source = B.timeout_plan(args.timeout, args.effort)
     if not math.isfinite(timeout) or timeout <= 0:
         # "0 = no limit" is the natural guess and it was a trap: the call was
@@ -605,7 +707,7 @@ def main(argv=None) -> int:
         with B.reading_prompt():
             prompt = gather_prompt(args, parser)
             system = gather_system(args)
-            schema = B.read_text_arg(args.schema) if args.schema else None
+            schema = B.read_text_arg(args.schema) if args.schema is not None else None
     except B.PromptStopped:
         prompt, system, schema = "", None, None
     except B.BadArg as e:
@@ -631,14 +733,7 @@ def main(argv=None) -> int:
         say.append(keep(r, prompt, unprinted))
     if B.cap_over_note(r):
         say.append(f"{B.TOOL_NAME}: WARN %s" % B.cap_over_note(r))
-    sys.stderr.write(B.trailer(r))
-    for line in say:
-        print(line, file=sys.stderr)
-    if out is not None:
-        # a lone surrogate (a half of a pair the model wrote) cannot be encoded
-        # to UTF-8: it goes out as the escape the saved file has, not as a traceback
-        sys.stdout.write(out.encode("utf-8", "backslashreplace").decode("utf-8"))
-    return code
+    return finish(code, B.trailer(r), say, out)
 
 
 if __name__ == "__main__":

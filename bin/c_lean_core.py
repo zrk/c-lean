@@ -71,7 +71,9 @@ EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_USAGE = 64
 EXIT_NOBIN = 69
+EXIT_OSERR = 71   # a local resource the call needs could not be made (EX_OSERR)
 EXIT_WALL = 75
+EXIT_STREAM = 120  # stdout or stderr could no longer be written, as CPython has it
 EXIT_TIMEOUT = 124
 SIGNAL_EXIT_BASE = 128  # 128+signum, the shell convention: 130 SIGINT, 143 SIGTERM
 
@@ -262,6 +264,9 @@ MAX_TIMEOUT = 2592000
 # and 6000 s covers that worst case: four messages that each run to the cap.
 DEFAULT_TIMEOUT = 1200
 EFFORT_TIMEOUT = {"xhigh": 3600, "max": 6000}
+# The values of --effort the CLI takes (CLI 2.1.312 `--help`). What it does
+# with any other value is up to it, so -e takes these alone.
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
 def default_timeout(effort) -> int:
@@ -531,7 +536,9 @@ def log_usage(rec: dict, path=None) -> None:
             os.fchmod(fd, 0o600)
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:  # logging must never break a run
-        print(f"{TOOL_NAME}: WARN could not write usage log: %s" % e, file=sys.stderr)
+        # nor may a stderr that can no longer be written: the text blocks of
+        # the call are saved after this line
+        _say_during_call(f"{TOOL_NAME}: WARN could not write usage log: %s" % e)
 
 
 # --------------------------------------------------------- children & signals
@@ -734,7 +741,8 @@ def _nul_arg(cmd):
 
 
 def _say_during_call(line) -> None:
-    """Print one line on stderr while a call runs or from a signal handler.
+    """Print one line on stderr while a call runs, from a signal handler, or
+    while the usage log is written.
 
     A stderr that can no longer be written (a pipe whose reader has exited, a
     closed stream) raised out of the read loop or the signal handler, and the
@@ -1293,6 +1301,19 @@ def _communicate(proc, timeout):
     return stdout, stderr, reason, gone
 
 
+def _cannot_make(what, e, t0) -> Result:
+    """The call could not start because a local resource it needs could not
+    be made: a full or read-only temporary directory, a quota, no file
+    descriptor or thread left. That is exit 71, with the trailer and the
+    usage-log line of any other call that did not start."""
+    reason = getattr(e, "strerror", None) or str(e) or type(e).__name__
+    if getattr(e, "filename", None):
+        reason += " (%s)" % e.filename
+    return Result(ok=False, exit=EXIT_OSERR, text="", raw=None, wall=False,
+                  secs=(_dt.datetime.now() - t0).total_seconds(),
+                  err="cannot start the call: %s: %s" % (what, reason))
+
+
 def _call_claude(prompt, system, model, effort, schema, timeout):
     if interrupted():
         return Result(ok=False, exit=SIGNAL_EXIT_BASE + interrupted(), text="", wall=False,
@@ -1305,14 +1326,21 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
     # put here after it is not the caller's either (see OUTPUT_CAP).
     env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(OUTPUT_CAP)
     t0 = _dt.datetime.now()
-    workdir = tempfile.mkdtemp(prefix=TOOL_NAME + "-run-")
-    os.chmod(workdir, 0o700)
-    proc = system_file = feed = None
+    proc = workdir = system_file = feed = None
+    # What is being made for the call while it is made, None once it is: an
+    # OSError (or a thread that cannot start) there is exit 71, not a
+    # traceback, and the `finally` below removes whatever was made before it.
+    making = "the working directory"
     try:
+        workdir = tempfile.mkdtemp(prefix=TOOL_NAME + "-run-")
+        os.chmod(workdir, 0o700)
+        making = "the system-prompt file"
         system_file = _system_file(system) if system else None
         cmd = _claude_cmd(binary, system_file, model, effort, schema)
         # stdin is a pipe of our own: _feed writes the prompt into it
+        making = "the stdin pipe"
         stdin_end, feed = os.pipe()
+        making = None
         try:
             # The CLI installs handlers even over inherited ignores. A session
             # of its own shields it from those signals sent to the whole job.
@@ -1348,8 +1376,10 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
             _LIVE.add(proc)
         if interrupted():  # the signal landed between Popen and the registration
             _kill_tree(proc)
+        making = "the feeder thread"
         threading.Thread(target=_feed, args=(feed, prompt.encode("utf-8", "backslashreplace")),
                          name=TOOL_NAME + "-stdin", daemon=True).start()
+        making = None
         feed = None  # the thread closes it
         linger = None
         stdout, stderr, reason, gone = _communicate(proc, timeout)
@@ -1374,6 +1404,14 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
                       "was killed with its process tree, and the call is judged by that event"
                       % (("%ss later" % seconds_shown(RESULT_GRACE)) if reason == "result"
                          else "when the timeout of %ss ran out" % seconds_shown(timeout)))
+    except (OSError, RuntimeError) as e:
+        if making is None:
+            raise
+        if proc is not None:
+            # The child waits for its prompt: it is killed before the `finally`
+            # closes its stdin, so that it never goes on with an empty one.
+            _kill_tree(proc)
+        return _cannot_make(making, e, t0)
     finally:
         if feed is not None:
             os.close(feed)
@@ -1391,7 +1429,8 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
                     pipe.close()
             with _LIVE_LOCK:
                 _LIVE.discard(proc)
-        shutil.rmtree(workdir, ignore_errors=True)
+        if workdir is not None:
+            shutil.rmtree(workdir, ignore_errors=True)
         if system_file:
             try:
                 os.unlink(system_file)
@@ -1585,22 +1624,55 @@ def trailer(r: Result, tool=TOOL_NAME) -> str:
                r.transport or ""))
 
 
+def decode_arg(data: bytes, source: str) -> str:
+    """Text the operator gave in a file or on stdin, decoded as UTF-8 whatever
+    the locale: the CLI reads UTF-8, and a locale that is not UTF-8 turned
+    "é" into a UnicodeDecodeError traceback. Bytes that are not UTF-8 are an
+    operator error (64) that names the first of them."""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise BadArg("%s: not UTF-8: the first bad byte is 0x%02x at byte offset %d"
+                     % (source, data[e.start], e.start))
+
+
 def read_file_arg(flag: str, path: str) -> str:
     """A file named on the command line. A missing one is an operator error (64),
     not a traceback out of the middle of a run."""
     try:
-        with open(os.path.expanduser(path)) as f:
-            return f.read()
+        with open(os.path.expanduser(path), "rb") as f:
+            data = f.read()
     except OSError as e:
         raise BadArg("%s %s: %s" % (flag, path, e.strerror or e))
+    # universal newlines, as the file had them when it was read as text
+    return decode_arg(data, "%s %s" % (flag, path)).replace("\r\n", "\n").replace("\r", "\n")
+
+
+def read_stdin_arg(source: str) -> str:
+    """The prompt on stdin, decoded as UTF-8 whatever the locale. A closed
+    stdin (`c-lean <&-`) holds nothing: sys.stdin is None then."""
+    if sys.stdin is None:
+        return ""
+    try:
+        data = sys.stdin.buffer.read()
+    except OSError as e:
+        raise BadArg("%s: %s" % (source, e.strerror or e))
+    return decode_arg(data, source)
 
 
 def read_text_arg(value: str) -> str:
     """`--schema` style argument: inline JSON if it starts with '{', else a file path."""
     v = value.strip()
+    if not v:
+        # an empty value switched the schema off without a word
+        raise BadArg("--schema takes inline JSON or a file, and its value is empty")
     if v.startswith("{") or v.startswith("["):
         return v
-    return read_file_arg("--schema", value)
+    text = read_file_arg("--schema", value)
+    if not text.strip():
+        # an empty file switched the schema off without a word, as "" did
+        raise BadArg("--schema takes inline JSON or a file, and the file %s is empty" % value)
+    return text
 
 
 CYRILLIC = re.compile(r"[Ѐ-ӿ]")

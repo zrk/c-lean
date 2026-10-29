@@ -63,8 +63,21 @@ c-lean --check
 - The child process gets an allow-listed environment. Every `ANTHROPIC_*`, `CLAUDE_*` and cloud-provider variable is dropped, so an API key or a provider setting in the calling shell cannot move the call off your subscription. A proxy or an extra CA certificate passes only when you name it in `C_LEAN_PASS_ENV`.
 - When the model's answer is cut and continued, the pieces are joined. Text that could not be printed as an answer is saved under `$XDG_STATE_HOME/c-lean/partial`, by default `~/.local/state/c-lean/partial`.
 - Each call appends one line of counters to `$XDG_STATE_HOME/c-lean/usage.jsonl`, with the same exit code as the trailer, and with `tokens_unknown: true` when the trailer says `NOT COUNTED`. The line stores a sha256 hash of the prompt, not the prompt. That is not anonymization: anyone who holds a candidate prompt can confirm it against the hash.
-- `c-lean --check` makes one live call to Haiku and reports the size of the start-up context.
+- `c-lean --check` makes one fixed live call to Haiku and reports the size of the start-up context. It ignores the prompt and every flag except `--timeout` and `--backend`. With `C_LEAN_CHECK_PROBE_FILE=PATH` it appends a JSON record of the probe to PATH, with the exit code `--check` returns; a file it creates there gets mode 0600, and a record that cannot be written costs one warning.
+- Files given to `-f`, `--system-file` and `--schema`, and a prompt on stdin, are read as UTF-8 whatever the locale; bytes that are not UTF-8 are a usage error. The answer goes to stdout as UTF-8 whatever the encoding of stdout.
 - `c-lean -h` lists every flag, exit code and environment variable.
+
+| Exit | Meaning |
+|---|---|
+| 0 | the answer was printed |
+| 1 | the call failed, an empty answer included |
+| 64 | usage: a bad flag or value, a file that cannot be read or is not UTF-8, a `--schema` the command line cannot carry |
+| 69 | the `claude` binary cannot be run |
+| 71 | a local resource the call needs could not be made: its working directory, the system-prompt file, the stdin pipe or the thread that writes the prompt |
+| 75 | the limit wall, not an ordinary failure |
+| 120 | stdout or stderr could no longer be written |
+| 124 | timeout, before `claude -p` printed its result |
+| 128+N | stopped by signal N (130, 143, 129), or 137 when `claude -p` died of SIGKILL |
 
 ## sub-scout and sub-coder
 

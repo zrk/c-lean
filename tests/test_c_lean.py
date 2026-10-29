@@ -23,7 +23,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import types
 import unittest
 from datetime import datetime, timezone
 from unittest import mock
@@ -3441,6 +3443,444 @@ if _dir:
                        "at most 3 s", "5 s after its exit", "inherited as SIG_IGN stays ignored",
                        "came after the answer", "exit 128+signal", "SIGKILL sent to the job"):
             self.assertIn(phrase, h, "help must describe process and stop handling: " + phrase)
+
+    # --- error paths: a clear line and the right exit code, never a traceback
+    def write_bytes(self, name, data):
+        path = self.path(name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def run_bytes(self, args, mode="single", stdin=b"", extra_env=None, **kw):
+        """`c-lean args` with bytes on stdin and both streams kept as bytes."""
+        env = child_env(mode, self.state, dict(self.env, **(extra_env or {})))
+        return subprocess.run([sys.executable, CLI] + args, env=env, input=stdin,
+                              capture_output=True, timeout=180, **kw)
+
+    def test_a_file_or_stdin_that_is_not_utf8_is_a_usage_error(self):
+        """A file given to -f, --system-file or --schema, and the prompt on
+        stdin, were decoded in the encoding of the locale: bytes that are not
+        UTF-8 ended in a UnicodeDecodeError traceback, exit 1."""
+        bad = self.write_bytes("bad.txt", b"ok \xff tail")
+        for args, stdin, source in (
+                (["-f", bad], b"", "-f %s" % bad),
+                (["--system-file", bad, "hello"], b"", "--system-file %s" % bad),
+                (["--schema", bad, "hello"], b"", "--schema %s" % bad),
+                ([], b"ok \xff tail", "the prompt on stdin"),
+                (["-f", "-"], b"ok \xff tail", "-f - (stdin)")):
+            with self.subTest(source=source):
+                p = self.run_bytes(["-m", "haiku"] + args, stdin=stdin)
+                err = p.stderr.decode("utf-8", "replace")
+                self.assertNotIn("Traceback", err)
+                self.assertEqual((p.returncode, err.splitlines()),
+                                 (64, ["c-lean: %s: not UTF-8: the first bad byte is 0xff at "
+                                       "byte offset 3" % source]),
+                                 "bytes that are not UTF-8 must be one usage line that names "
+                                 "the flag, the source and the offset: %s" % err[-300:])
+        self.assertEqual(self.calls(), 0)
+
+    def test_files_and_stdin_are_read_as_utf8_whatever_the_locale(self):
+        """Under a locale that is not UTF-8 (C, with Python's coercion and
+        UTF-8 mode off) "é" in a file or on stdin ended in a traceback."""
+        env = {"LC_ALL": "C", "LANG": "C", "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0"}
+        probe = subprocess.run([sys.executable, "-c", "import locale; "
+                                "print(locale.getpreferredencoding(False))"], capture_output=True,
+                               text=True, timeout=60, env=child_env("single", self.state, env))
+        if probe.stdout.strip().lower().replace("-", "") in ("utf8", ""):
+            self.skipTest("the C locale of this system is UTF-8: %r" % probe.stdout)
+        prompt, system = "café — Привет", "Rubric: é ü — Привет"
+        schema = '{"type": "object", "description": "é — Привет"}'
+        for args, stdin in ((["-f", self.write("utf8-prompt.txt", prompt),
+                              "--system-file", self.write("utf8-system.txt", system)], b""),
+                            (["--system-file", self.write("utf8-system-2.txt", system)],
+                             prompt.encode("utf-8"))):
+            with self.subTest(stdin=bool(stdin)):
+                p = self.run_bytes(["-m", "haiku"] + args, stdin=stdin, extra_env=env)
+                self.assertEqual((p.returncode, p.stdout.decode("utf-8")), (0, "ECHO:%s\n" % prompt),
+                                 p.stderr.decode("utf-8", "replace")[-300:])
+                got = self.received()
+                self.assertEqual((got["prompt_sha256"], got["system_sha256"]),
+                                 (hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                                  hashlib.sha256(system.encode("utf-8")).hexdigest()),
+                                 "the files and stdin must be read as UTF-8 whatever the locale")
+        p = self.run_bytes(["-m", "haiku", "--schema", self.write("utf8-schema.json", schema),
+                            "hello"], mode="schema", extra_env=env)
+        self.assertEqual(p.returncode, 0, p.stderr.decode("utf-8", "replace")[-300:])
+        self.assertEqual(self.flag("--json-schema"), schema)
+
+    def no_stdin(self):
+        """preexec_fn: c-lean starts with stdin closed, as `c-lean <&-` does."""
+        os.close(0)
+
+    def test_a_closed_stdin_is_an_empty_prompt(self):
+        """With stdin closed (`c-lean <&-`) sys.stdin is None, and a prompt that
+        had to come from it ended in an AttributeError traceback, exit 1."""
+        for args in ([], ["-f", "-"]):
+            with self.subTest(args=args):
+                p = self.run_bytes(["-m", "haiku"] + args, stdin=None, preexec_fn=self.no_stdin)
+                self.assertEqual((p.returncode, p.stderr.decode("utf-8", "replace")),
+                                 (64, "c-lean: empty prompt (give text, -f FILE, or pipe stdin)\n"),
+                                 "a closed stdin must be an empty prompt")
+        p = self.run_bytes(["-m", "haiku", "-f", "-", "hello"], stdin=None,
+                           preexec_fn=self.no_stdin)
+        self.assertEqual((p.returncode, p.stdout), (0, b"ECHO:hello\n"),
+                         "a closed stdin adds nothing to a prompt given otherwise")
+        self.assertEqual(self.calls(), 1)
+
+    def test_an_empty_schema_is_a_usage_error(self):
+        """--schema "" switched the schema off without a word, and a value of
+        spaces alone was looked for as a file named "   "."""
+        for value in ("", "   "):
+            with self.subTest(value=value):
+                p = run([CLI, "-m", "haiku", "--schema", value, "hello"], mode="schema",
+                        state=self.state, extra_env=self.env)
+                self.assertEqual((p.returncode, p.stderr),
+                                 (64, "c-lean: --schema takes inline JSON or a file, and its value "
+                                      "is empty\n"), "an empty --schema must be a usage error")
+        self.assertEqual(self.calls(), 0)
+
+    def test_an_empty_schema_file_is_a_usage_error(self):
+        """A --schema file with nothing in it, or only whitespace, switched
+        the schema off without a word, as --schema "" did."""
+        for n, content in enumerate(("", " \n\t\r\n")):
+            with self.subTest(content=content):
+                path = self.write("schema-%d.json" % n, content)
+                p = run([CLI, "-m", "haiku", "--schema", path, "hello"], mode="schema",
+                        state=self.state, extra_env=self.env)
+                self.assertEqual((p.returncode, p.stderr),
+                                 (64, "c-lean: --schema takes inline JSON or a file, and the file "
+                                      "%s is empty\n" % path),
+                                 "an empty --schema file must be a usage error")
+        self.assertEqual(self.calls(), 0)
+
+    def test_effort_takes_the_five_values_in_any_case(self):
+        """-e was passed to the CLI as given, whatever it was."""
+        for value, want in (("MAX", "max"), ("High", "high"), ("low", "low"), (None, None)):
+            with self.subTest(effort=value):
+                p = run([CLI, "-m", "haiku"] + (["-e", value] if value else []) + ["hello"],
+                        mode="single", state=self.state, extra_env=self.env)
+                self.assertEqual(p.returncode, 0, p.stderr[-300:])
+                self.assertEqual(self.flag("--effort"), want,
+                                 "-e %s must reach the CLI as --effort %s" % (value, want))
+        for value in ("turbo", "", "max ", "x-high"):
+            with self.subTest(effort=value):
+                p = run([CLI, "-m", "haiku", "-e", value, "hello"], mode="single",
+                        state=self.state, extra_env=self.env)
+                self.assertEqual((p.returncode, p.stderr),
+                                 (64, "c-lean: unknown -e %r (have: low, medium, high, xhigh, max, "
+                                      "in any letter case)\n" % value),
+                                 "an effort the CLI does not take must be a usage error")
+        self.assertEqual(self.calls(), 4)
+
+    def script_env(self, events, rc=0, extra_env=None):
+        """The environment of a run against these events (see script)."""
+        self.nscript = getattr(self, "nscript", 0) + 1
+        path = self.path("script-%d.json" % self.nscript)
+        with open(path, "w") as f:
+            json.dump({"events": events, "rc": rc}, f)
+        return child_env("script", self.state, dict(self.env, C_LEAN_FAKE_SCRIPT=path,
+                                                    **(extra_env or {})))
+
+    def test_a_reader_that_goes_away_mid_answer_ends_quietly_with_120(self):
+        """`c-lean … | head -c 10` with an answer of about 300 KB: the write met
+        a closed pipe and ended in a BrokenPipeError traceback, exit 1, where
+        -h promises exit 120."""
+        answer = "".join("line %06d of a long answer\n" % n for n in range(12000)).strip()
+        self.assertGreater(len(answer), 300000)
+        proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--system", "S", "hello"],
+                                env=self.script_env([ev_text("1", answer), ev_result(answer)]),
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, bufsize=0, preexec_fn=default_sighup)
+        try:
+            head = proc.stdout.read(10)
+            proc.stdout.close()
+            err = proc.stderr.read().decode("utf-8", "replace")
+            proc.wait(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.assertEqual(head, answer[:10].encode())
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("Exception ignored", err)
+        self.assertEqual(proc.returncode, 120, "a reader that went away must give exit 120: %s"
+                         % err[-300:])
+        self.assertIn(" · exit 0 · ", err, "the trailer was written before the answer")
+        self.assertEqual([r["exit"] for r in self.jsonl(self.log)], [0])
+
+    def test_a_stdout_with_no_reader_ends_without_a_second_error(self):
+        """An answer small enough for the buffer of stdout failed only when the
+        interpreter flushed it on the way out: a second error on stderr."""
+        read_end, write_end = os.pipe()
+        os.close(read_end)
+        try:
+            p = subprocess.run([sys.executable, CLI, "-m", "haiku", "--system", "S", "hello"],
+                               env=child_env("single", self.state, self.env), stdout=write_end,
+                               stderr=subprocess.PIPE, timeout=60, preexec_fn=default_sighup)
+        finally:
+            os.close(write_end)
+        err = p.stderr.decode("utf-8", "replace")
+        self.assertNotIn("Exception ignored", err, "a broken stdout must not fail again at "
+                         "interpreter shutdown")
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(p.returncode, 120, err[-300:])
+        self.assertEqual([r["exit"] for r in self.jsonl(self.log)], [0])
+
+    def test_a_usage_log_warning_on_a_broken_stderr_still_saves_the_text(self):
+        """The WARN of a usage log that cannot be written met a broken stderr and
+        raised before the text blocks of the call were saved."""
+        # a directory cannot be opened as the log: one WARN
+        env = self.script_env([ev_text("1", "text that must be kept"),
+                               ev_result("API Error", is_error=True, subtype="error")], rc=1,
+                              extra_env={"C_LEAN_USAGE_LOG": self.dir})
+        stderr = self.broken_stderr()
+        try:
+            p = subprocess.run([sys.executable, CLI, "-m", "haiku", "--system", "S", "hello"],
+                               env=env, stdout=subprocess.PIPE, stderr=stderr, timeout=60,
+                               preexec_fn=default_sighup)
+        finally:
+            os.close(stderr)
+        self.assertEqual(self.saved_blocks(), [["text that must be kept"]],
+                         "a broken stderr at the usage-log WARN must not cost the text blocks")
+        self.assertEqual((p.returncode, p.stdout), (120, b""))
+
+    def test_the_answer_is_utf8_whatever_the_encoding_of_stdout(self):
+        """Under PYTHONIOENCODING=ascii a non-ASCII answer ended in a
+        UnicodeEncodeError traceback and was lost."""
+        env = {"PYTHONIOENCODING": "ascii"}
+        prompt = "café — Привет"
+        p = self.run_bytes(["-m", "haiku"], stdin=prompt.encode("utf-8"), extra_env=env)
+        err = p.stderr.decode("ascii")  # stderr keeps its own encoding, with escapes
+        self.assertNotIn("Traceback", err)
+        self.assertEqual((p.returncode, p.stdout), (0, ("ECHO:%s\n" % prompt).encode("utf-8")),
+                         "the answer must go to stdout as UTF-8: %s" % err[-300:])
+        self.assertIn(" \\xb7 exit 0 \\xb7 ", err, "the trailer must not fail on the encoding")
+        # a lone surrogate still goes out as its escape, and a NOTE of model
+        # text on stderr in escapes
+        env = self.script_env([ev_text("1", "\ud800é "), ev_ask(CAP_ASK), ev_text("2", "ü end"),
+                               ev_result("ü end")], extra_env=env)
+        p = subprocess.run([sys.executable, CLI, "-m", "haiku", "--system", "S", "hello"], env=env,
+                           capture_output=True, timeout=120)
+        err = p.stderr.decode("ascii")
+        self.assertEqual((p.returncode, p.stdout), (0, "\\ud800é ü end\n".encode("utf-8")),
+                         err[-300:])
+        self.assertIn('"\\ud800\\xe9 " | "\\xfc end"', err)
+
+    def check_with_probe(self, mode, probe, extra=None, umask=None):
+        env = child_env(mode, self.state, dict(self.env, C_LEAN_CHECK_PROBE_FILE=probe,
+                                               **(extra or {})))
+
+        def start():
+            default_sighup()
+            if umask is not None:
+                os.umask(umask)
+        return subprocess.run([sys.executable, CLI, "--check"], env=env, capture_output=True,
+                              text=True, timeout=120, preexec_fn=start)
+
+    def test_check_keeps_the_exit_of_a_binary_that_cannot_run_and_of_a_timeout(self):
+        """--check turned exit 69 (the binary cannot be run) and 124 (the
+        timeout) into 1, so a script could not tell them from a bad probe."""
+        probe = self.path("probe.jsonl")
+        for bin_, mode, args, want in ((self.unusable_bin(), "single", [], 69),
+                                       (self.path("no-such-claude"), "single", [], 69),
+                                       (FAKE, "hang", ["--timeout", "2"], 124)):
+            with self.subTest(want=want, bin=bin_):
+                env = child_env(mode, self.state, dict(self.env, C_LEAN_CLAUDE_BIN=bin_,
+                                                       C_LEAN_CHECK_PROBE_FILE=probe))
+                try:
+                    p = subprocess.run([sys.executable, CLI, "--check"] + args, env=env,
+                                       capture_output=True, text=True, timeout=120,
+                                       preexec_fn=default_sighup)
+                finally:
+                    self.kill_recorded()
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual((p.returncode, self.trailer_exit(p), self.jsonl(self.log)[-1]["exit"],
+                                  self.jsonl(probe)[-1]["exit"]), (want, want, want, want),
+                                 "--check must give the exit of the call, in the trailer, the "
+                                 "usage log and the probe record too: %s" % p.stderr[-300:])
+
+    def test_check_keeps_the_exit_71_of_a_call_that_cannot_start(self):
+        """--check turned exit 71 (a resource the call needs could not be
+        made) into 1, as it did 69 and 124."""
+        for what in ("the working directory", "the system-prompt file"):
+            with self.subTest(what=what):
+                body, reason = self.CANNOT_MAKE[what]
+                tmp, probe = self.mktemp("c-lean-tmp-"), self.path("probe-71.jsonl")
+                p = self.check_with_probe("single", probe, extra=dict(
+                    TMPDIR=tmp, PYTHONPATH=self.site("import errno\n" + body)))
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual((p.returncode, self.trailer_exit(p), self.jsonl(self.log)[-1]["exit"],
+                                  self.jsonl(probe)[-1]["exit"]), (71, 71, 71, 71),
+                                 "--check must give exit 71 of a call that cannot start, in the "
+                                 "trailer, the usage log and the probe record too: %s"
+                                 % p.stderr[-300:])
+                self.assertIn("c-lean --check: FAIL call failed: cannot start the call: %s: %s"
+                              % (what, reason % {"tmp": tmp}), p.stderr.splitlines())
+                self.assertEqual(os.listdir(tmp), [])
+        self.assertEqual(self.calls(), 0)
+
+    def test_the_probe_record_carries_the_exit_of_check_and_is_private(self):
+        """The record of C_LEAN_CHECK_PROBE_FILE held the exit of the call (0),
+        not the exit of --check (1), and a new file got the mode of the umask."""
+        for umask in (0o022, 0o277):
+            with self.subTest(umask=oct(umask)):
+                probe = self.path("probe-%o.jsonl" % umask)
+                p = self.check_with_probe("usagenone", probe, umask=umask)
+                self.assertEqual(p.returncode, 1, p.stderr[-300:])
+                self.assertEqual([r["exit"] for r in self.jsonl(probe)], [1],
+                                 "the probe record must carry the exit that --check returns")
+                self.assertEqual(stat.S_IMODE(os.stat(probe).st_mode), 0o600,
+                                 "a probe file made by c-lean must have mode 0600")
+        # a file that is there keeps its mode
+        probe = self.path("probe-kept.jsonl")
+        open(probe, "w").close()
+        os.chmod(probe, 0o640)
+        p = self.check_with_probe("usageinout", probe)
+        self.assertEqual(p.returncode, 0, p.stderr[-300:])
+        self.assertEqual(([r["exit"] for r in self.jsonl(probe)],
+                          stat.S_IMODE(os.stat(probe).st_mode)), ([0], 0o640),
+                         "a probe file that is already there must keep its mode")
+
+    def test_a_probe_record_that_cannot_be_written_costs_one_warn(self):
+        """A probe file that could not be opened ended --check in a traceback."""
+        for probe, why in ((self.dir, "Is a directory"),
+                           (self.path("no-such-dir/probe.jsonl"), "No such file or directory")):
+            with self.subTest(probe=probe):
+                p = self.check_with_probe("usageinout", probe)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(self.warns(p) + [l for l in p.stderr.splitlines()
+                                                  if l.startswith("c-lean --check: WARN")],
+                                 ["c-lean --check: WARN could not write the probe record to %s: %s"
+                                  % (probe, why)], p.stderr[-300:])
+                self.assertEqual((p.returncode, self.trailer_exit(p),
+                                  self.jsonl(self.log)[-1]["exit"]), (0, 0, 0),
+                                 "a probe record that cannot be written must not change the exit")
+
+    def test_help_describes_check_and_the_exit_codes_of_the_error_paths(self):
+        h = " ".join(run([CLI, "-h"], state=self.state, extra_env=self.env).stdout.split())
+        for phrase in ("--check makes one fixed Haiku probe",
+                       "It ignores the prompt and every flag except --timeout and --backend",
+                       "It exits 0 or 1 (a failed check), or 69, 71, 75, 124 or 128+N as a call "
+                       "would",
+                       "C_LEAN_CHECK_PROBE_FILE=PATH appends a JSON record of the probe to PATH "
+                       "(a new file gets mode 0600) with the exit code --check gives",
+                       "71 a local resource the call needs could not be made",
+                       "c-lean: cannot start the call: <what>: <reason>",
+                       "c-lean then prints nothing more and exits 120, without a traceback",
+                       "so do the record of --check",
+                       "a prompt on stdin are read as UTF-8 too",
+                       "The answer goes to stdout as UTF-8 whatever the encoding of stdout"):
+            self.assertIn(phrase, h, "c-lean -h must say: %s" % phrase)
+        self.assertNotIn("cannot flush its streams", h)
+
+    # What the call needs, made by c-lean, made to fail by the test (a real
+    # failure needs a full disk, a quota or an exhausted process table).
+    CANNOT_MAKE = {
+        "the working directory": (
+            "def failing(*a, **k):\n"
+            "    raise OSError(errno.ENOSPC, 'No space left on device')\n"
+            "B.tempfile.mkdtemp = failing\n", "No space left on device"),
+        "the system-prompt file": (
+            "def failing(*a, **k):\n"
+            "    raise PermissionError(errno.EACCES, 'Permission denied', os.environ['TMPDIR'])\n"
+            "B.tempfile.mkstemp = failing\n", "Permission denied (%(tmp)s)"),
+        "the stdin pipe": (
+            "def failing():\n"
+            "    raise OSError(errno.EMFILE, 'Too many open files')\n"
+            "B.os.pipe = failing\n", "Too many open files"),
+        # The child is up when the thread cannot start: its pid is written
+        # down, and a walk of its tree waits until the child has started and
+        # then 0.5 s more, so that a child whose stdin was closed before the
+        # kill has the time to go on.
+        "the feeder thread": (
+            "import threading, time, types\n"
+            "class NoThread(threading.Thread):\n"
+            "    def start(self):\n"
+            "        with open(os.environ['CHILD_PIDS'], 'w') as f:\n"
+            "            f.write(' '.join(str(p.pid) for p in B._LIVE))\n"
+            "        raise RuntimeError(\"can't start new thread\")\n"
+            "B.threading = types.SimpleNamespace(Thread=NoThread)\n"
+            "real = B._descendants\n"
+            "def slow(pid):\n"
+            "    count = os.path.join(os.environ['C_LEAN_FAKE_STATE'], 'calls.count')\n"
+            "    t0 = time.monotonic()\n"
+            "    while not os.path.exists(count) and time.monotonic() - t0 < 30:\n"
+            "        time.sleep(0.01)\n"
+            "    time.sleep(0.5)\n"
+            "    return real(pid)\n"
+            "B._descendants = slow\n", "can't start new thread"),
+    }
+
+    def kill_pids(self, path):
+        """Kill every process whose pid is in the file at `path`, if any."""
+        if os.path.exists(path):
+            for pid in open(path).read().split():
+                if self.alive(pid):
+                    os.kill(int(pid), signal.SIGKILL)
+
+    def test_a_resource_the_call_needs_that_cannot_be_made_is_exit_71(self):
+        """mkdtemp, the file of the system prompt, os.pipe and the thread that
+        writes the prompt each ended in a traceback, exit 1, with no trailer
+        and no usage-log line, and what had been made stayed behind."""
+        for n, (what, (body, reason)) in enumerate(sorted(self.CANNOT_MAKE.items())):
+            with self.subTest(what=what):
+                tmp, pids = self.mktemp("c-lean-tmp-"), self.path("child-%d.pids" % n)
+                self.state = self.mktemp("c-lean-state-")  # a count of calls of its own
+                env = child_env("hang", self.state, dict(
+                    self.env, TMPDIR=tmp, CHILD_PIDS=pids,
+                    PYTHONPATH=self.site("import errno\n" + body)))
+                try:
+                    p = subprocess.run([sys.executable, CLI, "-m", "haiku", "--system", "S",
+                                        "hello"], env=env, capture_output=True, text=True,
+                                       timeout=120, preexec_fn=default_sighup)
+                finally:
+                    self.kill_recorded()
+                    self.kill_pids(pids)
+                self.assertNotIn("Traceback", p.stderr)
+                line = "c-lean: cannot start the call: %s: %s" % (what, reason % {"tmp": tmp})
+                self.assertEqual((p.returncode, [l for l in p.stderr.splitlines()
+                                                 if l.startswith("c-lean:")]), (71, [line]),
+                                 p.stderr[-400:])
+                self.assertEqual(self.trailer_exit(p), 71)
+                rec = self.jsonl(self.log)[-1]
+                self.assertEqual((rec["exit"], rec["tokens_unknown"]), (71, False))
+                self.assertEqual(os.listdir(tmp), [], "the working directory and the file of "
+                                 "the system prompt must be removed")
+                started = what == "the feeder thread"
+                self.assertEqual(self.calls(), int(started))
+                if started:
+                    pid = open(pids).read().split()[0]
+                    self.wait_for(lambda: not self.alive(pid), secs=5, what="the child to be killed")
+                    self.assertFalse(os.path.exists(os.path.join(self.state, "hang.pids")),
+                                     "the child must be killed before its stdin is closed")
+
+    def test_a_feeder_thread_that_cannot_start_leaves_no_descriptor_behind(self):
+        seen = []
+
+        class NoThread(threading.Thread):
+            def start(self):
+                seen.extend(p.pid for p in B._LIVE)
+                raise RuntimeError("can't start new thread")
+        tmp = self.mktemp("c-lean-tmp-")
+        env = child_env("hang", self.state, self.env)
+        with mock.patch.dict(os.environ, env), mock.patch.object(tempfile, "tempdir", tmp), \
+                mock.patch.object(B, "threading", types.SimpleNamespace(Thread=NoThread)):
+            before = len(os.listdir("/dev/fd"))
+            try:
+                r = B._call_claude("p", "S", "haiku", "low", None, 5)
+            except RuntimeError as e:
+                r = e
+            finally:
+                after = len(os.listdir("/dev/fd"))
+                self.addCleanup(self.kill_recorded)
+                for pid in seen:
+                    self.addCleanup(lambda pid=pid: self.alive(pid) and os.kill(pid, signal.SIGKILL))
+        self.assertEqual((getattr(r, "exit", r), getattr(r, "err", None)),
+                         (71, "cannot start the call: the feeder thread: can't start new thread"))
+        self.assertEqual(after, before, "every pipe end of the call must be closed")
+        self.assertEqual(len(seen), 1)
+        self.wait_for(lambda: not self.alive(seen[0]), secs=5, what="the child to be killed")
+        self.assertEqual(os.listdir(tmp), [])
 
 
 def tearDownModule():

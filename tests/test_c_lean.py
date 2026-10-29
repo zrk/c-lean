@@ -806,12 +806,8 @@ if _dir:
 
 
     def test_single_sighup_to_the_process_group_stops_the_call(self):
-        """A closed terminal hangs up the whole job: `c-lean` and its child both
-        get SIGHUP. The child dies of it, so the code is 128+1 whatever the
-        timing — a SIGHUP to the pid of `c-lean` alone would make the handler's
-        SIGKILL the child's death, and 137 the code. This fake dies of the
-        signal; the real CLI (the `cli` mode) ends the call itself with exit
-        129, and `c-lean` then says 1 or 137 — a gap this test does not cover."""
+        """SIGHUP to the whole job stops the call with exit 128+1, whether
+        the CLI exits first or the wrapper's SIGKILL reaches it first."""
         proc = self.start_call([CLI, "-m", "haiku", "--system", "S", "hello"],
                                 mode="sleeper", new_session=True)
         try:
@@ -2037,11 +2033,7 @@ if _dir:
                          "a timeout inside a character must keep completed text blocks")
 
     def test_an_exception_out_of_communicate_does_not_leave_the_child_running(self):
-        real = subprocess.Popen.communicate
-
         def boom(proc, *a, **kw):
-            if FAKE not in (proc.args if isinstance(proc.args, (list, tuple)) else [proc.args]):
-                return real(proc, *a, **kw)  # pgrep and the like are not the call
             # the prompt comes on stdin from a thread of the tool, which closes
             # it: the fake starts its work once stdin ends
             path = os.path.join(self.state, "hang.pids")
@@ -2050,7 +2042,7 @@ if _dir:
             raise OverflowError("timestamp too large to convert to C PyTime_t")
         env = child_env("hang", self.state, self.env)
         with mock.patch.dict(os.environ, env), \
-                mock.patch.object(subprocess.Popen, "communicate", boom):
+                mock.patch.object(B, "_communicate", boom):
             with self.assertRaises(OverflowError):
                 B._call_claude("p", "S", "haiku", "low", None, 5)
         parent, kid = open(os.path.join(self.state, "hang.pids")).read().split()
@@ -2417,7 +2409,7 @@ if _dir:
                 proc.kill()
                 proc.communicate()
             self.kill_leftovers()
-        self.assertEqual(proc.returncode, 128 + signal.SIGKILL, err[-300:])
+        self.assertEqual(proc.returncode, 128 + signal.SIGTERM, err[-300:])
         self.assertFalse(os.path.exists(got["system_file"]),
                          "the file of the system prompt must be removed after a stop signal")
 
@@ -2709,6 +2701,385 @@ if _dir:
                        "The usage-log line still gives the exit code c-lean had decided, not 120",
                        "The prompt goes to the CLI as UTF-8"):
             self.assertIn(phrase, h, "c-lean -h must say: %s" % phrase)
+
+    def test_linux_proc_walk_parses_comm_and_never_runs_pgrep(self):
+        procdir = self.mktemp("c-lean-proc-")
+        for pid, parent in ((101, 1), (102, 101), (103, 102)):
+            os.mkdir(os.path.join(procdir, str(pid)))
+            with open(os.path.join(procdir, str(pid), "stat"), "w") as f:
+                f.write("%d (a name (with) parentheses)) S %d 0 0\n" % (pid, parent))
+        scan = os.scandir
+        with mock.patch.object(B.sys, "platform", "linux"), \
+                mock.patch.object(B.os, "scandir", lambda path: scan(procdir)), \
+                mock.patch.object(B.subprocess, "run") as run_pgrep:
+            self.assertEqual(B._descendants(101), [102, 103],
+                             "/proc must parse ppid after the last closing parenthesis")
+            self.assertEqual(run_pgrep.call_count, 0,
+                             "Linux discovery must not start a subprocess")
+
+    def test_an_unreadable_proc_warns_once_and_still_kills_the_child(self):
+        import io
+        err = io.StringIO()
+        proc = mock.Mock(pid=101, c_lean_own_session=False, c_lean_killed_at=None)
+        with mock.patch.object(B.sys, "platform", "linux"), \
+                mock.patch.object(B.os, "scandir", side_effect=PermissionError("unreadable")), \
+                mock.patch.object(B, "_TREE_WARNED", False), \
+                mock.patch.object(B.sys, "stderr", err):
+            B._kill_tree(proc)
+            B._kill_tree(proc)
+        self.assertEqual(proc.kill.call_count, 2, "unreadable /proc must still kill the child")
+        self.assertEqual(err.getvalue().count("WARN could not list the processes of the call"), 1,
+                         "unreadable /proc must warn once per run")
+        self.assertIn("some may still run", err.getvalue())
+
+    def test_pgrep_failure_warns_and_uses_the_absolute_fallback(self):
+        import io
+        pgrep = self.path("pgrep")
+        with open(pgrep, "w") as f:
+            f.write("#!/bin/sh\nexit 3\n")
+        os.chmod(pgrep, 0o700)
+        real_run = subprocess.run
+        commands = []
+
+        def run_pgrep(cmd, **kw):
+            commands.append(cmd)
+            return real_run([pgrep] + cmd[1:], **kw)
+        err = io.StringIO()
+        proc = mock.Mock(pid=101, c_lean_own_session=False, c_lean_killed_at=None)
+        with mock.patch.object(B.sys, "platform", "darwin"), \
+                mock.patch.object(B.shutil, "which", return_value=None), \
+                mock.patch.object(B.subprocess, "run", run_pgrep), \
+                mock.patch.object(B, "_TREE_WARNED", False), \
+                mock.patch.object(B.sys, "stderr", err):
+            B._kill_tree(proc)
+            B._kill_tree(proc)
+        self.assertEqual(commands[0], ["/usr/bin/pgrep", "-P", "101"],
+                         "pgrep missing from PATH must fall back to /usr/bin/pgrep")
+        self.assertEqual(proc.kill.call_count, 2, "pgrep failure must still kill the child")
+        self.assertEqual(err.getvalue().count("WARN could not list the processes of the call"), 1,
+                         "pgrep failure must warn once per run")
+        self.assertIn("pgrep exited 3", err.getvalue())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc discovery")
+    def test_linux_timeout_kills_the_tree_without_pgrep(self):
+        bindir = self.mktemp("c-lean-no-pgrep-")
+        os.symlink(sys.executable, os.path.join(bindir, "python3"))
+        # child_env can prepend the discovery fixture; this test needs an empty PATH.
+        env = child_env("hang", self.state, self.env)
+        env["PATH"] = bindir
+        p = subprocess.run([sys.executable, CLI, "-m", "haiku", "--timeout", "2", "x"],
+                           env=env, capture_output=True, text=True, timeout=15)
+        pids = open(os.path.join(self.state, "hang.pids")).read().split()
+        try:
+            self.wait_for(lambda: not any(self.alive(pid) for pid in pids), secs=2,
+                          what="/proc to kill the grandchild without pgrep")
+        finally:
+            for pid in pids:
+                if self.alive(pid):
+                    os.kill(int(pid), signal.SIGKILL)
+        self.assertEqual(p.returncode, 124, p.stderr)
+        self.assertNotIn("could not list", p.stderr)
+
+    def test_killing_an_isolated_call_also_kills_its_group(self):
+        events = []
+        proc = mock.Mock(pid=101, c_lean_own_session=True, c_lean_killed_at=None)
+        proc.kill.side_effect = lambda: events.append("child")
+        with mock.patch.object(B, "_descendants", side_effect=lambda pid: events.append("list") or [102, 103]), \
+                mock.patch.object(B.os, "kill", side_effect=lambda pid, sig: events.append(pid)), \
+                mock.patch.object(B.os, "killpg", side_effect=lambda pid, sig: events.append((pid, sig))):
+            B._kill_tree(proc)
+        self.assertEqual(events, ["list", 103, 102, (101, signal.SIGKILL), "child"],
+                         "collect the whole tree first, then kill descendants, group and child")
+
+    def test_the_default_call_stays_in_the_job(self):
+        proc = self.start_call([CLI, "-m", "haiku", "hello"], "cli", new_session=True)
+        try:
+            self.wait_for(lambda: self.sleeper_pids(), what="the call in the job")
+            child = int(self.sleeper_pids()[0][0])
+            self.assertEqual(os.getpgid(child), os.getpgid(proc.pid),
+                             "with no inherited ignore the child must stay in the job")
+        finally:
+            os.kill(proc.pid, signal.SIGTERM)
+            proc.communicate(timeout=10)
+            self.kill_leftovers()
+
+    def test_each_inherited_ignore_survives_a_signal_to_the_job(self):
+        for sig in STOP_SIGNALS:
+            with self.subTest(signal=sig):
+                self.state = self.mktemp("c-lean-ignored-")
+                def inherited_ignore():
+                    default_sighup()
+                    signal.signal(sig, signal.SIG_IGN)
+                env = child_env("cli", self.state, dict(self.env, C_LEAN_FAKE_SLEEP="1"))
+                proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "hello"],
+                                        env=env, text=True, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, start_new_session=True,
+                                        preexec_fn=inherited_ignore)
+                try:
+                    self.wait_for(lambda: self.sleeper_pids(), what="the isolated call")
+                    os.killpg(proc.pid, sig)
+                    out, err = proc.communicate(timeout=10)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate()
+                    self.kill_leftovers()
+                self.assertEqual((proc.returncode, out), (0, "ECHO:hello\n"),
+                                 "each inherited ignore must survive a signal to the job: " + err)
+
+    def test_cli_stops_have_the_caught_signal_exit_for_pid_and_job(self):
+        for sig in STOP_SIGNALS:
+            for whole_job in (False, True):
+                with self.subTest(signal=sig, whole_job=whole_job):
+                    self.state = self.mktemp("c-lean-stop-")
+                    proc = self.start_call([CLI, "-m", "haiku", "hello"], "cli", new_session=True)
+                    try:
+                        self.wait_for(lambda: self.sleeper_pids(), what="the CLI handlers")
+                        (os.killpg if whole_job else os.kill)(proc.pid, sig)
+                        out, err = proc.communicate(timeout=10)
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+                            proc.communicate()
+                        self.kill_leftovers()
+                    self.assertEqual(proc.returncode, 128 + sig,
+                                     "a caught stop must exit 128+signal regardless of the CLI: " + err)
+                    self.assertEqual(out, "")
+                    self.assertIn("INTERRUPTED", err)
+                    self.assertIn("NOT COUNTED", err)
+                    rec = self.jsonl(self.log)[-1]
+                    self.assertEqual((rec["exit"], rec["interrupted"], rec["tokens_unknown"]),
+                                     (128 + sig, True, True), "a caught stop must not count tokens")
+
+    def test_a_stop_keeps_its_exit_when_the_cli_finishes_first(self):
+        site = self.mktemp("c-lean-stop-race-")
+        with open(os.path.join(site, "sitecustomize.py"), "w") as f:
+            f.write("import sys, time\nsys.path.insert(0, %r)\nimport c_lean_core as B\n"
+                    "real = B._kill_tree\n"
+                    "def delayed(proc):\n    time.sleep(0.3)\n    real(proc)\n"
+                    "B._kill_tree = delayed\n" % BIN)
+        for sig in STOP_SIGNALS:
+            self.state = self.mktemp("c-lean-cli-first-")
+            env = child_env("cli", self.state, dict(self.env, PYTHONPATH=site, C_LEAN_FAKE_SLEEP="20"))
+            proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "hello"], env=env,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    start_new_session=True, preexec_fn=default_sighup)
+            try:
+                self.wait_for(lambda: self.sleeper_pids(), what="the CLI signal handlers")
+                os.killpg(proc.pid, sig)
+                out, err = proc.communicate(timeout=10)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate()
+                self.kill_leftovers()
+            self.assertEqual(proc.returncode, 128 + sig,
+                             "the caught stop must win even when the CLI finishes first: " + err)
+            self.assertIn("INTERRUPTED", err)
+            self.assertIn("NOT COUNTED", err)
+            self.assertEqual(out, "")
+
+    def test_a_good_result_stands_when_a_stop_arrives(self):
+        for sig in STOP_SIGNALS:
+            self.state = self.mktemp("c-lean-answer-stop-")
+            proc = self.start_call([CLI, "-m", "haiku", "hello"], "linger", new_session=True)
+            try:
+                self.wait_for(lambda: os.path.exists(os.path.join(self.state, "hang.pids")),
+                              what="the result already printed")
+                os.kill(proc.pid, sig)
+                out, err = proc.communicate(timeout=10)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate()
+                pids = os.path.join(self.state, "hang.pids")
+                for pid in open(pids).read().split() if os.path.exists(pids) else []:
+                    if self.alive(pid):
+                        os.kill(int(pid), signal.SIGKILL)
+            self.assertEqual((proc.returncode, out), (0, "ECHO:hello\n"),
+                             "a good result before a stop must stand: " + err)
+            self.assertIn("came after the answer", err, "a stop after the answer needs a WARN")
+            self.assertNotIn("INTERRUPTED", err)
+            self.assertFalse(self.jsonl(self.log)[-1]["tokens_unknown"])
+
+    def test_a_stop_interrupts_prompt_reads_without_eof(self):
+        # Mark handler installation; stdin is kept open throughout communicate().
+        site = self.mktemp("c-lean-prompt-probe-")
+        with open(os.path.join(site, "sitecustomize.py"), "w") as f:
+            f.write("import sys, os\nsys.path.insert(0, %r)\nimport c_lean_core as B\n"
+                    "real = B.install_signal_handlers\n"
+                    "def install():\n    real()\n    open(os.environ['PROMPT_READY'], 'w').close()\n"
+                    "B.install_signal_handlers = install\n" % BIN)
+        for source in ("stdin", "dash", "fifo", "fifo-open"):
+            for sig in STOP_SIGNALS:
+                with self.subTest(source=source, signal=sig):
+                    ready = self.path("ready-%s-%d" % (source, sig))
+                    read_end, write_end = os.pipe()
+                    fifo_fd = None
+                    args = []
+                    if source.startswith("fifo"):
+                        fifo = self.path("fifo-%s-%d" % (source, sig))
+                        os.mkfifo(fifo)
+                        if source == "fifo":
+                            fifo_fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+                            os.write(fifo_fd, b"partial prompt")
+                        args = ["-f", fifo]
+                    elif source == "dash":
+                        args = ["-f", "-"]
+                    env = child_env("ok", self.state, dict(self.env, PYTHONPATH=site, PROMPT_READY=ready))
+                    proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku"] + args, env=env,
+                                            stdin=read_end, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                            text=True, preexec_fn=default_sighup)
+                    os.close(read_end)
+                    os.write(write_end, b"partial prompt")
+                    try:
+                        self.wait_for(lambda: os.path.exists(ready), what="prompt handlers")
+                        time.sleep(0.05)
+                        t0 = time.monotonic()
+                        os.kill(proc.pid, sig)
+                        try:
+                            out, err = proc.communicate(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            self.fail("a stop must interrupt a prompt read without EOF within 2s")
+                        self.assertLess(time.monotonic() - t0, 2)
+                    finally:
+                        os.close(write_end)
+                        if fifo_fd is not None:
+                            os.close(fifo_fd)
+                        if proc.poll() is None:
+                            proc.kill()
+                            proc.communicate()
+                    self.assertEqual(proc.returncode, 128 + sig, "prompt stop must exit 128+signal: " + err)
+                    self.assertIn("stopped before the call (signal %d)" % sig, err)
+                    self.assertNotIn("Traceback", err)
+                    self.assertIn("INTERRUPTED", err)
+                    self.assertEqual(out, "")
+                    rec = self.jsonl(self.log)[-1]
+                    self.assertEqual((rec["exit"], rec["interrupted"]), (128 + sig, True))
+                    self.assertEqual(self.calls(), 0)
+
+    def pipeholder(self, ending, sig=None, timeout="40", rc=0):
+        env = child_env("pipeholder", self.state,
+                        dict(self.env, C_LEAN_FAKE_HOLDER_END=ending, C_LEAN_FAKE_RC=str(rc)))
+        proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--timeout", timeout, "hello"],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, preexec_fn=default_sighup)
+        t0 = time.monotonic()
+        try:
+            self.wait_for(lambda: os.path.exists(os.path.join(self.state, "orphan.pid")),
+                          what="the orphan holding both pipes")
+            if sig:
+                self.wait_for(lambda: self.sleeper_pids(), what="the call with a pipe holder")
+                os.kill(proc.pid, sig)
+            try:
+                out, err = proc.communicate(timeout=B.RESULT_GRACE + B.KILL_DRAIN + 5)
+            except subprocess.TimeoutExpired:
+                self.fail("a surviving pipe holder must not wait for the call timeout")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+            path = os.path.join(self.state, "orphan.pid")
+            if os.path.exists(path) and self.alive(open(path).read()):
+                os.kill(int(open(path).read()), signal.SIGKILL)
+        return subprocess.CompletedProcess(proc.args, proc.returncode, out, err), time.monotonic() - t0
+
+    def test_an_exited_cli_with_a_result_and_open_pipes_keeps_the_answer(self):
+        p, took = self.pipeholder("answer")
+        self.assertLess(took, B.RESULT_GRACE + B.KILL_DRAIN + 5,
+                        "open pipes after exit must have a bounded wait")
+        self.assertEqual((p.returncode, p.stdout), (0, "ECHO:hello\n"), p.stderr)
+        self.assertIn("CLI exited but a process it started still held its output open 5s later", p.stderr)
+        self.assertIn("its output open after 3s; it may still run", p.stderr)
+
+    def test_an_exited_cli_without_a_result_and_open_pipes_fails(self):
+        p, took = self.pipeholder("exit")
+        self.assertLess(took, B.RESULT_GRACE + B.KILL_DRAIN + 5)
+        self.assertEqual(p.returncode, 1, "exited CLI without a result must fail, not time out: " + p.stderr)
+        self.assertIn("ended with no `result` event", p.stderr)
+        self.assertIn("rc=0", p.stderr)
+        self.assertIn("CLI exited but a process it started still held its output open 5s later", p.stderr)
+        self.assertIn("may still run", p.stderr)
+
+    def test_open_pipes_do_not_replace_the_childs_own_failure_exit(self):
+        p, took = self.pipeholder("answer", rc=1)
+        self.assertEqual(p.returncode, 1, "open pipes must preserve the child's own failure exit: " + p.stderr)
+        self.assertEqual(p.stdout, "")
+        self.assertIn("claude reported failure (rc=1", p.stderr)
+        self.assertIn("CLI exited but a process it started still held its output open 5s later", p.stderr)
+
+    def test_a_stop_with_a_surviving_pipe_holder_is_bounded(self):
+        for sig in STOP_SIGNALS:
+            self.state = self.mktemp("c-lean-stop-holder-")
+            p, took = self.pipeholder("hang", sig)
+            self.assertLess(took, B.KILL_DRAIN + 2, "a stop must drain for at most KILL_DRAIN")
+            self.assertEqual(p.returncode, 128 + sig, "a stop with open pipes must keep its exit: " + p.stderr)
+            self.assertIn("INTERRUPTED", p.stderr)
+            self.assertIn("its output open after 3s; it may still run", p.stderr)
+
+    def test_a_timeout_with_a_surviving_pipe_holder_is_bounded(self):
+        p, took = self.pipeholder("hang", timeout="2")
+        self.assertLess(took, 2 + B.KILL_DRAIN + 2, "a timeout must drain for at most KILL_DRAIN")
+        self.assertEqual(p.returncode, 124, p.stderr)
+        self.assertIn("its output open after 3s; it may still run", p.stderr)
+
+    def test_a_result_without_a_newline_starts_the_exit_grace(self):
+        t0 = time.monotonic()
+        p = self.script([ev_text("1", "ans")], "--timeout", "30", end="hang",
+                        tail_hex=json.dumps(ev_result("ans")).encode().hex())
+        self.assertLess(time.monotonic() - t0, B.RESULT_GRACE + B.KILL_DRAIN + 5,
+                        "a whole result without newline must start RESULT_GRACE")
+        self.assertEqual((p.returncode, p.stdout), (0, "ans\n"), p.stderr)
+        self.assertEqual(self.warns(p), [self.lingered("5s later")])
+
+    def test_a_result_followed_by_eof_starts_the_exit_grace(self):
+        t0 = time.monotonic()
+        p = self.script([ev_text("1", "ans"), ev_result("ans")], "--timeout", "30", end="closehang")
+        self.assertLess(time.monotonic() - t0, B.RESULT_GRACE + B.KILL_DRAIN + 5,
+                        "a result followed by EOF must start RESULT_GRACE")
+        self.assertEqual((p.returncode, p.stdout), (0, "ans\n"), p.stderr)
+        self.assertEqual(self.warns(p), [self.lingered("5s later")])
+
+    def test_the_output_reader_waits_in_watch_slices(self):
+        pipes = []
+        for data in (b"hello", b""):
+            read_end, write_end = os.pipe()
+            os.write(write_end, data)
+            os.close(write_end)
+            pipes.append(os.fdopen(read_end, "r", encoding="utf-8", errors="backslashreplace"))
+        proc = mock.Mock(stdout=pipes[0], stderr=pipes[1], c_lean_killed_at=None)
+        proc.poll.side_effect = [None, 0, 0]
+        selector = B.selectors.DefaultSelector()
+        select, waits = selector.select, []
+        def record(wait):
+            waits.append(wait)
+            return select(wait)
+        selector.select = record
+        with mock.patch.object(B.selectors, "DefaultSelector", return_value=selector):
+            out, _err, _reason, _gone = B._communicate(proc, B.MAX_TIMEOUT)
+        self.assertEqual(out, "hello")
+        self.assertTrue(waits)
+        self.assertLessEqual(max(waits), B.WATCH_SLICE,
+                             "each output wait must be bounded by WATCH_SLICE")
+
+    def test_pipe_decoding_keeps_universal_newlines_and_bad_utf8(self):
+        p = self.script([], tail_hex=(b"first\r\nsecond\rthird\n\xff" +
+                        b'\n' + json.dumps(ev_result("ans")).encode()).hex())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        # Inspect the loop directly: junk is deliberately outside JSON events.
+        proc = subprocess.Popen([sys.executable, "-c", "import os; os.write(1, b'a\\r\\nb\\rc\\n\\xff')"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                encoding="utf-8", errors="backslashreplace")
+        out, err, reason, gone = B._communicate(proc, 5)
+        self.assertEqual(out, "a\nb\nc\n\\xff", "the read loop must preserve text-mode decoding")
+
+    def test_help_describes_tree_discovery_stops_and_bounded_waits(self):
+        h = " ".join(run([CLI, "-h"], state=self.state, extra_env=self.env).stdout.split())
+        for phrase in ("Linux reads /proc", "pgrep from PATH, else /usr/bin/pgrep",
+                       "could not list the processes of the call", "some may still run",
+                       "at most 3 s", "5 s after its exit", "inherited as SIG_IGN stays ignored",
+                       "came after the answer", "exit 128+signal", "SIGKILL sent to the job"):
+            self.assertIn(phrase, h, "help must describe process and stop handling: " + phrase)
 
 
 def tearDownModule():

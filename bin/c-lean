@@ -95,7 +95,9 @@ Guarantees
     A CLI that has printed its whole `result` event has given its answer.
     If it has not exited 5 s after that, it is killed with its process
     tree, a WARN says so, and the call is judged by that event as if the
-    CLI had exited. The same holds when the timeout runs out in those 5 s:
+    CLI had exited. A whole final JSON object needs no trailing newline;
+    EOF on the pipes does not cancel the 5 s limit while the CLI still runs.
+    The same holds when the timeout runs out in those 5 s:
     the answer is printed, and the exit is not 124.
   * an answer is printed whole, not from its last text block alone. The
     result document of the CLI carries ONE text block, the last one. For an
@@ -154,18 +156,30 @@ Guarantees
     structured output, and text blocks that came with it are not kept),
     --check (a probe, not an answer), and blocks of whitespace alone.
     Thinking is never printed and never saved.
-  * SIGINT/SIGTERM/SIGHUP kill the child with its tree. The exit code is
-    128+signal when the signal lands before the call has started (@TOOL@ is
-    still reading the prompt) or when the child itself dies of the signal.
-    During a call to the claude CLI it is 137 or 1 instead, and a call the
-    CLI ended on its own is reported as a plain failure, not as INTERRUPTED
-    (see Known limitations). Whatever the exit code, a stopped call is
-    reported as stopped or failed, never as an
-    answer. Under `nohup` SIGHUP stays ignored and the child runs in a session
-    of its own, out of reach of the hangup a closed terminal sends to the whole
-    job (the claude CLI ends a call on it whatever it inherited), so the call
-    outlives the terminal; a SIGKILL sent to the job does not reach it then,
-    and the call runs to its end with nobody to read the answer.
+  * SIGINT/SIGTERM/SIGHUP kill the child with its tree and give exit
+    128+signal (130/143/129), INTERRUPTED and NOT COUNTED. This also stops
+    a prompt read at once, including stdin, -f - and a FIFO: no call is made.
+    A good whole `result` already in the stream stands instead: a WARN says
+    the stop came after the answer, and the call is judged by that event.
+    Every stop signal inherited as SIG_IGN stays ignored. If any one was
+    ignored at start (SIGHUP under `nohup`, for example), the child runs in a session
+    of its own, out of reach of signals sent to the whole job: the CLI puts
+    handlers over inherited ignores. Otherwise the child stays in the job.
+    Every kill of an isolated call also sends SIGKILL to its process group.
+    A SIGKILL sent to the job does not reach that isolated call, and it can
+    run to its end with nobody to read the answer.
+  * to find the process tree, Linux reads /proc without a subprocess; other
+    systems use pgrep from PATH, else /usr/bin/pgrep, with -P. The whole tree
+    is collected before any process is killed. When discovery is unavailable,
+    the direct child is still killed, and one line per run says:
+    @TOOL@: WARN could not list the processes of the call (<reason>); some may still run
+    A process already reparented away from the call cannot be found by that walk.
+  * after a kill (stop, timeout or lingering CLI), output is read for at most 3 s.
+    Then the pipes are closed; a WARN says if a process started by the call
+    still held its output open and may still run. If the CLI exited by itself
+    but its pipes stay open 5 s after its exit, its tree is killed and drained
+    in the same way, with a WARN. The call is judged by what the CLI printed
+    and its own exit code, so missing a `result` still fails.
   * `think` in the trailer is part of `out`, which is why it is printed in
     brackets: out 61 (think 55) means 61 output tokens, 55 of them thinking.
     The trailer also names the binary that ran, because it is chosen by
@@ -224,29 +238,20 @@ Known limitations
     file, whatever text blocks came with it.
   * The start window. Until the signal handlers are installed (the interpreter
     starting, the imports, parsing the flags) no call has been made. A SIGTERM
-    or SIGHUP in this window (unless SIGHUP was ignored at start) ends the
+    or SIGHUP in this window (unless inherited as ignored) ends the
     process and the OS reports the signal.
     A SIGINT there does the same, often with a KeyboardInterrupt traceback;
     inside the interpreter's own start-up it can instead end it with exit 1 and
     "Fatal Python error: init_…", and now and then CPython only reports the
     KeyboardInterrupt and the call goes on as usual.
-  * The exit code of a stop. A signal that lands before the call has started
-    (@TOOL@ is still reading the prompt) gives 128+signal, and no call is made.
-    During a call 128+signal comes out only when the child itself dies of the
-    signal, and the claude CLI does not: it catches all three.
-    A signal sent to @TOOL@'s pid alone (kill PID) is seen by @TOOL@ only: its
-    handler kills the child with SIGKILL, and the exit is 137 (128+9), with
-    INTERRUPTED in the trailer. A signal sent to the whole process group
-    (Ctrl-C, a closed terminal, kill -- -PGID) reaches the CLI too, and the
-    CLI ends the call itself tens of milliseconds later (SIGINT: exit 0 with
-    an error_during_execution document; SIGTERM: 143; SIGHUP: 129). If that
-    comes before the handler's SIGKILL, @TOOL@ reports an ordinary failure,
-    exit 1 ("claude reported failure (rc=0 subtype=error_during_execution)"
-    or "the stream of claude ended with no `result` event (… rc=129)"); if
-    not, 137. When the child is in a
-    session of its own (SIGHUP ignored at start, see Guarantees), a SIGINT or
-    SIGTERM sent to the job reaches @TOOL@ alone: 137. After a stop of your own,
-    read 1 and 137 as "stopped, no answer", not as a failed prompt.
+  * The exit code of a stop. When @TOOL@ catches signal N, it gives exit
+    128+signal, before and during the call, with INTERRUPTED and NOT COUNTED
+    during the call. The CLI's own signal handling cannot change that code:
+    it may die of the signal, be killed by @TOOL@, or finish an error document.
+    A good whole `result` already received is the exception: the answer stands,
+    a WARN says the stop came after the answer, and that event decides the call.
+    A child that dies of a signal @TOOL@ did not catch keeps its signal exit
+    (128+N). Signals landing after the exit has been decided cannot change it.
   * Exit 120. When stdout or stderr can no longer be written (a closed
     terminal, or a pipe whose reader has exited), the next write there fails.
     The interpreter then cannot flush its streams on the way out, and @TOOL@
@@ -261,16 +266,15 @@ Known limitations
     answer is lost with the stream.
     Send both streams to files when the terminal may close or the reader may
     go away.
-  * SIGQUIT (Ctrl-\\) and every other fatal signal @TOOL@ does not catch end it
+  * SIGKILL, SIGQUIT (Ctrl-\\) and every other fatal signal @TOOL@ does not catch end it
     on the spot: no trailer, no usage-log line, and the file of the system
     prompt stays in the temporary directory (so it does after a SIGKILL). A
     child the signal did not reach (kill -QUIT PID) runs its call to the
     end, and the answer is lost.
 
 Exit codes
-  0 ok · 1 the call failed (an empty answer counts, an answer still cut off
-    after the CLI's last continuation counts, and so does a call the claude
-    CLI ended on its own after a stop signal, see Known limitations) ·
+  0 ok · 1 the call failed (an empty answer counts, and an answer still cut
+    off after the CLI's last continuation counts) ·
   64 usage (a bad flag value included, and a --schema the command line
     cannot carry) ·
   69 the claude binary cannot be run (missing, no +x, bad format) ·
@@ -278,11 +282,9 @@ Exit codes
   124 timeout, before the CLI printed its `result` event ·
   120 stdout or stderr could no longer be written: a closed terminal, or a pipe
     whose reader has exited (see Known limitations) ·
-  137 the child was killed with SIGKILL, as a rule by @TOOL@'s own handler on a
-    stop signal (see Known limitations) ·
+  137 the child died of SIGKILL while @TOOL@ caught no stop signal ·
   130/143/129 stopped by SIGINT/SIGTERM/SIGHUP
-    — before the call starts, or when the child itself dies of the signal
-    (see Known limitations)
+    — before or during the call, unless a good whole `result` already came
 """
 from __future__ import annotations
 
@@ -598,9 +600,12 @@ def main(argv=None) -> int:
         return B.EXIT_USAGE
 
     try:
-        prompt = gather_prompt(args, parser)
+        with B.reading_prompt():
+            prompt = gather_prompt(args, parser)
         system = gather_system(args)
         schema = B.read_text_arg(args.schema) if args.schema else None
+    except B.PromptStopped:
+        prompt, system, schema = "", None, None
     except B.BadArg as e:
         print(f"{B.TOOL_NAME}: %s" % e, file=sys.stderr)
         return B.EXIT_USAGE

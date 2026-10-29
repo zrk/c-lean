@@ -15,7 +15,10 @@ env.json. received.jsonl has one line per run for what the fake was given: the
 argv, where the prompt came from, the system prompt (length and sha256), and
 the mode bits and directory of the --system-prompt-file file (see note).
 C_LEAN_FAKE_SCRIPT supplies exact events and optional stderr, tail_hex and
-end (exit, hang or kill). The `linger` mode prints a whole answer and then
+end (exit, hang, closehang or kill). `closehang` closes both output pipes
+before hanging. `pipeholder` leaves an orphan holding both pipes; its
+C_LEAN_FAKE_HOLDER_END selects answer, exit or hang.
+The `linger` mode prints a whole answer and then
 does not exit, with a child of its own. C_LEAN_FAKE_SLEEP controls signal scenarios;
 C_LEAN_FAKE_RC and C_LEAN_FAKE_WALL_RC control selected exit codes.
 C_LEAN_FAKE_ASSERT_ENV refuses leaked credentials or an unexpected output cap.
@@ -496,6 +499,11 @@ def main():
             # raw bytes after the last line, no newline: a character cut in two
             sys.stdout.buffer.write(bytes.fromhex(plan["tail_hex"]))
             sys.stdout.buffer.flush()
+        if plan.get("end") == "closehang":
+            os.close(1)
+            os.close(2)
+            time.sleep(45)
+            os._exit(0)
         if plan.get("end") == "hang":
             time.sleep(45)
         if plan.get("end") == "kill":
@@ -514,6 +522,31 @@ def main():
     if MODE == "usageinout":
         return emit("OK", usage_doc={"input_tokens": 575, "output_tokens": 3})
 
+    if MODE == "pipeholder":
+        # Double fork: the holder is reparented before the call exits or is
+        # stopped, so even a working process walk cannot recover its link.
+        middle = os.fork()
+        if middle == 0:
+            holder = os.fork()
+            if holder == 0:
+                os.setsid()
+                with open(os.path.join(STATE, "orphan.pid"), "w") as f:
+                    f.write(str(os.getpid()))
+                time.sleep(45)
+            os._exit(0)
+        os.waitpid(middle, 0)
+        while not os.path.exists(os.path.join(STATE, "orphan.pid")):
+            time.sleep(0.01)
+        ending = os.environ.get("C_LEAN_FAKE_HOLDER_END", "answer")
+        if ending == "answer":
+            emit("ECHO:" + prompt.strip()[:200])
+            return int(os.environ.get("C_LEAN_FAKE_RC", "0"))
+        if ending == "exit":
+            return int(os.environ.get("C_LEAN_FAKE_RC", "0"))
+        with open(os.path.join(STATE, "pids.log"), "a") as f:
+            f.write("%d\n" % os.getpid())
+        time.sleep(45)
+        return 0
     if MODE in ("hang", "linger"):
         if MODE == "linger":
             # the whole answer, `result` included, and then no exit

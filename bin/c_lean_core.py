@@ -51,11 +51,13 @@ Hard rules encoded here:
 from __future__ import annotations
 
 import datetime as _dt
+from contextlib import contextmanager
 import errno
 import hashlib
 import json
 import os
 import re
+import selectors
 import shutil
 import signal
 import subprocess
@@ -536,6 +538,8 @@ def log_usage(rec: dict, path=None) -> None:
 _LIVE_LOCK = threading.Lock()
 _LIVE = set()
 _INTERRUPT = {"signum": 0}
+_READING_PROMPT = False
+_TREE_WARNED = False
 # The signals that stop a run: Ctrl-C, `kill`, and a closed terminal.
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
@@ -545,10 +549,25 @@ def interrupted() -> int:
     return _INTERRUPT["signum"]
 
 
-def sighup_ignored() -> bool:
-    """SIGHUP is ignored here, i.e. the run was started under `nohup` to
-    outlive its terminal (see install_signal_handlers and _call_claude)."""
-    return signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+def stop_signal_ignored() -> bool:
+    """An inherited ignore requires isolating the call from job signals."""
+    return any(signal.getsignal(s) is signal.SIG_IGN for s in STOP_SIGNALS)
+
+
+class PromptStopped(Exception):
+    """A stop interrupted a prompt read, including opening a FIFO."""
+
+
+@contextmanager
+def reading_prompt():
+    global _READING_PROMPT
+    _READING_PROMPT = True
+    try:
+        if interrupted():
+            raise PromptStopped()
+        yield
+    finally:
+        _READING_PROMPT = False
 
 
 def interrupt(signum: int = signal.SIGTERM) -> None:
@@ -580,17 +599,16 @@ def install_signal_handlers() -> None:
     """Every stop signal is handled the same way: no new call starts, and the
     running children are killed with their trees.
 
-    SIGHUP had no handler, and a closed terminal or `kill -HUP` ended the
-    wrapper on the spot: no trailer, and the children, alive without their
-    parent, finished calls whose answers nobody read. One case is left alone:
-    a SIGHUP inherited as SIG_IGN means the run was started under `nohup` to
-    outlive its terminal, so it stays ignored, and the children are started
-    in a session of their own (see _call_claude)."""
+    Every inherited SIG_IGN stays ignored; the call then leaves the job
+    (see _call_claude). Raising during a prompt read prevents PEP 475 from
+    restarting that read after the handler returns."""
     def handler(signum, frame):  # noqa: ARG001
         interrupt(signum)
+        if _READING_PROMPT:
+            raise PromptStopped()
     for s in STOP_SIGNALS:
-        if s == signal.SIGHUP and sighup_ignored():
-            continue  # nohup: the run must survive the closed terminal
+        if signal.getsignal(s) is signal.SIG_IGN:
+            continue
         try:
             signal.signal(s, handler)
         except (ValueError, OSError):  # not the main thread / not supported here
@@ -714,20 +732,53 @@ def _nul_arg(cmd):
     return None
 
 
-def _descendants(pid: int, depth: int = 0) -> list:
-    """Live descendants of pid, deepest last. `pgrep -P` walk; empty on any trouble."""
-    if depth > 6:
-        return []
-    try:
-        out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True, timeout=5)
-    except Exception:
-        return []
-    found = []
-    for tok in out.stdout.split():
-        if tok.isdigit():
-            kid = int(tok)
-            found.append(kid)
-            found.extend(_descendants(kid, depth + 1))
+def _tree_warning(reason) -> None:
+    global _TREE_WARNED
+    if not _TREE_WARNED:
+        _TREE_WARNED = True
+        print(f"{TOOL_NAME}: WARN could not list the processes of the call "
+              "(%s); some may still run" % reason, file=sys.stderr)
+
+
+def _descendants(pid: int) -> list:
+    """Collect the whole tree before killing anything; parents precede children."""
+    children = {}
+    if sys.platform.startswith("linux"):
+        try:
+            with os.scandir("/proc") as entries:
+                for entry in entries:
+                    if not entry.name.isdigit():
+                        continue
+                    try:
+                        with open(entry.path + "/stat") as f:
+                            # comm can contain spaces and parentheses. After its
+                            # LAST ')' come state and ppid, in that order.
+                            parent = int(f.read().rsplit(")", 1)[1].split()[1])
+                        children.setdefault(parent, []).append(int(entry.name))
+                    except (FileNotFoundError, ProcessLookupError):
+                        continue  # exited during the snapshot
+        except (OSError, ValueError, IndexError) as e:
+            _tree_warning("/proc: %s" % e)
+    found, todo, seen = [], [pid], {pid}
+    pgrep = None if sys.platform.startswith("linux") else (
+        shutil.which("pgrep") or "/usr/bin/pgrep")
+    for parent in todo:
+        kids = children.get(parent, [])
+        if pgrep:
+            try:
+                out = subprocess.run([pgrep, "-P", str(parent)], capture_output=True,
+                                     text=True, timeout=5)
+                if out.returncode >= 2 or out.returncode < 0:
+                    raise OSError("pgrep exited %d" % out.returncode)
+                kids = [int(t) for t in out.stdout.split() if t.isdigit()]
+            except (OSError, subprocess.SubprocessError) as e:
+                _tree_warning(str(e))
+                break
+        for kid in kids:
+            if kid not in seen:
+                seen.add(kid)
+                found.append(kid)
+                todo.append(kid)
     return found
 
 
@@ -737,18 +788,24 @@ def _kill_tree(proc) -> None:
     subprocess.run's own timeout path kills only the direct child; a grandchild
     survives (proven with a fake binary that spawns `sleep`). Even one call
     must not leak processes. The child stays in our process group
-    on purpose, so an operator's Ctrl-C still reaches it — except under `nohup`
-    (see _call_claude), where our own handlers stop it through this function.
+    on purpose, except when a stop signal was inherited as ignored.
     """
     for pid in reversed(_descendants(proc.pid)):
         try:
             os.kill(pid, signal.SIGKILL)
         except Exception:
             pass
+    if getattr(proc, "c_lean_own_session", False):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
     try:
         proc.kill()
     except Exception:
         pass
+    if getattr(proc, "c_lean_killed_at", None) is None:
+        proc.c_lean_killed_at = time.monotonic()
 
 
 # ---------------------------------------------------------------- the stream
@@ -1088,16 +1145,9 @@ def save_blocks(blocks, prompt, reason, model=None, effort=None, tool=TOOL_NAME,
     return path
 
 
-def _text(data) -> str:
-    """Process output as text. TimeoutExpired carries bytes even in text mode."""
-    if isinstance(data, bytes):
-        return data.decode("utf-8", "replace")
-    return data or ""
-
-
 # Seconds between two looks at what the child has printed so far (see
-# _communicate). It also keeps every wait far below the ~24 days at which the
-# poll() under communicate() overflows: it takes milliseconds in a C int.
+# _communicate). It also keeps selector waits far below the ~24 days at
+# which poll() overflows: it takes milliseconds in a C int.
 WATCH_SLICE = 0.5
 # Seconds the CLI has to exit once it has printed a whole `result` event. The
 # answer is in that event: a CLI still alive after this is killed rather than
@@ -1105,16 +1155,14 @@ WATCH_SLICE = 0.5
 RESULT_GRACE = 5
 
 
-class Lingered(subprocess.TimeoutExpired):
-    """The child printed a whole `result` event and was still running
-    RESULT_GRACE seconds later."""
+# Seconds to drain output after a kill, even if an orphan holds a pipe.
+KILL_DRAIN = 3
 
 
 def _feed(fd, data) -> None:
     """Write the prompt to the child's stdin and close it. This runs in a
-    thread of its own because communicate() runs in short slices, and
-    CPython does not go on writing the input in the slice after one that
-    ran out. A child that exits before it has read all of it (EPIPE) costs
+    thread of its own so a child that does not read it cannot block output
+    reading or stop handling. A child that exits before it has read all of it (EPIPE) costs
     nothing here: the run is judged by its exit code and stderr."""
     try:
         view = memoryview(data)
@@ -1127,7 +1175,7 @@ def _feed(fd, data) -> None:
 
 
 def _holds_result(lines: bytes) -> bool:
-    """Do these whole lines of stdout hold a `result` event?"""
+    """Do these lines (a whole JSON tail included) hold a `result` event?"""
     for line in lines.split(b"\n"):
         try:
             ev = json.loads(line)
@@ -1139,32 +1187,88 @@ def _holds_result(lines: bytes) -> bool:
 
 
 def _communicate(proc, timeout):
-    """proc.communicate(timeout=timeout) in slices of WATCH_SLICE seconds,
-    each followed by a look at the lines of stdout that came whole since the
-    last one. The output read so far is kept by communicate() from one slice
-    to the next. Returns (stdout, stderr) once the child has exited. Raises
-    TimeoutExpired when the whole limit has passed, and Lingered when the
-    child printed a whole `result` event and had not exited RESULT_GRACE
-    seconds later. The child still runs in both cases."""
+    """Read both pipes ourselves, independently of child exit and pipe EOF.
+
+    Return text, the reason for a kill (if any), and the child's exit code
+    before that kill. No Popen buffers or TimeoutExpired partial output are used.
+    The c_lean_* attributes are our own call state, not Popen internals.
+    """
     if not 0 <= timeout <= MAX_TIMEOUT:  # nan would never run out below
         raise ValueError("timeout must be between 0 and %d seconds, got %r" % (MAX_TIMEOUT, timeout))
     end = time.monotonic() + timeout
-    scanned, result_at = 0, None
-    while True:
+    scanned, result_at, exited_at = 0, None, None
+    reason, gone = None, None
+    buffers = [bytearray(), bytearray()]
+    pipes = (proc.stdout, proc.stderr)
+    with selectors.DefaultSelector() as selector:
         try:
-            return proc.communicate(timeout=max(0.0, min(end - time.monotonic(), WATCH_SLICE)))
-        except subprocess.TimeoutExpired as e:
-            now = time.monotonic()
-            if now >= end:
-                raise
-            if result_at is None:
-                out = e.stdout or b""
-                whole = out.rfind(b"\n") + 1
-                if _holds_result(out[scanned:whole]):
-                    result_at = now
-                scanned = max(scanned, whole)
-            elif now - result_at >= RESULT_GRACE:
-                raise Lingered(e.cmd, e.timeout, e.stdout, e.stderr) from None
+            for i, pipe in enumerate(pipes):
+                selector.register(pipe, selectors.EVENT_READ, i)
+            while True:
+                now = time.monotonic()
+                rc = proc.poll()
+                if rc is not None and exited_at is None:
+                    exited_at = now
+                killed_at = getattr(proc, "c_lean_killed_at", None)
+                if interrupted() and killed_at is None:
+                    _kill_tree(proc)
+                    killed_at = proc.c_lean_killed_at
+                if killed_at is not None and reason is None:
+                    reason = "stop"
+                if rc is not None and not selector.get_map():
+                    break
+                if killed_at is None:
+                    if exited_at is not None and now - exited_at >= RESULT_GRACE:
+                        reason = "pipes"
+                    elif rc is None and result_at is not None and now - result_at >= RESULT_GRACE:
+                        reason = "result"
+                    elif now >= end:
+                        reason = "timeout"
+                    if reason:
+                        gone = rc
+                        _kill_tree(proc)
+                        killed_at = proc.c_lean_killed_at
+                if killed_at is not None:
+                    deadline = killed_at + KILL_DRAIN
+                    if now >= deadline:
+                        if selector.get_map():
+                            print(f"{TOOL_NAME}: WARN a process started by the call still held "
+                                  "its output open after %ss; it may still run"
+                                  % seconds_shown(KILL_DRAIN), file=sys.stderr)
+                        break
+                else:
+                    deadlines = [end]
+                    if result_at is not None and rc is None:
+                        deadlines.append(result_at + RESULT_GRACE)
+                    if exited_at is not None:
+                        deadlines.append(exited_at + RESULT_GRACE)
+                    deadline = min(deadlines)
+                wait = max(0.0, min(deadline - time.monotonic(), WATCH_SLICE))
+                if not selector.get_map():
+                    time.sleep(wait)  # EOF on both pipes does not imply child exit
+                    continue
+                for key, _ in selector.select(wait):
+                    data = os.read(key.fd, 65536)
+                    if not data:
+                        selector.unregister(key.fileobj)
+                        continue
+                    buffers[key.data].extend(data)
+                    if key.data == 0 and result_at is None:
+                        out = buffers[0]
+                        # Include the tail: JSON parsing accepts a whole object
+                        # without a newline, and rejects every cut object.
+                        if _holds_result(out[scanned:]):
+                            result_at = time.monotonic()
+                        scanned = out.rfind(b"\n") + 1
+        finally:
+            for pipe in pipes:
+                pipe.close()
+    # Match TextIOWrapper's UTF-8/backslashreplace and universal newlines,
+    # including a CRLF split between reads and a final incomplete character.
+    stdout, stderr = (bytes(data).decode(pipe.encoding, pipe.errors)
+                      .replace("\r\n", "\n").replace("\r", "\n")
+                      for data, pipe in zip(buffers, pipes))
+    return stdout, stderr, reason, gone
 
 
 def _call_claude(prompt, system, model, effort, schema, timeout):
@@ -1188,15 +1292,13 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
         # stdin is a pipe of our own: _feed writes the prompt into it
         stdin_end, feed = os.pipe()
         try:
-            # Under nohup the child leaves the job for a session of its own. The
-            # claude CLI puts its own SIGHUP handler over the SIG_IGN it inherits
-            # and ends the call with exit 129 (measured on 2.1.258), so the hangup
-            # a closed terminal sends to the whole job lost every call in flight.
-            # SIGINT/SIGTERM still stop it: our handlers kill it via _kill_tree.
+            # The CLI installs handlers even over inherited ignores. A session
+            # of its own shields it from those signals sent to the whole job.
+            own_session = stop_signal_ignored()
             proc = subprocess.Popen(
                 cmd, stdin=stdin_end, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", errors="backslashreplace", cwd=workdir, env=env,
-                start_new_session=sighup_ignored(),
+                start_new_session=own_session,
             )
         except OSError as e:
             if e.errno == errno.E2BIG:
@@ -1219,6 +1321,7 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
                               "and a command line cannot carry one" % (binary, where))
         finally:
             os.close(stdin_end)
+        proc.c_lean_own_session = own_session
         with _LIVE_LOCK:
             _LIVE.add(proc)
         if interrupted():  # the signal landed between Popen and the registration
@@ -1227,57 +1330,43 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
                          name=TOOL_NAME + "-stdin", daemon=True).start()
         feed = None  # the thread closes it
         linger = None
-        try:
-            stdout, stderr = _communicate(proc, timeout)
-            rc = proc.returncode
-        except subprocess.TimeoutExpired as e:
-            # None when the child still runs; else it had exited, and only
-            # something it left behind kept the pipes open
-            gone = proc.poll()
-            _kill_tree(proc)
-            # What the CLI had printed by then is read for how far the model
-            # had got and for the text blocks that had come whole, which the
-            # caller keeps. No answer is taken from a killed call, unless a
-            # whole `result` event had come: then the answer is in hand.
-            stdout, stderr = e.stdout, e.stderr
-            try:
-                stdout, stderr = proc.communicate(timeout=15)
-            except subprocess.TimeoutExpired as e2:
-                stdout, stderr = e2.stdout, e2.stderr
-            except Exception:
-                pass
-            stdout, stderr = _text(stdout), _text(stderr)
-            cut = read_stream(stdout)
-            if not isinstance(cut.doc, dict):
-                secs = (_dt.datetime.now() - t0).total_seconds()
-                # The work was done and billed on the model side; reporting a clean
-                # zero here would understate the spend of a timed-out call.
-                return Result(ok=False, exit=EXIT_TIMEOUT, text="", err="timeout after %ss" % timeout,
-                              why="the call was killed by the timeout after %ss"
-                                  % seconds_shown(timeout),
-                              finished=cut.finished, blocks=cut.texts(),
-                              continued=cut.continued, went_on=cut.joined_after(),
-                              secs=secs, wall=False, raw=None, tokens_unknown=True)
-            # Judged by that event as if the CLI had exited by itself: with
-            # the code it had exited with, else as a clean exit.
+        stdout, stderr, reason, gone = _communicate(proc, timeout)
+        rc = proc.returncode
+        cut = read_stream(stdout)
+        if reason == "timeout" and not isinstance(cut.doc, dict) and not interrupted():
+            secs = (_dt.datetime.now() - t0).total_seconds()
+            return Result(ok=False, exit=EXIT_TIMEOUT, text="", err="timeout after %ss" % timeout,
+                          why="the call was killed by the timeout after %ss"
+                              % seconds_shown(timeout),
+                          finished=cut.finished, blocks=cut.texts(),
+                          continued=cut.continued, went_on=cut.joined_after(),
+                          secs=secs, wall=False, raw=None, tokens_unknown=True)
+        if reason == "pipes":
+            rc = gone
+            linger = ("the claude CLI exited but a process it started still held its output "
+                      "open %ss later: its process tree was killed, and the call is judged "
+                      "by what it printed and its own exit code" % seconds_shown(RESULT_GRACE))
+        elif reason in ("result", "timeout"):
             rc = 0 if gone is None else gone
             linger = ("the claude CLI printed its `result` event and had not exited %s: it "
                       "was killed with its process tree, and the call is judged by that event"
-                      % (("%ss later" % seconds_shown(RESULT_GRACE)) if isinstance(e, Lingered)
+                      % (("%ss later" % seconds_shown(RESULT_GRACE)) if reason == "result"
                          else "when the timeout of %ss ran out" % seconds_shown(timeout)))
     finally:
         if feed is not None:
             os.close(feed)
         if proc is not None:
-            # Whatever left communicate() (an OverflowError on a huge timeout,
-            # anything unforeseen), the child must not go on being computed and
+            # Whatever left the read loop, the child must not go on being computed and
             # paid for with nobody to read the answer.
             try:
                 if proc.poll() is None:
                     _kill_tree(proc)
-                    proc.wait(timeout=5)
+                    proc.wait(timeout=WATCH_SLICE)
             except Exception:  # noqa: BLE001 — the exception in flight is the one to report
                 pass
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is not None:
+                    pipe.close()
             with _LIVE_LOCK:
                 _LIVE.discard(proc)
         shutil.rmtree(workdir, ignore_errors=True)
@@ -1292,6 +1381,19 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
     stream = read_stream(raw_out)
     # Every text block the model wrote, whatever the call comes to below.
     blocks = stream.texts()
+
+    caught = interrupted()
+    good_result = isinstance(stream.doc, dict) and not stream.doc.get("is_error")
+    if caught and good_result:
+        rc = 0
+        linger = ("the stop (signal %d) came after the answer: the call was killed with its "
+                  "process tree, and the call is judged by its `result` event" % caught)
+    if caught and not good_result:
+        return Result(ok=False, exit=SIGNAL_EXIT_BASE + caught, text="", wall=False, raw=None,
+                      err="call stopped by signal %d" % caught, secs=secs, interrupted=True,
+                      why="the call was stopped by signal %d" % caught, blocks=blocks,
+                      continued=stream.continued, went_on=stream.joined_after(),
+                      tokens_unknown=True, linger=linger)
 
     if rc is not None and rc < 0:
         # Killed by a signal — our own stop, or the Ctrl-C that reached the whole
@@ -1336,7 +1438,7 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
                 rc, (raw_out + "\n" + raw_err)[-4000:].strip()[-400:])
         return Result(ok=False, exit=(EXIT_WALL if wall else EXIT_FAIL), text="", wall=wall,
                       err=err, why=why, blocks=blocks,
-                      secs=secs, raw=None, tokens_unknown=True, continued=continued)
+                      secs=secs, raw=None, tokens_unknown=True, continued=continued, linger=linger)
 
     usage, tokens_unknown = extract_usage(doc)
     text = (doc.get("result") or "")

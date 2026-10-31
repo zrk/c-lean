@@ -2,7 +2,6 @@
 name: sub-coder
 description: "Lean coding subagent for one bounded subtask with a self-contained brief: the files, the change, the check to run. Starts without CLAUDE.md; its working rules sit in its own prompt. Not for open-ended work."
 tools: Read, Edit, Write, Bash
-model: inherit
 omitClaudeMd: true
 ---
 

@@ -6,6 +6,8 @@ Run:  python3 tests/test_c_lean.py
 No model is called: C_LEAN_CLAUDE_BIN points the tool at fake_claude.py.
 The tool under test lives in the repository's bin/ directory; C_LEAN_BIN_DIR
 overrides that (redphase.py uses it to test a deliberately broken copy).
+The agent files are read from agents/; C_LEAN_AGENTS_DIR overrides that in
+the same way.
 
 Every check here was first seen RED on its own assert by breaking the wrapper on
 purpose (the rule "never trust a test you have not seen fail") — redphase.py
@@ -32,6 +34,7 @@ from unittest import mock
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
 BIN = os.environ.get("C_LEAN_BIN_DIR") or os.path.join(os.path.dirname(TESTS), "bin")
+AGENTS = os.environ.get("C_LEAN_AGENTS_DIR") or os.path.join(os.path.dirname(TESTS), "agents")
 sys.dont_write_bytecode = True
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 # The core under test, for the checks that need no process: the
@@ -4227,6 +4230,83 @@ if _dir:
                 self.assertEqual(p.stdout, "")
                 self.assertEqual((self.trailer_exit(p), self.jsonl(self.log)[-1]["exit"]),
                                  (code, code))
+
+
+FRONTMATTER_KEY_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_-]*)[ \t]*:[ \t]*(.*)$")
+
+
+def frontmatter(text):
+    """The keys of the frontmatter of text, each with its values, or None when
+    there is none. The frontmatter is the block between the first line `---` and
+    the next one. A key counts only when it starts a line of the block, so a
+    `model:` in the prompt or indented below another key is no key."""
+    lines = text.split("\n")
+    if lines[0].rstrip() != "---":
+        return None
+    for end in range(1, len(lines)):
+        if lines[end].rstrip() == "---":
+            break
+    else:
+        return None
+    keys = {}
+    for line in lines[1:end]:
+        m = FRONTMATTER_KEY_RE.match(line)
+        if m:
+            keys.setdefault(m.group(1), []).append(m.group(2).strip())
+    return keys
+
+
+def agent_problems(directory):
+    """What is wrong with the agent files (*.md) in directory, one line each.
+    Every file needs a name and tools that are not empty and omitClaudeMd: true,
+    and must have no model and no effort: the caller names both in each Agent
+    call. A directory without a single agent file is a problem of its own: a
+    check that looked at nothing has shown nothing."""
+    names = sorted(n for n in os.listdir(directory) if n.endswith(".md")) \
+        if os.path.isdir(directory) else []
+    if not names:
+        return ["no agent file (*.md) in %s" % directory]
+    problems = []
+    for name in names:
+        with open(os.path.join(directory, name), encoding="utf-8") as f:
+            keys = frontmatter(f.read())
+        if keys is None:
+            problems.append("%s: no frontmatter between two --- lines" % name)
+            continue
+        for key in ("name", "tools"):
+            if key not in keys:
+                problems.append("%s: no %s" % (name, key))
+            elif not keys[key][0]:
+                problems.append("%s: %s is empty" % (name, key))
+        if keys.get("omitClaudeMd") != ["true"]:
+            problems.append("%s: omitClaudeMd is not true" % name)
+        for key in ("model", "effort"):
+            if key in keys:
+                problems.append("%s: has the key %s" % (name, key))
+    return problems
+
+
+class AgentFiles(unittest.TestCase):
+    def test_agent_files_are_lean_and_name_no_model_or_effort(self):
+        self.assertEqual(agent_problems(AGENTS), [],
+                         "every agent file needs name, tools and omitClaudeMd: true, and no "
+                         "model and no effort: the caller names both in each Agent call")
+
+    def test_a_directory_without_agent_files_is_a_problem(self):
+        with tempfile.TemporaryDirectory(prefix="c-lean-agents-") as d:
+            missing = os.path.join(d, "missing")
+            with open(os.path.join(d, "notes.txt"), "w"):
+                pass
+            for directory in (d, missing):
+                self.assertEqual(agent_problems(directory),
+                                 ["no agent file (*.md) in %s" % directory],
+                                 "a directory without agent files must fail the check")
+
+    def test_only_keys_at_the_start_of_a_frontmatter_line_count(self):
+        text = ("---\nname: x\ndescription: >\n  model: sonnet\n  effort: high\n"
+                "tools: Read\nomitClaudeMd: true\n---\n\nmodel: sonnet\neffort: high\n")
+        self.assertEqual(sorted(frontmatter(text)), ["description", "name", "omitClaudeMd", "tools"],
+                         "a key indented below another key or in the prompt is no key")
 
 
 def tearDownModule():

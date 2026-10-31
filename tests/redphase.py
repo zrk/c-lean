@@ -4,15 +4,18 @@ on ITS assert (the rule: never trust a test you have not seen fail).
 
 usage: redphase.py [REPORT.json] [--only SUBSTRING]
 
-Only bin/ and tests/ are copied into a fresh temp directory per case. The copy
-is broken and tested through C_LEAN_BIN_DIR; repository files stay intact.
+Only bin/, agents/ and tests/ are copied into a fresh temp directory per case.
+The copy is broken and tested through C_LEAN_BIN_DIR and C_LEAN_AGENTS_DIR;
+repository files stay intact.
 Each copy, including the unmutated one, uses a TMPDIR inside its own tree,
 so a mutation that breaks cleanup cannot leave files in the real TMPDIR.
 The temp tree is removed at the end.
 
 A case is (label, file, old, new, test, expected substring). `old`/`new` may
 also be a tuple of (old, new) pairs when the pre-fix shape touched several
-lines at once; every pair is applied to the same copy.
+lines at once; every pair is applied to the same copy. A file under tests/ or
+agents/ is named by its path, any other by its name in bin/. A test of class
+Case is named by its method, a test of another class as Class.method.
 """
 import argparse
 import json
@@ -24,6 +27,7 @@ import tempfile
 
 SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.environ.get("C_LEAN_BIN_DIR") or os.path.join(SRC, "bin")
+AGENTS = os.environ.get("C_LEAN_AGENTS_DIR") or os.path.join(SRC, "agents")
 
 
 M = [('log line is written',
@@ -2430,6 +2434,79 @@ M += [
   "a timeout after CLI exit must warn about open pipes and the CLI's own exit"),
 ]
 
+M += [
+ ('agents: a model in the frontmatter fails',
+  'agents/sub-scout.md',
+  'omitClaudeMd: true\n',
+  'model: sonnet\nomitClaudeMd: true\n',
+  'AgentFiles.test_agent_files_are_lean_and_name_no_model_or_effort',
+  'sub-scout.md: has the key model'),
+ ('agents: an effort in the frontmatter fails',
+  'agents/sub-coder.md',
+  'omitClaudeMd: true\n',
+  'omitClaudeMd: true\neffort: high\n',
+  'AgentFiles.test_agent_files_are_lean_and_name_no_model_or_effort',
+  'sub-coder.md: has the key effort'),
+ ('agents: a file without omitClaudeMd fails',
+  'agents/sub-scout.md',
+  'omitClaudeMd: true\n',
+  '',
+  'AgentFiles.test_agent_files_are_lean_and_name_no_model_or_effort',
+  'sub-scout.md: omitClaudeMd is not true'),
+ ('agents: a file without a name fails',
+  'agents/sub-coder.md',
+  'name: sub-coder\n',
+  '',
+  'AgentFiles.test_agent_files_are_lean_and_name_no_model_or_effort',
+  'sub-coder.md: no name'),
+ ('agents: a file with empty tools fails',
+  'agents/sub-scout.md',
+  'tools: Read, Grep, Glob\n',
+  'tools:\n',
+  'AgentFiles.test_agent_files_are_lean_and_name_no_model_or_effort',
+  'sub-scout.md: tools is empty'),
+ ('agents: a file without a frontmatter fails',
+  'agents/sub-coder.md',
+  '---\nname: sub-coder\n',
+  'name: sub-coder\n',
+  'AgentFiles.test_agent_files_are_lean_and_name_no_model_or_effort',
+  'sub-coder.md: no frontmatter between two --- lines'),
+ ('agents: a directory without agent files fails',
+  'tests/test_c_lean.py',
+  '    if not names:\n        return ["no agent file',
+  '    if False:\n        return ["no agent file',
+  'AgentFiles.test_a_directory_without_agent_files_is_a_problem',
+  'a directory without agent files must fail the check'),
+ ('agents: an indented key is no key',
+  'tests/test_c_lean.py',
+  'FRONTMATTER_KEY_RE = re.compile(r"([A-Za-z_]',
+  'FRONTMATTER_KEY_RE = re.compile(r"\\s*([A-Za-z_]',
+  'AgentFiles.test_only_keys_at_the_start_of_a_frontmatter_line_count',
+  'a key indented below another key or in the prompt is no key'),
+ ('agents: a key in the prompt is no key',
+  'tests/test_c_lean.py',
+  '    for line in lines[1:end]:\n',
+  '    for line in lines[1:]:\n',
+  'AgentFiles.test_only_keys_at_the_start_of_a_frontmatter_line_count',
+  'a key indented below another key or in the prompt is no key'),
+]
+
+
+def source_of(fname):
+    """The repository file a case names."""
+    if fname.startswith("tests/"):
+        return os.path.join(SRC, fname)
+    if fname.startswith("agents/"):
+        return os.path.join(AGENTS, fname[len("agents/"):])
+    return os.path.join(BIN, fname)
+
+
+def copy_of(tree, fname):
+    """The same file in the copy `tree`."""
+    if fname.startswith(("tests/", "agents/")):
+        return os.path.join(tree, fname)
+    return os.path.join(tree, "bin", fname)
+
 
 def apply(src, old, new):
     pairs = old if isinstance(old, tuple) else ((old, new),)
@@ -2446,6 +2523,7 @@ def make_copy(root, name):
     os.mkdir(os.path.join(dst, "tmp"))
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
     shutil.copytree(BIN, os.path.join(dst, "bin"), ignore=ignore)
+    shutil.copytree(AGENTS, os.path.join(dst, "agents"), ignore=ignore)
     shutil.copytree(os.path.join(SRC, "tests"), os.path.join(dst, "tests"), ignore=ignore)
     return dst
 
@@ -2453,10 +2531,11 @@ def make_copy(root, name):
 def run_one(tree, test):
     env = dict(os.environ)
     env["C_LEAN_BIN_DIR"] = os.path.join(tree, "bin")
+    env["C_LEAN_AGENTS_DIR"] = os.path.join(tree, "agents")
     env["TMPDIR"] = os.path.join(tree, "tmp")
     try:
         p = subprocess.run([sys.executable, os.path.join(tree, "tests", "test_c_lean.py"),
-                            "Case." + test],
+                            test if "." in test else "Case." + test],
                            capture_output=True, text=True, cwd=tree, env=env, timeout=240)
     except subprocess.TimeoutExpired as e:
         # a mutation that makes the tool hang is a finding of its own: report it
@@ -2478,8 +2557,7 @@ def main():
     seen, stale = {}, []
     for label, fname, old, new, _t, _e in M:
         if fname not in seen:
-            source = os.path.join(SRC, fname) if fname.startswith("tests/") else os.path.join(BIN, fname)
-            with open(source) as f:
+            with open(source_of(fname)) as f:
                 seen[fname] = f.read()
         if apply(seen[fname], old, new) is None:
             stale.append("%s (%s)" % (label, fname))
@@ -2497,13 +2575,13 @@ def main():
             if only and only not in label and only not in test:
                 continue
             tree = make_copy(root, "case%02d" % n)
-            path = os.path.join(tree, fname) if fname.startswith("tests/") else os.path.join(tree, "bin", fname)
+            path = copy_of(tree, fname)
             src = open(path).read()  # read BEFORE the truncating open
             open(path, "w").write(apply(src, old, new))
             rc, log = run_one(tree, test)
             rc2, log2 = run_one(green_tree, test)
             shutil.rmtree(tree, ignore_errors=True)
-            failed = ("FAIL: " + test + " (") in log
+            failed = ("FAIL: " + test.rpartition(".")[2] + " (") in log
             if fname.startswith("tests/"):
                 failed = failed or "ERROR: tearDownModule" in log
             rec = {"check": label, "test": test, "red_rc": rc, "red_saw_expected": expect in log,

@@ -85,9 +85,8 @@ c-lean --check
 ## sub-scout and sub-coder
 
 - Both start without CLAUDE.md (`omitClaudeMd: true`), with their own short prompt in place of the Claude Code system prompt, and with a narrow tool list. Give them a self-contained brief: the paths, the question or the change, and the check to run.
-- Default models: sub-scout runs on `sonnet`, sub-coder on the session's model (`inherit`). Neither file sets an effort, so both use the session's effort.
-- Claude Code picks a subagent's model in this order: the `model` passed in that Agent call, the `model` in the agent file, the `CLAUDE_CODE_SUBAGENT_MODEL` environment variable, the session's model. So Claude, or you through Claude, can run either agent on another model for one task. A per-call `effort` works the same way. `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` pins every subagent to one model.
-- To change a default for good, copy the agent file to `~/.claude/agents/` and edit it. Your copy runs as `sub-scout`, the plugin's as `c-lean:sub-scout`.
+- Neither agent file names a model or an effort, on purpose. The caller names `model` and `effort` in each Agent call to `c-lean:sub-scout` or `c-lean:sub-coder`, as with `-m` and `-e` of `c-lean`. A call without them runs the agent on the session's model and effort.
+- Claude Code picks a subagent's model in this order: the `model` passed in that Agent call, the `model` in the agent file, the `CLAUDE_CODE_SUBAGENT_MODEL` environment variable, the session's model. These two agent files have no `model`, so the second step never applies to them. A per-call `effort` works the same way. `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` pins every subagent to one model.
 
 ## Measurements
 

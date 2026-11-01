@@ -375,7 +375,7 @@ def main():
         system = opts.get("--system-prompt", "").encode("utf-8", "surrogateescape")
     seen.update(system_chars=len(system.decode("utf-8", "replace")), system_sha256=digest(system))
     note(seen)
-    if MODE not in ("noise", "noisewall"):
+    if MODE != "noise":
         # the live CLI prints `system/init` before it calls the model: whatever
         # a mode does next, the stream has begun
         head()
@@ -590,14 +590,6 @@ def main():
         return int(os.environ.get("C_LEAN_FAKE_RC", "0"))
     if MODE == "wallstderr":
         sys.stderr.write("noise\n" + WALL_TEXT + "\n")
-        return 1
-    if MODE == "noisewall":
-        # one line of CLI noise before the stream (node does that), a `result`
-        # event that broke off half way, and an answer that itself says `rate
-        # limit`: there is no document, and the only wall words on stdout are
-        # the model's — in the message of the stream and in the broken line
-        sys.stdout.write("(node:123) Warning: deprecated API\n")
-        emit("the vendor returned a rate limit error", last="cut")
         return 1
     if MODE == "wallstdout":
         # the CLI's own sentence on stdout, as a plain line AFTER the stream has

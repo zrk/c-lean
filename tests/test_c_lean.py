@@ -3482,7 +3482,10 @@ if _dir:
         select, waits = selector.select, []
         def record(wait):
             waits.append(wait)
-            return select(wait)
+            # Record first, wait a sane time: epoll refuses a huge timeout
+            # with OverflowError, which would hide the assert below (kqueue
+            # accepts it) when the slice is lost.
+            return select(min(wait, B.WATCH_SLICE))
         selector.select = record
         with mock.patch.object(B.selectors, "DefaultSelector", return_value=selector):
             out, _err, _reason, _gone = B._communicate(proc, B.MAX_TIMEOUT)
@@ -4089,9 +4092,28 @@ if _dir:
                 self.assertTrue(rec["ts"].startswith("2026-10-29T"))
 
     def test_usage_log_to_dev_null_does_not_warn(self):
+        # Root may fchmod /dev/null, so "no WARN" alone proves nothing there,
+        # and a mutated run would really change the device. The probe refuses
+        # every fchmod on a non-regular file and notes it: nothing real is
+        # ever chmodded, and the test fails on the attempt itself.
+        tried = self.path("fchmod-tried")
+        armed = self.path("fchmod-armed")
+        site = self.site("import stat\n"
+                         "real = os.fchmod\n"
+                         "def refuse_devices(fd, mode):\n"
+                         "    if not stat.S_ISREG(os.fstat(fd).st_mode):\n"
+                         "        with open(os.environ['FCHMOD_TRIED'], 'a') as f:\n"
+                         "            f.write(oct(mode) + '\\n')\n"
+                         "        raise PermissionError(1, 'probe: not a regular file')\n"
+                         "    return real(fd, mode)\n"
+                         "os.fchmod = refuse_devices\n"
+                         "open(os.environ['FCHMOD_ARMED'], 'w').close()\n")
         p = run([CLI, "-m", "haiku", "hello"], mode="single", state=self.state,
-                extra_env=dict(self.env, C_LEAN_USAGE_LOG="/dev/null"))
+                extra_env=dict(self.env, C_LEAN_USAGE_LOG="/dev/null", PYTHONPATH=site,
+                               FCHMOD_TRIED=tried, FCHMOD_ARMED=armed))
+        self.assertTrue(os.path.exists(armed), "the fchmod probe never loaded (is sitecustomize loaded?)")
         self.assertEqual((p.returncode, p.stdout), (0, "ECHO:hello\n"), p.stderr)
+        self.assertFalse(os.path.exists(tried), "a usage log on a device must not be chmodded")
         self.assertEqual(self.warns(p), [], "a usage log on /dev/null must not WARN")
 
     def test_usage_log_fifo_is_written_without_changing_its_mode(self):

@@ -1831,6 +1831,12 @@ M += [('R1 Linux parses stat after the last parenthesis',
   '        pass',
   'test_an_unreadable_proc_warns_once_and_still_kills_the_child',
   'unreadable /proc must still kill the child'),
+ ('R1 Linux finds the tree in /proc, not with pgrep',
+  'c_lean_core.py',
+  '            with os.scandir("/proc") as entries:',
+  '            with os.scandir("/proc-is-not-walked") as entries:',
+  'test_linux_timeout_kills_the_tree_without_pgrep',
+  'timed out waiting for /proc to kill the grandchild without pgrep'),
  ('R1 pgrep exit 3 is a discovery failure',
   'c_lean_core.py',
   'if out.returncode >= 2 or out.returncode < 0:',
@@ -2307,6 +2313,16 @@ M += [('F1 a WARN on a stderr that cannot be written never raises',
   '                return False\n',
   'test_a_good_call_with_stderr_closed_prints_the_answer',
   'a stderr closed from the start must not cost the answer'),
+ ('E15 --check with a stderr closed from the start exits 120',
+  'c-lean',
+  '        if err is not None and sys.stderr is not None:\n'
+  '            stream = sys.stderr\n',
+  '        if err is not None:\n'
+  '            stream = sys.stderr\n'
+  '            if stream is None:\n'
+  '                return False\n',
+  'test_check_with_stderr_closed_keeps_its_exit',
+  'with stderr closed, --check must keep the exit it decided'),
  ('E15 -h says nothing of a stderr closed from the start',
   'c-lean',
   '    A stderr closed from the start (`2>&-`) is not a stream that fails: its\n'
@@ -2335,7 +2351,7 @@ M += [
   '            if stat.S_ISREG(os.fstat(fd).st_mode):',
   '            if True:',
   'test_usage_log_to_dev_null_does_not_warn',
-  'a usage log on /dev/null must not WARN'),
+  'a usage log on a device must not be chmodded'),
  ('fix R3 a FIFO usage log keeps its mode',
   'c_lean_core.py',
   '            if stat.S_ISREG(os.fstat(fd).st_mode):',
@@ -2600,8 +2616,10 @@ def main():
                 continue
             tree = make_copy(root, "case%02d" % n)
             path = copy_of(tree, fname)
-            src = open(path).read()  # read BEFORE the truncating open
-            open(path, "w").write(apply(src, old, new))
+            with open(path) as f:  # read BEFORE the truncating open
+                src = f.read()
+            with open(path, "w") as f:
+                f.write(apply(src, old, new))
             rc, log = run_one(tree, test)
             rc2, log2 = run_one(green_tree, test)
             shutil.rmtree(tree, ignore_errors=True)

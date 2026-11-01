@@ -22,7 +22,7 @@ Inside a git repository every subagent except Explore and Plan also receives a g
 - Always choose the model with `-m` (`haiku`, `sonnet`, `opus` or a full model ID); there is no default. Choose effort with `-e`.
 - Pass the prompt as an argument, with `-f FILE`, or on stdin. Give a rubric with `--system` or `--system-file`, and ask for JSON with `--schema`.
 - stdout carries only the answer. stderr carries a trailer with token counts.
-- It runs only on a Claude subscription login. It ignores API keys and cloud-provider settings on purpose, so a call can never be billed to an API account by accident.
+- It is built for a Claude subscription login: it passes the CLI an allow-listed environment, so API keys and cloud-provider settings from your session are not forwarded. That guarantee covers the environment and configuration the call is given; it cannot vouch for how the CLI is otherwise authenticated or billed on your machine.
 
 ```bash
 c-lean -m haiku --system "Answer yes or no." "Does this log line report an error? <line>"

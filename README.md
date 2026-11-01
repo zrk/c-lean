@@ -28,6 +28,8 @@ claude plugin install c-lean@c-lean
 
 Inside a session the same works as `/plugin marketplace add zrk/c-lean` and `/plugin install c-lean@c-lean`.
 
+**PATH shadowing.** Claude Code 2.1.316 appends a plugin's `bin/` to the end of `PATH`, and only for the session's Bash tool, so any other `c-lean` earlier on `PATH` (a copy you installed by hand, a symlink in `~/.local/bin`) shadows the plugin's. Check from inside a session, not from your own terminal, where the plugin's copy never appears: ask Claude to run `type -a c-lean` through its Bash tool. The first line is the one that runs, and it should be the plugin's.
+
 To try it without installing, load it for one session:
 
 ```bash
@@ -36,7 +38,8 @@ claude --plugin-dir /path/to/c-lean
 
 Requirements:
 
-- Claude Code 2.1.271 or later, for `omitClaudeMd` in agent files. The numbers below were measured on 2.1.311.
+- A POSIX system: Linux or macOS. Windows is not supported: `c-lean` registers `signal.SIGHUP`, which does not exist there, so it fails at import, and it relies on `os.killpg`, process groups and `selectors` on pipes. (Read off the code; not run on Windows.)
+- Claude Code 2.1.271 or later, for `omitClaudeMd` in agent files. The numbers below were measured on 2.1.311, except where a row names another version.
 - Python 3.10 or later, for `c-lean`.
 - For `--system`, `--system-file` and `--check`, a CLI version that supports `--system-prompt-file`. Update Claude Code if it reports that option as unknown; calls without a system prompt do not need it.
 - For `c-lean`: Claude Code signed in with a Claude subscription. The subagents work with whatever provider your session uses.
@@ -67,6 +70,7 @@ c-lean --check
 - `c-lean` sets the child's `CLAUDE_CODE_MAX_OUTPUT_TOKENS` to 128000 (`OUTPUT_CAP` in `bin/c_lean_core.py`); the CLI clamps it to the model's upper bound. If a result names a default cap above it, a WARN says which model was held down; raise `OUTPUT_CAP` for that model.
 - When the model's answer is cut and continued, the pieces are joined. Text that could not be printed as an answer is saved under `$XDG_STATE_HOME/c-lean/partial`, by default `~/.local/state/c-lean/partial`.
 - Each call appends one line of counters to `$XDG_STATE_HOME/c-lean/usage.jsonl`, with the same exit code as the trailer, and with `tokens_unknown: true` when the trailer says `NOT COUNTED`. The line stores a sha256 hash of the prompt, not the prompt. That is not anonymization: anyone who holds a candidate prompt can confirm it against the hash.
+- Data kept on disk. The usage log is `$XDG_STATE_HOME/c-lean/usage.jsonl` (`~/.local/state/c-lean/usage.jsonl` when `XDG_STATE_HOME` is unset or empty); `C_LEAN_USAGE_LOG` overrides the path. Text of an answer that was not printed goes to one file per call in `$XDG_STATE_HOME/c-lean/partial/` (files 0600; the directory is 0700 only when `c-lean` creates it, an existing directory keeps its mode); `C_LEAN_PARTIAL_DIR` overrides the directory. `partial/` holds model text, so treat it like the answers themselves. Nothing is ever pruned: both grow without bound. To prune, delete old files, for example `find ~/.local/state/c-lean/partial -type f -mtime +30 -delete`, and truncate or remove `usage.jsonl` (`(umask 077; f=~/.local/state/c-lean/usage.jsonl; tail -n 1000 "$f" > "$f.new") && mv ~/.local/state/c-lean/usage.jsonl.new ~/.local/state/c-lean/usage.jsonl` keeps the last 1 000 lines; run it when no `c-lean` call is in flight, or a concurrent append can be lost).
 - `c-lean --check` makes one fixed live call to Haiku and reports the size of the start-up context. It ignores the prompt and every flag except `--timeout` and `--backend`. With `C_LEAN_CHECK_PROBE_FILE=PATH` it appends a JSON record of the probe to PATH, with the exit code `--check` returns; a file it creates there gets mode 0600, and a record that cannot be written costs one warning.
 - Files given to `-f`, `--system-file` and `--schema`, and a prompt on stdin, are read as UTF-8 whatever the locale; bytes that are not UTF-8 are a usage error. The answer goes to stdout as UTF-8 whatever the encoding of stdout.
 - `c-lean -h` lists every flag, exit code and environment variable.
@@ -95,7 +99,8 @@ Start-up context is `input + cache_creation + cache_read` of the first model req
 
 | What starts | Tokens |
 |---|---|
-| `c-lean`: empty system prompt, no tools | 579 |
+| `c-lean`: empty system prompt, no tools (CLI 2.1.311) | 579 |
+| `c-lean --check`: haiku at effort low, with a short system prompt, no tools (CLI 2.1.316, 2026-11-01) | 412 |
 | custom subagent, `tools: []`, `omitClaudeMd: true` | 960 |
 | custom subagent, Read and Grep, `omitClaudeMd: true` | 3 327 |
 | custom subagent, Read, Grep and Bash, `omitClaudeMd: true` | 3 383 |
@@ -107,6 +112,7 @@ Start-up context is `input + cache_creation + cache_read` of the first model req
 - A parent session with 9 MCP servers and 83 tools gave the same subagent numbers, within one token, as a parent with no settings files and no MCP servers. The one exception was the Bash tool, whose description was 212 tokens longer under the parent without settings files. A narrowed subagent does not inherit the parent's MCP tools or skills.
 - Inside a git repository, every subagent except Explore and Plan also receives a git status snapshot: 165 more tokens in a clean repository, up to 1 347 more when the status reaches its length cap.
 - Inside a Claude desktop app session a subagent starts higher: the app adds a tool of its own and messages with parts of the session's environment. In the author's runs that added about 0.5K to 0.7K tokens.
+- The two `c-lean` rows are not one setup: 579 is an empty system prompt on 2.1.311, 412 is the `--check` probe, which adds a short system prompt of its own, on 2.1.316, so they differ in CLI version and system prompt, and possibly in effort (nothing records the effort used for 579), and are not comparable. The CLI version may account for part of the difference; that is unverified. The 412 is the input-token count that `--check` reported (4 output tokens, 2.9 s); it is the same quantity (`input + cache_creation + cache_read` of the single request; the probe record shows 412/0/0), measured with a different prompt setup and on a different CLI version.
 - The general-purpose figure was measured in September 2026 on an older Claude Code. Yours depends on your MCP servers, skills and CLAUDE.md.
 
 ## A lean worker outside a session
@@ -114,8 +120,15 @@ Start-up context is `input + cache_creation + cache_read` of the first model req
 The subagents run inside a Claude Code session. For a script or a scheduled job, the same idea works with `claude -p` directly:
 
 ```bash
-env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
-  claude -p --model sonnet --effort high \
+env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+  ${USER:+USER="$USER"} ${LOGNAME:+LOGNAME="$LOGNAME"} \
+  ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} \
+  ${LANG:+LANG="$LANG"} \
+  ${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"} \
+  ${DISABLE_TELEMETRY:+DISABLE_TELEMETRY="$DISABLE_TELEMETRY"} \
+  ${DO_NOT_TRACK:+DO_NOT_TRACK="$DO_NOT_TRACK"} \
+  ${DISABLE_ERROR_REPORTING:+DISABLE_ERROR_REPORTING="$DISABLE_ERROR_REPORTING"} \
+  claude -p --model sonnet --effort high --no-session-persistence \
     --setting-sources "" --strict-mcp-config --disable-slash-commands \
     --tools "Read,Grep,Glob" --allowedTools "Read,Grep,Glob" \
     --system-prompt-file worker-prompt.md \
@@ -126,13 +139,14 @@ env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
 - `--setting-sources ""` loads no settings files and no CLAUDE.md. `--strict-mcp-config` with no `--mcp-config` starts no MCP servers.
 - `--system-prompt-file` replaces the Claude Code system prompt with the text of the file. Passed as `--system-prompt "$(cat ...)"`, the text would be on the command line, where Linux refuses an argument of 128 KiB or more and other local users can read it.
 - `--tools` limits the tool set. `--allowedTools` pre-approves the same tools, so the run never stops at a permission prompt.
-- `env -u` keeps a stray API key from moving the run off your subscription.
+- `env -i` starts from an empty environment and passes only what `c-lean` itself passes (`PATH`, `HOME`, `USER`, `LOGNAME`, `TMPDIR`, `XDG_RUNTIME_DIR`, `LANG`; its list also has `SHELL`, `LC_*`, `TZ`, `TERM` and a few more that do not touch authentication). `USER` and `LOGNAME` are kept because the CLI's credential lookup may depend on them (for example the macOS Keychain account), and `XDG_RUNTIME_DIR` because a Linux keyring service may be found through it; neither is verified here. `XDG_CONFIG_HOME` is not in `c-lean`'s list, so it is not passed. A deny-list such as `env -u ANTHROPIC_API_KEY` is not enough: `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_CONFIG_DIR` would still route the call elsewhere. The four telemetry opt-outs are optional pass-throughs; `${VAR:+...}` adds one only when it is set, and works the same in bash and zsh. Add `HTTPS_PROXY` and a CA file the same way only if your machine needs them.
+- `--no-session-persistence` keeps the brief and the answer out of the transcripts the CLI would otherwise leave on disk.
 - The brief comes on stdin, so its length is not limited by the command line.
 - With a slightly broader tool set, workers like this started at 5.5K to 8K tokens in the author's runs.
 
 ## Known limits
 
-- `c-lean` works only on a Claude subscription login, on purpose. It does not use API keys, Amazon Bedrock, Google Cloud or Microsoft Foundry.
+- `c-lean` is built for a Claude subscription login: it gives the CLI an allow-listed environment and configuration, so API keys and cloud-provider settings (Amazon Bedrock, Google Cloud, Microsoft Foundry) from your session are not forwarded. That is a guarantee about what the call is given, not about how the CLI authenticates or bills on your machine.
 - The Claude Code documentation says that `--bare` "will become the default for `-p` in a future release", and bare mode never reads a subscription login. When that happens, `c-lean` and the recipe above stop authenticating until an opt-out exists. API keys and cloud providers keep working in bare mode. The subagents run inside an authenticated session and are not affected.
 - The subagents do not see your CLAUDE.md, so project rules reach them only through the brief.
 
@@ -145,7 +159,7 @@ python3 tests/redphase.py
 
 `test_c_lean.py` runs the tool against a fake `claude` binary; no model is called. `redphase.py` breaks a throwaway copy of the tool one way at a time and requires the matching test to fail on its own assert, so a test that cannot fail is caught.
 
-The timeout and signal tests find child processes through `/proc` on Linux and the real `pgrep` elsewhere. In a sandbox that forbids listing processes, set `C_LEAN_TEST_FAKE_PGREP=1` to use a fixture for that step; the tests still kill real processes.
+The timeout and signal tests find child processes through `/proc` on Linux and the real `pgrep` elsewhere. In a sandbox that forbids listing processes, set `C_LEAN_TEST_FAKE_PGREP=1` to use a fixture for that step; the tests still kill real processes. On macOS there is no `/proc`, so the tests also need `ps` to tell a live process from an unreaped zombie; a sandbox that refuses `ps` there makes `test_a_zombie_is_not_alive` fail, so allow `ps` in the sandbox.
 
 ## License
 

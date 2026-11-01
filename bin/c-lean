@@ -89,7 +89,9 @@ Guarantees
     @ENV@PASS_ENV that is refused costs one WARN naming it, never its value;
     so does an entry that is not a variable name (letters, digits, _), and
     that entry is not passed. The CLI's API-key-only mode is never used: this
-    call needs the subscription login.
+    call needs the subscription login. This promise covers the environment and
+    configuration the call is given, not how the CLI authenticates or bills on
+    this machine.
   * no context — --tools "" --setting-sources "" --strict-mcp-config
     --disable-slash-commands --no-session-persistence, cwd = fresh private tmpdir.
     The system prompt is what --system or --system-file gave, and empty when
@@ -98,7 +100,9 @@ Guarantees
     --system-prompt "" is passed when there is none. What is left is the floor
     the CLI adds on its own, ~0.6K input tokens (measured 2026-10-27 on CLI
     2.1.311 with haiku: 579 with an empty system prompt; on CLI 2.1.288 the
-    built-in one gave 6,598).
+    built-in one gave 6,598). A separate data point, not the same setup:
+    on CLI 2.1.316 with haiku, --check (effort low, with its own short
+    system prompt) reported 412 input tokens (2026-11-01).
   * the prompt is never on the command line of the CLI: it goes on stdin. A
     system prompt goes in a file of its own, with mode 0600 and outside the
     cwd of the call, passed with --system-prompt-file. The file is removed

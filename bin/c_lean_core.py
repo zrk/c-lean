@@ -1524,6 +1524,9 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
     blocks = stream.texts()
 
     caught = interrupted()
+    # A `result` that came before the stop is still the document of the call:
+    # the stop decides the outcome, --json prints what was received.
+    seen_doc = stream.doc if isinstance(stream.doc, dict) else None
     good_result = isinstance(stream.doc, dict) and not stream.doc.get("is_error")
     if caught and good_result:
         rc = 0
@@ -1540,7 +1543,7 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
     if caught and not good_result:
         # The stop line alone says what happened: a WARN of the kill before
         # the stop would say the call is judged by something it is not.
-        return Result(ok=False, exit=SIGNAL_EXIT_BASE + caught, text="", wall=False, raw=None,
+        return Result(ok=False, exit=SIGNAL_EXIT_BASE + caught, text="", wall=False, raw=seen_doc,
                       err="call stopped by signal %d" % caught, secs=secs, interrupted=True,
                       why="the call was stopped by signal %d" % caught, blocks=blocks,
                       continued=stream.continued, went_on=stream.joined_after(),
@@ -1551,7 +1554,7 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
         # process group. Not an ordinary failure: retrying it would be a real,
         # paid call made after the operator already said stop. The model may
         # have spent tokens by then, and no document says how many.
-        return Result(ok=False, exit=SIGNAL_EXIT_BASE - rc, text="", wall=False, raw=None,
+        return Result(ok=False, exit=SIGNAL_EXIT_BASE - rc, text="", wall=False, raw=seen_doc,
                       err="call killed by signal %d" % (-rc), secs=secs, interrupted=True,
                       why="the call was killed by signal %d" % (-rc), blocks=blocks, linger=linger,
                       continued=stream.continued, went_on=stream.joined_after(),

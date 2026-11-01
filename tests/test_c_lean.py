@@ -159,6 +159,28 @@ if os.environ.get("PROBE_NOW"):
     mod.B.save_blocks = lambda *a, **k: real(*a, now=now, **k)
 sys.exit(mod.main(sys.argv[2:]))
 '''
+# Python 3.12 indents with a pure-Python encoder that runs out of stack on a document
+# nested ~1500 deep; on the other versions that cannot be had cheaply, so the dump of
+# the result document raises RecursionError when it is given an `indent` (PROBE_DEEP=
+# indent) or whatever it is given (PROBE_DEEP=all).
+DEEP_PROBE = r'''
+import importlib.machinery, importlib.util, json, os, sys
+loader = importlib.machinery.SourceFileLoader("c_lean_cli", sys.argv[1])
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("c_lean_cli", loader))
+loader.exec_module(mod)
+real, how = json.dumps, os.environ["PROBE_DEEP"]
+
+
+def dumps(obj, *a, **k):
+    if isinstance(obj, dict) and obj.get("type") == "result" and (
+            how == "all" or k.get("indent") is not None):
+        raise RecursionError("maximum recursion depth exceeded")
+    return real(obj, *a, **k)
+
+
+json.dumps = dumps
+sys.exit(mod.main(sys.argv[2:]))
+'''
 # every signal that stops a run: Ctrl-C, `kill`, a closed terminal
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 # the names that must never reach the child: keys, tokens, transport switches,
@@ -1289,6 +1311,110 @@ if _dir:
         one = json.loads(self.call("single", "--json").stdout)
         self.assertNotIn("c_lean_pieces", one, "an ordinary call has no pieces to carry")
 
+    def test_json_prints_the_document_whatever_the_outcome(self):
+        """--json is asked for most when the call went wrong. All but
+        emptysingle (which printed at base) used to leave stdout empty; the
+        exit code is the one the call has."""
+        for mode, code in (("maxtokens", 1), ("terminal", 1), ("fail", 1), ("limit", 75),
+                           ("contfail", 1), ("emptysingle", 1)):
+            with self.subTest(mode=mode):
+                p = self.call(mode, "--json")
+                self.assertEqual(p.returncode, code, p.stderr)
+                self.assertTrue(p.stdout.strip(), "--json must print the document of a call "
+                                "that failed in mode %s (stdout None on failure)" % mode)
+                doc = json.loads(p.stdout)
+                self.assertIsInstance(doc, dict)
+                plain = json.loads(self.fake(mode, "json"))
+                for key in ("is_error", "subtype"):
+                    self.assertEqual(doc.get(key), plain.get(key),
+                                     "the document must be the CLI's own (%s)" % key)
+                if mode in ("fail", "limit", "contfail"):
+                    self.assertTrue(doc["is_error"], mode)
+                if mode == "fail":
+                    self.assertEqual(doc["subtype"], "error")
+                # the same stdout as without --json, apart from the document
+                self.assertEqual(self.call(mode).returncode, code)
+
+    def test_json_of_a_document_the_encoder_cannot_indent_is_printed_compact(self):
+        """A document nested too deep for the indenting encoder (3.12) was a
+        traceback with no trailer and no log line, on the failure path and on
+        the ok path alike. It is dumped again without `indent`."""
+        for mode, code in (("fail", 1), ("single", 0)):
+            with self.subTest(mode=mode):
+                p = run(["-c", DEEP_PROBE, CLI, "-m", "haiku", "--system", "S", "--json", "hello"],
+                        mode=mode, state=self.state, extra_env=dict(self.env, PROBE_DEEP="indent"))
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertTrue(p.stdout.strip(), "the document must still be printed, "
+                                "compact: %r (%s)" % (p.stdout, p.stderr[-200:]))
+                self.assertEqual(json.loads(p.stdout)["type"], "result")
+                self.assertEqual(p.returncode, code, p.stderr)
+                self.assertEqual(p.stdout.count("\n"), 1, "compact means one line")
+                self.assertEqual(self.jsonl(self.log)[-1]["exit"], code)
+
+    def test_json_of_a_document_that_cannot_be_dumped_at_all_is_an_ordinary_failure(self):
+        for mode, code, rc_log in (("fail", 1, 1), ("single", 1, 1)):  # ok too: no document
+            with self.subTest(mode=mode):
+                p = run(["-c", DEEP_PROBE, CLI, "-m", "haiku", "--system", "S", "--json", "hello"],
+                        mode=mode, state=self.state, extra_env=dict(self.env, PROBE_DEEP="all"))
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual((p.returncode, p.stdout), (code, ""), p.stderr)
+                self.assertEqual(self.jsonl(self.log)[-1]["exit"], rc_log)
+                self.assertIn("[c-lean]", p.stderr, "the trailer must be there")
+
+    def test_json_under_schema_without_structured_output_fails_as_without_json(self):
+        """--json changes what is printed, not how the call ends: the check for
+        a missing structured_output was skipped with it (exit 0, no line)."""
+        args = ["-m", "haiku", "--system", "S", "--schema", self.SCHEMA, "hello"]
+        plain = run([CLI] + args, mode="single", state=self.state, extra_env=self.env)
+        p = run([CLI, "--json"] + args, mode="single", state=self.state, extra_env=self.env)
+        self.assertEqual(plain.returncode, 1, plain.stderr)
+        self.assertEqual(p.returncode, 1, "--json must not turn the failure into exit 0: %s"
+                         % p.stderr)
+        line = "--schema given but the CLI returned no structured_output"
+        self.assertIn(line, plain.stderr)
+        self.assertIn(line, p.stderr)
+        self.assertEqual([r["exit"] for r in self.jsonl(self.log)], [1, 1])
+        self.assertEqual(json.loads(p.stdout), json.loads(self.fake("single", "json")) | {
+            "uuid": json.loads(p.stdout)["uuid"]}, "stdout must be exactly the document")
+
+    def test_json_prints_a_document_that_came_before_a_stop_or_a_kill(self):
+        """The signal outcomes dropped the document they had received."""
+        good = self.path("good-then-kill.json")
+        with open(good, "w") as f:
+            json.dump({"events": [ev_result("done")], "end": "kill"}, f)
+        p = run([CLI, "-m", "haiku", "--json", "hello"], mode="script", state=self.state,
+                extra_env=dict(self.env, C_LEAN_FAKE_SCRIPT=good))
+        self.assertEqual(p.returncode, 128 + signal.SIGKILL, p.stderr)
+        self.assertTrue(p.stdout.strip(), "a document received before the CLI was killed must "
+                        "be printed (stdout None on failure)")
+        self.assertEqual(json.loads(p.stdout)["result"], "done")
+        bad = self.path("error-then-hang.json")
+        with open(bad, "w") as f:
+            json.dump({"events": [ev_result("", is_error=True,
+                                            subtype="error_during_execution")],
+                       "end": "hang"}, f)
+        env = child_env("script", self.state, dict(self.env, C_LEAN_FAKE_SCRIPT=bad))
+        proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--json", "hello"],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, preexec_fn=default_sighup)
+        try:
+            time.sleep(1.5)  # the document is out and the grace of 5 s is running
+            os.kill(proc.pid, signal.SIGTERM)
+            out, err = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+        self.assertEqual(proc.returncode, 128 + signal.SIGTERM, err)
+        self.assertTrue(out.strip(), "a document received before the stop must be printed "
+                        "(stdout None on failure): %r" % out)
+        self.assertTrue(json.loads(out)["is_error"])
+
+    def test_json_of_a_call_with_no_document_leaves_stdout_empty(self):
+        p = self.call("cutstream", "--json")
+        self.assertNotEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, "", "no `result` was received: there is no document to print")
+
     def test_json_of_blocks_that_were_not_joined_is_the_document_alone(self):
         """--json with a WARN: the document goes out as the CLI gave it, with
         no c_lean_pieces (the key is there only when the blocks were joined),
@@ -2112,6 +2238,8 @@ if _dir:
                        "The JSON schema of --schema does go on the command\n    line",
                        "The trailer says\n    CONTINUED xN", "c_lean_pieces",
                        "the key is there only when the blocks were joined",
+                       "--json prints\n    the document of any call that received one, whatever "
+                       "the outcome",
                        "A whitespace character can be\n    lost at a seam",
                        "at most 3 times", "With --schema nothing is joined",
                        # the kinds of continuation

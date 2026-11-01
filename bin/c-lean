@@ -169,7 +169,12 @@ Guarantees
     lost at a seam (a newline was, in 12 of 12 measured seams after the
     output cap), and @TOOL@ does not guess it back: read the seams. --json
     prints the result document plus one key, @PIECES@, the text of each
-    block; the key is there only when the blocks were joined.
+    block; the key is there only when the blocks were joined. --json prints
+    the document of any call that received one, whatever the outcome (a cut
+    answer, an error, a limit wall, a stop after the `result`). The exit code
+    and stderr are the same as without it, except exit 120 when stdout can no
+    longer be written, as for any answer. A call that ended before any
+    `result` has no document, and stdout stays empty.
     Blocks are joined only when they can be trusted to be one answer: the
     CLI took no message back, every message from the first text block to
     the last one continues the message before it in one of the four ways
@@ -553,26 +558,53 @@ def to_keep(r) -> list:
     return r.blocks if any(b.strip() for b in r.blocks) else []
 
 
+def json_text(r):
+    """The `--json` form of the CLI's result document: the document as the CLI
+    gave it; its `result` is the last text block only, so the blocks of a joined
+    answer ride along under one key. No key when nothing was joined: the
+    document then is what was printed. None when the document cannot be dumped:
+    Python 3.12 indents with a pure-Python encoder that runs out of stack on a
+    document nested ~1000 deep (measured on 3.12.3), so it is dumped again
+    without `indent`. The compact dump has not been seen to fail where
+    `json.loads` read the document, so giving up (nothing to print, never a
+    traceback) is defensive only."""
+    doc = dict(r.raw, **{B.PIECES_KEY: r.pieces}) if r.pieces else r.raw
+    for indent in (2, None):
+        try:
+            return json.dumps(doc, ensure_ascii=False, indent=indent) + "\n"
+        except RecursionError:
+            pass
+    return None
+
+
 def settle(args, r, schema, timeout, limit_source):
     """What the call comes to, with nothing printed yet: (exit code, lines for
     stderr after the trailer, text for stdout or None, why its text blocks are
     not all on stdout or None when they are)."""
     say = [f"{B.TOOL_NAME}: WARN %s" % r.linger] if r.linger else []
+    # --json is asked for most when the call went wrong (cut off? refused? a
+    # wall?): whenever a `result` document was received it is printed, whatever
+    # the outcome. None when there is none (killed before any `result`).
+    doc_out = json_text(r) if args.json and isinstance(r.raw, dict) else None
     if r.wall:
         say.append(f"{B.TOOL_NAME}: LIMIT WALL — stop and wait for the window to reset. %s" % r.err)
-        return B.EXIT_WALL, say, None, r.why or "the call hit the limit wall"
+        return B.EXIT_WALL, say, doc_out, r.why or "the call hit the limit wall"
     if r.interrupted:
         say.append(f"{B.TOOL_NAME}: stopped — %s" % (r.err or "interrupted"))
-        return r.exit or B.EXIT_FAIL, say, None, r.why or "the call was stopped by a signal"
+        return r.exit or B.EXIT_FAIL, say, doc_out, r.why or "the call was stopped by a signal"
     if r.exit == B.EXIT_TIMEOUT:
         say.append(f"{B.TOOL_NAME}: %s" % B.timeout_message(timeout, limit_source, r.finished,
                                                   len(to_keep(r))))
-        return B.EXIT_TIMEOUT, say, None, r.why or "the call was killed by the timeout"
+        return B.EXIT_TIMEOUT, say, doc_out, r.why or "the call was killed by the timeout"
     if not r.ok:
         say.append(f"{B.TOOL_NAME}: %s" % (r.err or "failed"))
-        return r.exit or B.EXIT_FAIL, say, None, r.why or "the call failed"
+        return r.exit or B.EXIT_FAIL, say, doc_out, r.why or "the call failed"
     if r.warn:
         say.append(f"{B.TOOL_NAME}: WARN %s" % r.warn)
+    if args.json and doc_out is None:
+        say.append(f"{B.TOOL_NAME}: --json: the document of the CLI is nested too deep to "
+                   "print — not a result")
+        return B.EXIT_FAIL, say, None, "the document of the CLI could not be printed"
     # What goes to stdout: every text block of an answer that came in several,
     # or the `result` of the document, which is the last one.
     answer, seams = B.splice(r.pieces) if r.pieces else (r.text, [])
@@ -604,16 +636,15 @@ def settle(args, r, schema, timeout, limit_source):
         # what it is needed to explain (cut off? refused? a wall?). Report the
         # failure, but do not swallow the thing that was asked for.
 
+    # Under --schema a call with no structured output is a failure with or
+    # without --json (--json only changes what is printed with it). An empty
+    # answer was reported above, as without --json.
+    if schema and r.structured is None and not empty:
+        say.append(f"{B.TOOL_NAME}: --schema given but the CLI returned no structured_output")
+        return B.EXIT_FAIL, say, (doc_out if args.json else r.text + "\n"), unprinted
     if args.json:
-        # the document as the CLI gave it; its `result` is the last text block
-        # only, so the blocks of a joined answer ride along under one key. No
-        # key when nothing was joined: the document then is what was printed.
-        doc = dict(r.raw, **{B.PIECES_KEY: r.pieces}) if r.pieces else r.raw
-        out = json.dumps(doc, ensure_ascii=False, indent=2) + "\n"
+        out = doc_out
     elif schema:
-        if r.structured is None:
-            say.append(f"{B.TOOL_NAME}: --schema given but the CLI returned no structured_output")
-            return B.EXIT_FAIL, say, r.text + "\n", unprinted
         out = json.dumps(r.structured, ensure_ascii=False) + "\n"
     else:
         out = answer + "\n"

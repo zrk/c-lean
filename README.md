@@ -52,6 +52,7 @@ c-lean -m haiku --schema schema.json "..."
 c-lean --check
 ```
 
+- With `--json`, stdout carries the CLI's `result` document whenever the call received one, whatever the outcome (a cut-off answer, an error, a limit wall, a stop after the `result`); the exit code and stderr are unchanged (except exit 120 when stdout cannot be written, as for any answer). A call that ended before any `result` has no document and prints nothing.
 - There is no default model. Choose model and effort for each task.
 - stdout carries only the answer. stderr carries a trailer with token counts and the exit code of the process. `NOT COUNTED` in the trailer means the counts are not exact, so read them as a lower bound: the usage report of `claude -p` was missing or malformed, or the call was stopped by the timeout or a signal. A malformed usage report never costs the answer.
 - Each call has a timeout: `--timeout SEC` overrides the effort's default of 1200 s (no `-e`, low, medium or high), 3600 s at `-e xhigh` and 6000 s at `-e max`. If `claude -p` has printed its result and does not exit within 5 seconds, `c-lean` stops it, prints the answer and a warning.

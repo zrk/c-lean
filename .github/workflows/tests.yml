@@ -3,8 +3,32 @@ name: tests
 on:
   push:
   pull_request:
+  # The red phase (mutation harness) is slow, so it never runs on push: it has
+  # its own weekly schedule and a manual trigger.
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
 
+permissions:
+  contents: read
+
+# Actions stay on their major tags for now; pinning them to commit SHAs is a follow-up.
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install ruff
+        run: python3 -m pip install ruff==0.16.9
+      # E741 (a single-letter `l`) is ignored on purpose. bin/c-lean has no .py
+      # extension, so ruff skips it unless it is named.
+      - name: Lint
+        run: ruff check --select E4,E7,E9,F --ignore E741 bin/c-lean bin tests
+
   test:
     strategy:
       fail-fast: false
@@ -17,6 +41,8 @@ jobs:
           - os: macos-latest
             python: "3.14"
     runs-on: ${{ matrix.os }}
+    # A full run takes 3-4 minutes; macOS runners are slower.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -24,3 +50,43 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Tests against a fake claude binary
         run: python3 tests/test_c_lean.py
+
+  # The runner starts a job container with `tail -f /dev/null` as PID 1 and no
+  # `--init`, so orphaned grandchildren stay zombies instead of being reaped.
+  # The tests must not mistake a zombie for a live process.
+  test-container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container: python:3.12-slim
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tests against a fake claude binary
+        run: python3 tests/test_c_lean.py
+
+  redphase:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # Measured once, in a 4-CPU sandbox (not on GitHub runners): 1158 s for 476
+    # cases (about 19 minutes), and the case list is growing.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      # `shell: bash` runs with pipefail, so rc 1 / rc 2 of redphase survive the
+      # tee. redphase prints one JSON row per case as it goes: the log keeps a
+      # partial run's data if the step is cut off.
+      - name: Break the source one thing at a time and see each test go red
+        shell: bash
+        timeout-minutes: 50
+        run: python3 tests/redphase.py "$RUNNER_TEMP/redphase.json" | tee "$RUNNER_TEMP/redphase.log"
+      - name: Upload the report and the log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: redphase-report
+          path: |
+            ${{ runner.temp }}/redphase.json
+            ${{ runner.temp }}/redphase.log
+          if-no-files-found: warn

@@ -560,6 +560,11 @@ def main():
         return 0
     if MODE == "sleeper":
         secs = float(os.environ.get("C_LEAN_FAKE_SLEEP", "20"))
+        # SIGHUP ignored here and, through exec, in the child: a hangup to the
+        # whole job cannot end either by itself (if this process died first, its
+        # child would be orphaned out of c-lean's reach), so only c-lean's own
+        # kill of the tree can.
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
         kid = subprocess.Popen(["/bin/sleep", str(secs)])
         with open(os.path.join(STATE, "pids.log"), "a") as f:
             f.write("%d %d\n" % (os.getpid(), kid.pid))

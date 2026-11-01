@@ -210,6 +210,40 @@ def run(cmd, mode="ok", state=None, extra_env=None, stdin="", cwd=None):
     return p
 
 
+def pid_alive(pid):
+    """Is `pid` a live process? A zombie (state Z) or a dead one (X) is not:
+    kill(pid, 0) succeeds for a zombie, and where PID 1 reaps orphans lazily
+    (Docker without --init, some VMs) a killed grandchild sits in Z for a while.
+    An unknown state counts as alive: a "left alive" assert must fail loudly
+    rather than pass because `ps` was refused by a sandbox or is missing."""
+    pid = int(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass  # EPERM: it exists, just is not ours
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as f:
+            # "pid (comm) S ...": comm may hold spaces and parens, so cut at the last ")".
+            state = f.read().rpartition(b")")[2].split()[0].decode("ascii", "replace")
+    except (FileNotFoundError, ProcessLookupError):
+        # ESRCH: reaped between the open and the read of its stat file
+        if os.path.isdir("/proc/self"):
+            return False  # Linux, and it exited since the kill above
+        state = None
+    except (OSError, IndexError):
+        state = None
+    if state is None:  # no /proc (macOS)
+        try:
+            out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                                 text=True).stdout.split()
+        except OSError:
+            out = []
+        state = out[0] if out and out[0][0].isupper() else None
+    return state is None or state[0] not in "ZX"
+
+
 class Case(unittest.TestCase):
     def setUp(self):
         self.tmpdirs = []
@@ -283,11 +317,42 @@ class Case(unittest.TestCase):
 
 
     def alive(self, pid):
+        return pid_alive(pid)
+
+    def test_a_state_that_cannot_be_read_counts_as_alive(self):
+        """No /proc and a `ps` that is refused, absent, silent or garbled must not
+        read as "dead": every "left alive" assert would then pass on nothing."""
+        me = os.getpid()
+        def ps(out):
+            return types.SimpleNamespace(stdout=out)
+        for what, run in (("ps refused", mock.Mock(side_effect=PermissionError)),
+                          ("ps absent", mock.Mock(side_effect=FileNotFoundError)),
+                          ("ps silent", mock.Mock(return_value=ps(""))),
+                          ("ps garbled", mock.Mock(return_value=ps("???\n")))):
+            with mock.patch("builtins.open", side_effect=PermissionError), \
+                 mock.patch.object(subprocess, "run", run):
+                self.assertTrue(pid_alive(me), "state unknown (%s) must count as alive" % what)
+        with mock.patch("builtins.open", side_effect=PermissionError), \
+             mock.patch.object(subprocess, "run", return_value=ps("Z+\n")):
+            self.assertFalse(pid_alive(me), "ps reporting a zombie must count as dead")
+        if os.path.isdir("/proc/self"):
+            with mock.patch("builtins.open", side_effect=ProcessLookupError), \
+                 mock.patch.object(subprocess, "run", return_value=ps("")):
+                self.assertFalse(pid_alive(me), "a process reaped while its stat file "
+                                                "was being read must count as dead")
+
+    def test_a_zombie_is_not_alive(self):
+        """The liveness check the process-tree tests rely on: a killed child that
+        nobody has reaped yet is a zombie, and kill(pid, 0) still succeeds for it."""
+        kid = subprocess.Popen(["sleep", "60"])
         try:
-            os.kill(int(pid), 0)
-            return True
-        except OSError:
-            return False
+            self.assertTrue(self.alive(kid.pid), "a running process must count as alive")
+            kid.kill()  # not waited for, so it stays a zombie of ours
+            self.wait_for(lambda: not self.alive(kid.pid), secs=5, what="the zombie to count as dead")
+            os.kill(kid.pid, 0)  # still in the process table, which is the point
+        finally:
+            kid.wait()
+        self.assertFalse(self.alive(kid.pid), "a reaped process is gone")
 
     def wait_for(self, fn, secs=20, what="condition"):
         t0 = time.time()
@@ -491,12 +556,9 @@ class Case(unittest.TestCase):
         parent, kid = open(os.path.join(self.state, "hang.pids")).read().split()
         alive = []
         for pid in (parent, kid):
-            try:
-                os.kill(int(pid), 0)
+            if self.alive(pid):
                 alive.append(pid)
                 os.kill(int(pid), 9)
-            except OSError:
-                pass
         self.assertEqual(alive, [], "timeout left %s alive (child or grandchild)" % alive)
 
 
@@ -812,8 +874,9 @@ if _dir:
 
 
     def test_single_sighup_to_the_process_group_stops_the_call(self):
-        """SIGHUP to the whole job stops the call with exit 128+1, whether
-        the CLI exits first or the wrapper's SIGKILL reaches it first."""
+        """SIGHUP to the whole job stops the call with exit 128+1. The fake
+        and its child ignore SIGHUP, so only c-lean's own kill of the tree
+        can end them; a leaked child fails the test."""
         proc = self.start_call([CLI, "-m", "haiku", "--system", "S", "hello"],
                                 mode="sleeper", new_session=True)
         try:

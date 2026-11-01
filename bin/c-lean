@@ -463,18 +463,22 @@ def write_probe(path, probe):
     a file that is already there keeps its mode."""
     try:
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = B.open_record_file(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL)
             made = True
         except FileExistsError:
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+            fd = B.open_record_file(path, os.O_WRONLY | os.O_APPEND)
             made = False
-        with os.fdopen(fd, "a", encoding="utf-8", errors="backslashreplace") as f:
+        try:
             if made:
                 os.fchmod(fd, 0o600)  # a umask can take bits off the mode given to open
-            f.write(json.dumps(probe, ensure_ascii=False) + "\n")
+            # O_NONBLOCK as in the usage log: a FIFO with no reader, or one
+            # that does not drain, gives a WARN, not a hang.
+            B.write_record(fd, json.dumps(probe, ensure_ascii=False) + "\n")
+        finally:
+            os.close(fd)
     except Exception as e:  # noqa: BLE001 — the record must not change the exit or end in a traceback
         return (f"{B.TOOL_NAME} --check: WARN could not write the probe record to %s: %s"
-                % (path, getattr(e, "strerror", None) or e))
+                % (path, B._fifo_reason(e, path)))
     return None
 
 

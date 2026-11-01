@@ -57,6 +57,7 @@ import hashlib
 import json
 import os
 import re
+import select
 import selectors
 import shutil
 import signal
@@ -566,6 +567,65 @@ def extract_usage(doc: dict):
     return counters, unknown
 
 
+def _fifo_reason(e: Exception, path) -> str:
+    """The reason of a failed open or write; "a FIFO" only when it is one (a
+    UNIX socket path gives ENXIO too)."""
+    why = str(getattr(e, "strerror", None) or e)
+    fifo = _is_fifo(path)  # only a hint for the message
+    if fifo and isinstance(e, OSError) and e.errno == errno.ENXIO:
+        return "a FIFO with no reader (%s)" % why
+    if fifo and isinstance(e, BlockingIOError):
+        return "a FIFO whose reader does not read (%s)" % why
+    return why
+
+
+# How long a record may wait for a FIFO to take it. A reader that drains gets
+# any size (a long --tag is more than the 64 KiB a pipe holds); one that never
+# does must cost a WARN after this, not a hang before the answer is printed.
+RECORD_WAIT_SECS = 2.0
+
+
+def open_record_file(path, flags: int, mode: int = 0o600) -> int:
+    """os.open(O_NONBLOCK). A FIFO with no reader gives ENXIO; a reader that
+    reopens between two records (`while true; do cat fifo; done`) is back in
+    moments, as a blocking open would have waited for, so retry for as long as
+    a record may wait. Any other ENXIO (a socket path) fails at once."""
+    deadline = time.monotonic() + RECORD_WAIT_SECS
+    while True:
+        try:
+            return os.open(path, flags | os.O_NONBLOCK, mode)
+        except OSError as e:
+            if e.errno != errno.ENXIO or time.monotonic() >= deadline or not _is_fifo(path):
+                raise
+        time.sleep(0.03)
+
+
+def _is_fifo(path) -> bool:
+    try:
+        return stat.S_ISFIFO(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+def write_record(fd: int, line: str) -> None:
+    """Write the record to a non-blocking fd within RECORD_WAIT_SECS; a record
+    left torn is an error with its byte counts, not silence."""
+    data = memoryview(line.encode("utf-8", "backslashreplace"))
+    done = 0
+    deadline = time.monotonic() + RECORD_WAIT_SECS
+    while done < len(data):
+        try:
+            done += os.write(fd, data[done:])
+            continue
+        except BlockingIOError:
+            if done == 0 and time.monotonic() >= deadline:
+                raise  # nothing written, so nothing torn
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise OSError("wrote %d of %d bytes, the record is torn" % (done, len(data)))
+        select.select([], [fd], [], left)
+
+
 def log_usage(rec: dict, path=None) -> None:
     """Append counters and the prompt's sha256 hash, never its text.
 
@@ -579,15 +639,24 @@ def log_usage(rec: dict, path=None) -> None:
         parent = os.path.dirname(path)
         if parent:
             _private_dir(parent)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as f:
+        # O_NONBLOCK: a FIFO nobody reads made open() wait for a reader for
+        # ever, before the answer was printed, and no signal could end it. It
+        # does nothing to a regular file or a device, and it stays set so a
+        # reader that does not drain gives EAGAIN, not a hang.
+        fd = open_record_file(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        try:
             if stat.S_ISREG(os.fstat(fd).st_mode):
                 os.fchmod(fd, 0o600)
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            # One record, written whole within RECORD_WAIT_SECS (it holds no
+            # prompt text); atomic against other writers only up to PIPE_BUF.
+            # A buffered file object would raise from its flush, not here.
+            write_record(fd, json.dumps(rec, ensure_ascii=False) + "\n")
+        finally:
+            os.close(fd)
     except Exception as e:  # logging must never break a run
         # nor may a stderr that can no longer be written: the text blocks of
         # the call are saved after this line
-        _say_during_call(f"{TOOL_NAME}: WARN could not write usage log: %s" % e)
+        _say_during_call(f"{TOOL_NAME}: WARN could not write usage log: %s" % _fifo_reason(e, path))
 
 
 # --------------------------------------------------------- children & signals

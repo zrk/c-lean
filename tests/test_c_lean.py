@@ -16,6 +16,7 @@ replays those breakages on a throwaway copy.
 import atexit
 import contextlib
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -4299,7 +4300,8 @@ if _dir:
                 stack.enter_context(mock.patch.object(B, "_dt", types.SimpleNamespace(
                     datetime=SteppingDatetime, timezone=timezone)))
                 stack.enter_context(mock.patch.object(B, "time", types.SimpleNamespace(
-                    monotonic=mock.Mock(side_effect=[1000.0, 1003.5]))))
+                    monotonic=mock.Mock(side_effect=itertools.chain([1000.0, 1003.5],
+                                                                    itertools.repeat(1003.5))))))
                 stack.enter_context(mock.patch.object(tempfile, "tempdir", tmp))
                 stack.enter_context(mock.patch.object(B, "_communicate",
                     timed_out if outcome == "timeout" else read_all))
@@ -4354,6 +4356,191 @@ if _dir:
         self.assertEqual(json.loads(data), {"probe": "fifo"})
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o640,
                          "a FIFO usage log must keep its existing mode")
+
+    def run_with_fifo(self, args, env_name, fill=False):
+        """Run c-lean with `env_name` naming a FIFO. No reader, or with `fill`
+        a reader that never reads and a pipe already full. A hang fails here
+        on its own timeout, not in the runner's."""
+        path = self.path("sink-%s.fifo" % ("full" if fill else "empty"))
+        os.mkfifo(path, 0o600)
+        rd = os.open(path, os.O_RDONLY | os.O_NONBLOCK) if fill else None
+        try:
+            if fill:
+                wr = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                try:
+                    while True:
+                        os.write(wr, b"x" * 4096)
+                except BlockingIOError:
+                    pass
+                finally:
+                    os.close(wr)
+            env = child_env("single", self.state, dict(self.env, **{env_name: path}))
+            try:
+                return subprocess.run([sys.executable, CLI] + args, env=env, capture_output=True,
+                                      text=True, timeout=20, preexec_fn=default_sighup)
+            except subprocess.TimeoutExpired:
+                self.fail("c-lean hung on a FIFO that %s" % ("nobody drains" if fill else "has no reader"))
+        finally:
+            if rd is not None:
+                os.close(rd)
+
+    def test_usage_log_fifo_without_reader_warns_and_does_not_hang(self):
+        for fill in (False, True):
+            with self.subTest(fill=fill):
+                p = self.run_with_fifo(["-m", "haiku", "hello"], "C_LEAN_USAGE_LOG", fill)
+                self.assertEqual((p.returncode, p.stdout), (0, "ECHO:hello\n"), p.stderr)
+                self.assertEqual(len([w for w in self.warns(p) if "could not write usage log" in w]), 1,
+                                 "a usage log FIFO that cannot take the record must give one WARN: "
+                                 + p.stderr)
+
+    def test_probe_file_fifo_without_reader_warns_and_does_not_hang(self):
+        for fill in (False, True):
+            with self.subTest(fill=fill):
+                p = self.run_with_fifo(["--check"], "C_LEAN_CHECK_PROBE_FILE", fill)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(len([w for w in p.stderr.splitlines()
+                                      if "WARN could not write the probe record" in w]), 1,
+                                 "a probe FIFO that cannot take the record must give one WARN: "
+                                 + p.stderr)
+
+    def test_a_short_write_of_the_usage_record_is_a_warn_not_silence(self):
+        said = []
+        def write(fd, data):
+            if said_calls:
+                raise BlockingIOError(11, "Resource temporarily unavailable")
+            said_calls.append(1)
+            return 3
+        said_calls = []
+        with mock.patch.object(B.os, "write", write), \
+                mock.patch.object(B, "RECORD_WAIT_SECS", 0.2), \
+                mock.patch.object(B, "_say_during_call", said.append):
+            B.log_usage({"probe": "short"}, path=self.log)
+        self.assertEqual(len(said), 1, "a torn usage record must give one WARN")
+        self.assertIn("wrote 3 of ", said[0])
+        self.assertIn("the record is torn", said[0])
+
+    def test_a_large_usage_record_reaches_a_reader_that_drains(self):
+        """A record over the 64 KiB a pipe holds was cut by one non-blocking
+        write even though the reader kept reading."""
+        path = self.path("big.fifo")
+        os.mkfifo(path, 0o600)
+        rd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        got, stop = [], threading.Event()
+
+        def drain():
+            while not stop.is_set():
+                try:
+                    chunk = os.read(rd, 4096)
+                except BlockingIOError:
+                    chunk = None
+                if chunk:
+                    got.append(chunk)
+                else:
+                    time.sleep(0.001)
+        t = threading.Thread(target=drain)
+        t.start()
+        said = []
+        try:
+            with mock.patch.object(B, "_say_during_call", said.append):
+                B.log_usage({"tag": "x" * 120000}, path=path)
+            time.sleep(0.2)
+        finally:
+            stop.set()
+            t.join()
+            os.close(rd)
+        data = b"".join(got)
+        self.assertEqual(said, [], "a reader that drains must get the whole record")
+        self.assertTrue(data.endswith(b"}\n"), "a reader that drains must get the whole record")
+        self.assertEqual(len(json.loads(data)["tag"]), 120000)
+
+    def test_a_record_for_a_reader_that_never_drains_ends_in_a_warn(self):
+        path = self.path("stuck.fifo")
+        os.mkfifo(path, 0o600)
+        rd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        said = []
+        # in a thread: without O_NONBLOCK the write blocks, and a hang must
+        # fail here, not in the runner's timeout
+        t = threading.Thread(target=B.log_usage, args=({"tag": "x" * 120000},),
+                             kwargs={"path": path}, daemon=True)
+        try:
+            with mock.patch.object(B, "RECORD_WAIT_SECS", 0.3), \
+                    mock.patch.object(B, "_say_during_call", said.append):
+                t.start()
+                t.join(10)
+                finished = not t.is_alive()
+        finally:
+            os.close(rd)  # a stuck write ends with EPIPE
+            t.join(5)
+        self.assertTrue(finished, "log_usage must not hold the record for ever")
+        self.assertEqual(len(said), 1, said)
+        self.assertIn("the record is torn", said[0])
+
+    def test_a_fifo_reader_that_opens_late_still_gets_the_record(self):
+        """`while true; do cat fifo; done` has no reader between two cats; a
+        blocking open waited for the next one, and the record must not be lost."""
+        path = self.path("late.fifo")
+        os.mkfifo(path, 0o600)
+        got = []
+
+        def late_reader():
+            time.sleep(0.3)
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                while True:
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        break
+                    got.append(chunk)
+            finally:
+                os.close(fd)
+        t = threading.Thread(target=late_reader, daemon=True)
+        t.start()
+        said = []
+        w = threading.Thread(target=B.log_usage, args=({"probe": "late"},), kwargs={"path": path},
+                             daemon=True)
+        with mock.patch.object(B, "_say_during_call", said.append):
+            w.start()
+            w.join(10)
+            ended = not w.is_alive()
+        t.join(5)
+        self.assertTrue(ended, "log_usage must not hold the record for ever")
+        self.assertEqual(said, [], "a reader that opens late must get the whole record")
+        self.assertEqual(json.loads(b"".join(got)), {"probe": "late"},
+                         "a reader that opens late must get the whole record")
+
+    def test_a_fifo_nobody_opens_gives_one_warn_within_the_bound(self):
+        path = self.path("never.fifo")
+        os.mkfifo(path, 0o600)
+        said = []
+        w = threading.Thread(target=B.log_usage, args=({"probe": "never"},), kwargs={"path": path},
+                             daemon=True)
+        with mock.patch.object(B, "_say_during_call", said.append):
+            t0 = time.monotonic()
+            w.start()
+            w.join(B.RECORD_WAIT_SECS + 8)
+            took = time.monotonic() - t0
+            ended = not w.is_alive()
+        self.assertTrue(ended, "log_usage must not wait for a reader for ever")
+        self.assertLess(took, B.RECORD_WAIT_SECS + 5)
+        self.assertEqual(len(said), 1, said)
+        self.assertIn("a FIFO with no reader", said[0])
+
+    def test_enxio_on_a_socket_path_is_not_called_a_fifo(self):
+        import socket
+        # a short directory: a socket path over ~104 bytes cannot be bound
+        short = tempfile.mkdtemp(dir="/tmp")
+        self.tmpdirs.append(short)
+        path = os.path.join(short, "s.sock")
+        srv = socket.socket(socket.AF_UNIX)
+        srv.bind(path)
+        try:
+            said = []
+            with mock.patch.object(B, "_say_during_call", said.append):
+                B.log_usage({"probe": "sock"}, path=path)
+        finally:
+            srv.close()
+        self.assertEqual(len(said), 1, said)
+        self.assertNotIn("FIFO", said[0])
 
     def test_an_existing_regular_usage_log_is_made_private(self):
         self.write("usage.jsonl", "")

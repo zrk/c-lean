@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import json
 import math
 import os
 import select
+import signal
 import socket
 import stat
 import struct
 import sys
 import termios
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import c_lean_core as B  # noqa: E402
@@ -211,9 +214,11 @@ Guarantees
     prints the result document plus one key, @PIECES@, the text of each
     block; the key is there only when the blocks were joined. --json prints
     the document of any call that received one, whatever the outcome (a cut
-    answer, an error, a limit wall, a stop after the `result`). The exit code
-    and stderr are the same as without it, except exit 120 when stdout can no
-    longer be written, as for any answer. A call that ended before any
+    answer, an error, a limit wall, a stop after the `result`), whole
+    unless a stop comes after the call, before it is all printed (see The
+    exit code of a stop). The exit code and stderr are the same as without it,
+    except exit 120 when stdout can no longer be written, as for any
+    answer. A call that ended before any
     `result` has no document, and stdout stays empty.
     Blocks are joined only when they can be trusted to be one answer: the
     CLI took no message back, every message from the first text block to
@@ -290,7 +295,8 @@ Guarantees
     kept as for any other.
   * the exit code in the trailer and in the usage-log line is the exit code
     of the process: an empty answer, or no structured output under
-    --schema, is exit 1 in all three places. Exit 120 is the one exception
+    --schema, is exit 1 in all three places. Exit 120, and 128+N for a stop
+    after the call until the end of the run is printed, are the exceptions
     (see Known limitations).
   * an empty answer is a failure, not a result (--allow-empty turns that off):
     `@TOOL@ … > answer.md` used to leave an empty file behind and exit 0.
@@ -346,7 +352,22 @@ Known limitations
     A good whole `result` already received is the exception: the answer stands,
     a WARN says the stop came after the answer, and that event decides the call.
     A child that dies of a signal @TOOL@ did not catch keeps its signal exit
-    (128+N). Signals landing after the exit has been decided cannot change it.
+    (128+N). A stop after the call, until the end of the run is printed,
+    gives 128+signal too, and a reader that does not read cannot hold it:
+    the print ends at once, or about 1 s later when the stop lands in a
+    write to stderr that blocks, and a wait for the usage log or the
+    --check record ends at once too. Nothing more goes to stdout then (it
+    may hold part of the answer, NOT a result), the text blocks are saved
+    to a file as those of an answer not printed are (under --schema the
+    text blocks, not the structured output), and a line on stderr says so,
+    after the trailer when that was not printed yet; stderr is given at
+    most 1 s for these lines. The trailer and the usage-log line keep the
+    exit @TOOL@ had decided. Signals landing after that cannot change it.
+    Lines written before the call ends (a WARN about @ENV@PASS_ENV or
+    stdin, or one of the call) go to stderr as they come: a reader that
+    does not read can hold them, and a stop then waits for it. So it
+    holds the end of the run after a stop before or during the call, until
+    a second stop ends it.
   * Exit 120. When stdout or stderr can no longer be written (a closed
     terminal, or a pipe whose reader has exited), the next write there fails.
     @TOOL@ then prints nothing more and exits 120, without a traceback,
@@ -385,13 +406,22 @@ Exit codes
     whose reader has exited (see Known limitations) ·
   137 the child died of SIGKILL while @TOOL@ caught no stop signal ·
   130/143/129 stopped by SIGINT/SIGTERM/SIGHUP
-    — before or during the call, unless a good whole `result` already came
+    — before or during the call, unless a good whole `result` already came,
+    and after it until the end of the run is printed
 """
 # python -OO strips docstrings, so the help is a constant, not __doc__
 HELP = (HELP.replace("@TOOL@", B.TOOL_NAME).replace("@ENV@", B.ENV_PREFIX)
         .replace("@PIECES@", B.PIECES_KEY))
 
 CHECK_MAX_INPUT = 1500
+STOP_LINES_WAIT = 1.0  # seconds the lines of a stopped print may wait for stderr
+# Seconds a write to stderr may block with the stops held (see put_exact) before
+# a stop that waits is let in: about the time a person gives a Ctrl-C before
+# pressing it again, and far above a write that has room (microseconds).
+WRITE_WATCHDOG = 1.0
+# The longest single wait of a write for room, or for a stop held meanwhile: a
+# stop taken by another thread runs only once the main thread wakes up.
+WAIT_STEP = B.WAIT_STEP
 CHECK_SYSTEM = ("You are a terse evaluator. Always answer in English. "
                 "Reply with exactly one word and nothing else.")
 CHECK_PROMPT = "Reply with the single word: OK"
@@ -600,6 +630,7 @@ def do_check(args) -> int:
     tool = B.TOOL_NAME + " --check"
     r = B.call_model(CHECK_PROMPT, system=CHECK_SYSTEM, model="haiku", effort="low",
                      timeout=timeout, backend=args.backend, tag="check", tool=tool, log=False)
+    stop_seen = B.stops_judged()  # a stop after these cuts the print (see finish)
     # the answer as `c-lean` would print it: every block joined, else the result
     seen = (B.splice(r.pieces)[0] if r.pieces else r.text) or ""
     probe = {"ts": B.now_iso(), "kind": "check", "exit": r.exit, "wall": bool(r.wall),
@@ -612,7 +643,9 @@ def do_check(args) -> int:
     # a probe that fails is exit 1 whatever the call gave, and the trailer, the
     # usage log and the probe record must say so
     r.exit = code
-    B.log_call(r, CHECK_PROMPT, tag="check", tool=tool)
+    # its WARN goes with the trailer, as every line after the call does: a
+    # stop must not wait for a stderr that is not read (see finish)
+    B.log_call(r, CHECK_PROMPT, tag="check", tool=tool, say=say)
     probe["exit"] = code
     # Before anything is printed, as the usage-log line is: a stream that can
     # no longer be written must not cost the record. A record that cannot be
@@ -622,7 +655,7 @@ def do_check(args) -> int:
         warn = write_probe(probe_path, probe)
         if warn:
             say.append(warn)
-    return finish(code, B.trailer(r, tool), say)
+    return finish(code, B.trailer(r, tool), say, seen=stop_seen)
 
 
 def write_probe(path, probe):
@@ -851,7 +884,7 @@ def keep(r, prompt, reason) -> str:
             "printed, NOT a result" % (size, path))
 
 
-def write_end(err=None, out=None) -> bool:
+def write_end(err=None, out=None, taken=None) -> bool:
     """Write `err` to stderr, then `out` to stdout; False when one of them can
     no longer be written (a pipe whose reader has exited, a closed terminal, a
     full disk, a stdout closed from the start). Nothing more is written then.
@@ -863,25 +896,155 @@ def write_end(err=None, out=None) -> bool:
     `out` goes out as UTF-8 bytes whatever the encoding of stdout: under an
     ASCII one, a non-ASCII answer ended in a UnicodeEncodeError traceback and
     was lost. A lone surrogate (half of a pair the model wrote) goes out as
-    the escape the saved file has. stderr keeps its own encoding: Python
-    writes it with backslashreplace, so no text fails there."""
+    the escape the saved file has. stderr keeps its own encoding, with
+    backslashreplace as Python writes it, so no text fails there.
+
+    A stop while this writes (B.printing) raises B.OutputStopped out of it;
+    taken then says what stderr took of err_bytes(err) (see put_exact)."""
     stream = None
     try:
         if err is not None and sys.stderr is not None:
             stream = sys.stderr
-            stream.write(err)
-            stream.flush()
+            put_exact(stream, err_bytes(err), new_taken() if taken is None else taken)
         if out is not None:
             stream = sys.stdout
             if stream is None:
                 return False
-            stream.flush()  # whatever the text layer holds goes first
-            stream.buffer.write(out.encode("utf-8", "backslashreplace"))
-            stream.buffer.flush()
+            put(stream, out.encode("utf-8", "backslashreplace"))
     except OSError:
         silence(stream)
         return False
     return True
+
+
+def put(stream, data) -> None:
+    """Write every byte of `data` to the buffer under `stream`, after what its
+    text layer holds, and flush it.
+
+    Under `python -u` or PYTHONUNBUFFERED the buffer is the raw file, and one
+    write() of it can take part of the bytes: the pipe of a reader that exits
+    mid-answer, a signal. The rest was dropped and the run ended with exit 0.
+    A file the parent left O_NONBLOCK takes no more while its reader is slow
+    (None from the raw file, BlockingIOError from a buffered one): that is
+    waited for, as a blocking file waits, and it cost a good answer exit 120."""
+    stream.flush()
+    buf = stream.buffer
+    view = memoryview(data)
+    while True:
+        try:
+            while view:
+                n = buf.write(view)
+                if n is None:
+                    raise BlockingIOError(errno.EAGAIN, "no room", 0)
+                view = view[n:]
+            buf.flush()
+            return
+        except BlockingIOError as e:
+            view = view[e.characters_written:]  # what a buffered file took is its own now
+            select.select([], [buf], [], WAIT_STEP)  # a stop another thread took runs after it
+
+
+def err_bytes(text) -> bytes:
+    """`text` as stderr writes it: its own encoding, with backslashreplace."""
+    return text.encode(getattr(sys.stderr, "encoding", None) or "utf-8", "backslashreplace")
+
+
+def new_taken() -> dict:
+    """What a file took of a put_exact: `took` bytes, and `lost` when the
+    rest was given up on (see put_exact)."""
+    return {"took": 0, "lost": False}
+
+
+class Stalled(Exception):
+    """stderr took nothing more in time: a write held back the stops while a
+    stop waited, or the time a bounded write had ran out."""
+
+
+def put_exact(stream, data, taken, deadline=None) -> None:
+    """Write every byte of `data` to the file under `stream`, past its buffer
+    (after what it holds), and add to taken["took"] each byte the file took.
+    `deadline` (time.monotonic()) bounds the whole write: Stalled after it.
+
+    A stop that cuts this must know what is left to send: Python's buffer
+    hides it. A write it took whole may still sit in it unwritten, and a
+    raw write under PIPE_BUF bytes that a signal cuts takes none, so the
+    trailer and its lines (a SAVED path among them) were lost.
+
+    The wait for room is where a stop cuts this. The write comes after it,
+    a piece of at most PIPE_BUF bytes, with the stops held (B.hold_stops): a
+    stop handled between the return of the write and the count lost the
+    count, and the trailer was printed twice. Room seen by select() does not
+    promise that the write will not block (another writer of the same pipe
+    takes it first, a terminal stalls), and a write that blocked with the
+    stops held could be ended by SIGKILL alone: SIGALRM looks every
+    WAIT_STEP seconds whether a stop waits, and once the stops have been
+    held for WRITE_WATCHDOG seconds and one does, the write is given up on
+    (taken["lost"]), never sent again, and the stop goes on. A look in
+    short steps sees a stop handled after SIGALRM (one another thread took,
+    or a signal of a higher number) at the next step, not a whole
+    WRITE_WATCHDOG later; the wait for room is cut in such steps too.
+    A file left O_NONBLOCK is waited for, as in put(), and so is what the
+    buffer of `stream` still holds (a line a stop cut), within `deadline`:
+    a flush that waited for room before the timer was armed held the stop
+    lines, and the run, past it; a full O_NONBLOCK one cost exit 120."""
+    fd = stream.fileno()
+    view = memoryview(data)
+    held = [0.0]  # since when the stops are held, 0 when they are not
+
+    def wait():
+        """What to arm the timer with now, None for nothing."""
+        secs = WAIT_STEP if held[0] else None
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            secs = left if secs is None else min(secs, left)
+        return secs
+
+    def arm():
+        secs = wait()
+        if secs is not None:
+            if secs <= 0:
+                raise Stalled()
+            signal.setitimer(signal.ITIMER_REAL, secs)
+
+    def ring(signum, frame):  # noqa: ARG001
+        if held[0] and B.stop_held() and time.monotonic() - held[0] >= WRITE_WATCHDOG:
+            raise Stalled()
+        arm()  # no stop waits, or not for long yet: wait on
+
+    old = signal.signal(signal.SIGALRM, ring)
+    try:
+        while True:  # what the buffer holds goes first
+            arm()
+            try:
+                stream.flush()
+                break
+            except BlockingIOError:
+                select.select([], [fd], [], WAIT_STEP)
+        while view:
+            arm()
+            if not select.select([], [fd], [], WAIT_STEP)[1]:
+                continue
+            B.hold_stops()
+            try:
+                held[0] = time.monotonic()
+                arm()
+                try:
+                    n = os.write(fd, view[:select.PIPE_BUF])
+                except BlockingIOError:  # another writer took the room first
+                    n = 0
+                taken["took"] += n
+            except Stalled:
+                taken["lost"] = True
+                raise
+            finally:
+                held[0] = 0.0
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                B.release_stops()  # a stop that came meanwhile raises here
+            view = view[n:]
+    finally:
+        # The timer is c-lean's alone: it is stopped here, not restored.
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, signal.SIG_DFL if old is None else old)
 
 
 def silence(stream) -> None:
@@ -900,13 +1063,73 @@ def silence(stream) -> None:
         pass
 
 
-def finish(code, trailer, say, out=None) -> int:
+def finish(code, trailer, say, out=None, save=None, seen=None) -> int:
     """Print the end of a run, the trailer and the lines of `say` on stderr
     and then the answer on stdout, and return the exit code: `code`, or 120
-    when a stream could no longer be written (see Exit 120 in the help)."""
-    if not write_end(trailer + "".join(line + "\n" for line in say), out):
-        return B.EXIT_STREAM
+    when a stream could no longer be written (see Exit 120 in the help), or
+    128+N when stop signal N came after the call, before this was all printed.
+
+    `seen` is B.stops_judged(): a stop after the ones the call was judged
+    with, and before the print, counts as one during the print. It was only
+    recorded, and a reader that does not read then held the print, and the
+    run, for ever. `save(reason)` keeps the text blocks of the call and
+    returns the line that says so; None when they are kept already or there
+    are none."""
+    err = trailer + "".join(line + "\n" for line in say)
+    taken = new_taken()  # what stderr took of err
+    try:
+        with B.printing():
+            if seen is not None and B.stop_count() != seen:
+                raise B.OutputStopped()
+            if not write_end(err, taken=taken):
+                return B.EXIT_STREAM
+            if out is not None and not write_end(out=out):
+                return B.EXIT_STREAM
+    except (B.OutputStopped, Stalled):
+        # what of the trailer and its lines stderr did not take goes first,
+        # unless stderr was given up on
+        rest = (None if taken["lost"] or sys.stderr is None
+                else err_bytes(err)[taken["took"]:])
+        return stopped_printing(rest, save, answer=out is not None)
     return code
+
+
+def stopped_printing(rest, save, answer=True) -> int:
+    """The end of a run that a stop cut after the call, before its end was
+    all printed: stdout may hold part of the answer, so the run ends with
+    128+N, never with the exit of the call; the text blocks are kept as for
+    an answer that was not printed. `rest` is the bytes of the trailer and
+    its lines that stderr had yet to take, all of them when the stop came
+    before them; None when stderr was given up on, and nothing more goes
+    there. `answer`: an answer was to go to stdout (not under --check)."""
+    signum = B.last_stop()  # the stop that cut the print, not the first one
+    lines = [f"{B.TOOL_NAME}: stopped — signal %d came after the call, before the end of the run "
+             "was all printed" % signum
+             + (": stdout may hold part of the answer, NOT a result" if answer else "")]
+    if save is not None:
+        lines.append(save("the run was stopped by signal %d after the call, before its answer "
+                          "was all printed" % signum))
+    if rest is not None:
+        write_bounded(rest + err_bytes("".join(line + "\n" for line in lines)))
+    # what the buffers still hold must not block the interpreter on the way
+    # out, with every stop signal ignored by then
+    silence(sys.stdout)
+    silence(sys.stderr)
+    return B.SIGNAL_EXIT_BASE + signum
+
+
+def write_bounded(data) -> None:
+    """Write the bytes `data` to stderr, waiting at most STOP_LINES_WAIT
+    seconds for them to be taken. A stop must end the run: a stderr that is
+    not read (a full pipe, or the one pipe of both streams under 2>&1) held
+    these lines, and the run, until a second stop. What is not taken by then
+    is lost."""
+    if sys.stderr is None:
+        return
+    try:
+        put_exact(sys.stderr, data, new_taken(), deadline=time.monotonic() + STOP_LINES_WAIT)
+    except (Stalled, ValueError, OSError):
+        pass
 
 
 def main(argv=None) -> int:
@@ -965,18 +1188,25 @@ def main(argv=None) -> int:
     r = B.call_model(prompt, system=system, model=args.model, effort=args.effort,
                      schema=schema, timeout=timeout, backend=args.backend,
                      tag=args.tag, tool=B.TOOL_NAME, log=False)
+    stop_seen = B.stops_judged()  # a stop after these cuts the print (see finish)
     code, say, out, unprinted = settle(args, r, schema, timeout, limit_source)
     # Some exits are decided here, not by the call (an empty answer, a missing
     # structured output): the trailer and the usage log must say this one.
     r.exit = code
-    B.log_call(r, prompt, tag=args.tag, tool=B.TOOL_NAME)
+    # its WARN goes with the trailer, as every line after the call does: a
+    # stop must not wait for a stderr that is not read (see finish)
+    B.log_call(r, prompt, tag=args.tag, tool=B.TOOL_NAME, say=say)
     # The file comes first, before a single line is printed: a stream that can
     # no longer be written (see Exit 120 in the help) must not cost the text too.
     if unprinted and to_keep(r):
         say.append(keep(r, prompt, unprinted))
     if B.cap_over_note(r):
         say.append(f"{B.TOOL_NAME}: WARN %s" % B.cap_over_note(r))
-    return finish(code, B.trailer(r), say, out)
+    # A stop while the answer is printed leaves part of it on stdout at most:
+    # its text blocks are kept then, as those of an answer not printed are.
+    save = (None if unprinted or out is None or not to_keep(r)
+            else lambda reason: keep(r, prompt, reason))
+    return finish(code, B.trailer(r), say, out, save, seen=stop_seen)
 
 
 if __name__ == "__main__":

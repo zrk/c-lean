@@ -205,6 +205,15 @@ sys.exit(mod.main(sys.argv[2:]))
 '''
 # every signal that stops a run: Ctrl-C, `kill`, a closed terminal
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+# extra_env for the tool's two ways of writing stdout: buffered (the default
+# of child_env), and the raw file of `python -u` and PYTHONUNBUFFERED
+# The line of a stop after the call, before the end of the run was all
+# printed; its tail only when an answer was to go to stdout.
+STOP_LINE = ("c-lean: stopped — signal %d came after the call, before the end of the run "
+             "was all printed")
+STOP_LINE_STDOUT = ": stdout may hold part of the answer, NOT a result"
+UNBUFFERED_MODES = (("buffered", {"PYTHONUNBUFFERED": None}),
+                    ("unbuffered", {"PYTHONUNBUFFERED": "1"}))
 # the names that must never reach the child: keys, tokens, transport switches,
 # a foreign config dir, the thinking cap, and one plain unrelated name
 LEAKY_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_HOST",
@@ -215,6 +224,12 @@ LEAKY_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_HOST",
 
 def child_env(mode="ok", state=None, extra_env=None):
     env = dict(os.environ)
+    # The tool runs buffered, as a plain `c-lean` does and as on the CI
+    # runners, whatever the shell of the suite exports: under PYTHONUNBUFFERED
+    # stdout.buffer is the raw file, whose write() may be short, and a test
+    # passed or failed on the caller's environment. A test of that mode asks
+    # for it (UNBUFFERED_MODES).
+    env.pop("PYTHONUNBUFFERED", None)
     env["C_LEAN_CLAUDE_BIN"] = FAKE
     env["C_LEAN_FAKE_MODE"] = mode
     env["C_LEAN_FAKE_STATE"] = state or tempfile.mkdtemp(prefix="c-lean-state-")
@@ -3872,14 +3887,20 @@ if _dir:
         self.assertEqual(self.calls(), 0)
 
     def test_a_warning_during_the_call_with_stderr_closed_keeps_the_answer(self):
-        """The WARN of a usage log that cannot be written went to stdout when
-        stderr was closed from the start, and then the run ended with 120
-        and no answer. Such a stderr does not fail: its lines are dropped."""
-        p = self.run_bytes(["-m", "haiku", "hello"], preexec_fn=self.no_stderr,
-                           extra_env={"C_LEAN_USAGE_LOG": self.mktemp("c-lean-log-")})
-        self.assertEqual((p.returncode, p.stdout), (0, b"ECHO:hello\n"),
-                         "with stderr closed, stdout must hold the answer and nothing else")
-        self.assertEqual(self.calls(), 1)
+        """A WARN went to stdout when stderr was closed from the start, and
+        then the run ended with 120 and no answer. Such a stderr does not
+        fail: its lines are dropped. One WARN is written during the call (a
+        refused C_LEAN_PASS_ENV name), one with the trailer (a usage log
+        that cannot be written)."""
+        for warn, extra in (("during the call", {"C_LEAN_PASS_ENV": "ANTHROPIC_API_KEY"}),
+                            ("after the call", {"C_LEAN_USAGE_LOG": self.mktemp("c-lean-log-")})):
+            with self.subTest(warn=warn):
+                before = self.calls()
+                p = self.run_bytes(["-m", "haiku", "hello"], preexec_fn=self.no_stderr,
+                                   extra_env=extra)
+                self.assertEqual((p.returncode, p.stdout), (0, b"ECHO:hello\n"),
+                                 "with stderr closed, stdout must hold the answer and nothing else")
+                self.assertEqual(self.calls(), before + 1)
 
     def test_a_good_call_with_stderr_closed_prints_the_answer(self):
         """A stderr closed from the start (`c-lean 2>&-`) cost the answer of a
@@ -3954,32 +3975,788 @@ if _dir:
         return child_env("script", self.state, dict(self.env, C_LEAN_FAKE_SCRIPT=path,
                                                     **(extra_env or {})))
 
+    LONG_ANSWER = "".join("line %06d of a long answer\n" % n for n in range(12000)).strip()
+
     def test_a_reader_that_goes_away_mid_answer_ends_quietly_with_120(self):
         """`c-lean … | head -c 10` with an answer of about 300 KB: the write met
         a closed pipe and ended in a BrokenPipeError traceback, exit 1, where
-        -h promises exit 120."""
-        answer = "".join("line %06d of a long answer\n" % n for n in range(12000)).strip()
+        -h promises exit 120. Under PYTHONUNBUFFERED the one write() of the
+        answer took 64 KiB, the rest was dropped, and the run gave exit 0."""
+        answer = self.LONG_ANSWER
         self.assertGreater(len(answer), 300000)
-        proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--system", "S", "hello"],
-                                env=self.script_env([ev_text("1", answer), ev_result(answer)]),
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, bufsize=0, preexec_fn=default_sighup)
+        for name, mode in UNBUFFERED_MODES:
+            with self.subTest(stdout=name):
+                log = self.path("usage-%s.jsonl" % name)
+                env = self.script_env([ev_text("1", answer), ev_result(answer)],
+                                      extra_env=dict(mode, C_LEAN_USAGE_LOG=log))
+                proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--system", "S",
+                                         "hello"], env=env, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, bufsize=0,
+                                        preexec_fn=default_sighup)
+                assert proc.stdout is not None and proc.stderr is not None
+                try:
+                    head = proc.stdout.read(10)
+                    proc.stdout.close()
+                    err = proc.stderr.read().decode("utf-8", "replace")
+                    proc.wait(timeout=60)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+                self.assertEqual(head, answer[:10].encode())
+                self.assertNotIn("Traceback", err)
+                self.assertNotIn("Exception ignored", err)
+                self.assertEqual(proc.returncode, 120, "a reader that went away must give exit "
+                                 "120: %s" % err[-300:])
+                self.assertIn(" · exit 0 · ", err, "the trailer was written before the answer")
+                self.assertEqual([r["exit"] for r in self.jsonl(log)], [0])
+
+    def logged(self, path):
+        """The usage log holds a whole line: the call has ended, and the print
+        of its end comes next."""
         try:
-            head = proc.stdout.read(10)
-            proc.stdout.close()
-            err = proc.stderr.read().decode("utf-8", "replace")
-            proc.wait(timeout=60)
+            with open(path) as f:
+                return f.read().endswith("\n")
+        except OSError:
+            return False
+
+    def cli_module(self):
+        """`c-lean` loaded as a module in this process, for its writers alone:
+        nothing here calls main(), which installs signal handlers."""
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("c_lean_cli", CLI)
+        spec = importlib.util.spec_from_loader("c_lean_cli", loader)
+        assert spec is not None
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+
+    class ShortFile:
+        """A stdout or stderr whose buffer, like the raw file of
+        PYTHONUNBUFFERED, takes at most `step` bytes a write()."""
+        encoding = "utf-8"
+
+        def __init__(self, step):
+            self.got, self.step = bytearray(), step
+            self.buffer = self
+
+        def write(self, data):
+            n = min(len(data), self.step)
+            self.got += bytes(data[:n])
+            return n
+
+        def flush(self):
+            pass
+
+        def fileno(self):
+            raise ValueError("no file under this stream")  # silence() must not dup2 a real fd
+
+    def test_a_short_write_never_ends_with_exit_0_and_a_cut_answer(self):
+        """The answer went out in one write() of stdout.buffer and its count
+        was not looked at. Under PYTHONUNBUFFERED that buffer is the raw file:
+        a short write (a reader gone mid-answer, a signal) dropped the rest of
+        the answer, and the run gave exit 0."""
+        mod = self.cli_module()
+        answer = "é" + "x" * 99999 + "\n"
+        for step in (4096, 1, 65536):
+            with self.subTest(step=step):
+                out = self.ShortFile(step)
+                # stderr is written past its buffer, to its file (see put_exact)
+                with open(self.path("stderr-%d" % step), "w+", encoding="utf-8") as err, \
+                        mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+                    rc = mod.finish(0, "trailer · ü\n", [], answer)
+                    err.seek(0)
+                    trailer = err.read()
+                self.assertEqual((rc, len(out.got)), (0, len(answer.encode("utf-8"))),
+                                 "every byte of the answer must be written, short writes or not")
+                self.assertEqual((bytes(out.got), trailer), (answer.encode("utf-8"), "trailer · ü\n"))
+
+    def test_a_slow_reader_of_a_non_blocking_stdout_gets_the_whole_answer(self):
+        """A stdout the parent left O_NONBLOCK, read slowly: the first write()
+        that found the pipe full ended the run with exit 120, and a good
+        answer was lost after 64 KiB."""
+        answer = self.LONG_ANSWER
+        for name, mode in UNBUFFERED_MODES:
+            with self.subTest(stdout=name):
+                env = self.script_env([ev_text("1", answer), ev_result(answer)], extra_env=mode)
+                read_end, write_end = os.pipe()
+                os.set_blocking(write_end, False)
+                try:
+                    proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--system", "S",
+                                             "hello"], env=env, stdout=write_end,
+                                            stderr=subprocess.PIPE, preexec_fn=default_sighup)
+                    assert proc.stderr is not None
+                finally:
+                    os.close(write_end)
+                got = bytearray()
+                try:
+                    t0 = time.monotonic()
+                    while time.monotonic() - t0 < 60:
+                        chunk = os.read(read_end, 16384)
+                        if not chunk:
+                            break
+                        got += chunk
+                        time.sleep(0.005)
+                    err = proc.stderr.read().decode("utf-8", "replace")
+                    proc.wait(timeout=60)
+                finally:
+                    os.close(read_end)
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+                    proc.stderr.close()
+                self.assertEqual((proc.returncode, len(got)), (0, len(answer) + 1),
+                                 "a slow reader of a non-blocking stdout must get the whole "
+                                 "answer and exit 0: %s" % err[-300:])
+                self.assertEqual(bytes(got), (answer + "\n").encode())
+
+    def stop_while_printing(self, mode, sig, stderr=subprocess.PIPE, answer=None):
+        """Start a call with a long answer and a stdout nobody reads, send
+        `sig` once the print has begun, and wait at most 5 s for the end.
+        Returns (proc, stdout, seconds the stop took, partial dir, usage log)."""
+        answer = answer or self.LONG_ANSWER
+        partial, log = self.mktemp("c-lean-partial-"), self.path("usage-%d.jsonl" % time.time_ns())
+        env = self.script_env([ev_text("1", answer), ev_result(answer)],
+                              extra_env=dict(mode, C_LEAN_USAGE_LOG=log, C_LEAN_PARTIAL_DIR=partial))
+        proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--system", "S", "hello"],
+                                env=env, stdout=subprocess.PIPE, stderr=stderr,
+                                preexec_fn=default_sighup)
+        assert proc.stdout is not None
+        self.addCleanup(proc.stdout.close)
+        try:
+            # the usage-log line is written just before the print: once it is
+            # there the tool prints, and nobody reads stdout
+            self.wait_for(lambda: self.logged(log) or proc.poll() is not None, secs=60,
+                          what="the end of the call")
+            time.sleep(0.3)
+            self.assertIsNone(proc.poll(), "the end of the run must not fit in the pipes, or "
+                              "nothing here is tested")
+            os.kill(proc.pid, sig)
+            t0 = time.monotonic()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.fail("signal %d while the end of the run was printed must end the run at "
+                          "once, not wait for a reader that does not read" % sig)
+            return proc, proc.stdout.read(), time.monotonic() - t0, partial, log
         finally:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
-        self.assertEqual(head, answer[:10].encode())
-        self.assertNotIn("Traceback", err)
-        self.assertNotIn("Exception ignored", err)
-        self.assertEqual(proc.returncode, 120, "a reader that went away must give exit 120: %s"
-                         % err[-300:])
-        self.assertIn(" · exit 0 · ", err, "the trailer was written before the answer")
-        self.assertEqual([r["exit"] for r in self.jsonl(self.log)], [0])
+
+    def test_a_stop_while_the_answer_is_printed_ends_the_run_and_keeps_the_answer(self):
+        """After the call, a stop found no exception to raise into: PEP 475
+        restarted the write of the answer, and with a reader that does not
+        read SIGTERM, SIGINT and SIGHUP did nothing; SIGKILL alone ended the
+        run. A write that the signal cut short instead (a live reader, the
+        raw stdout of PYTHONUNBUFFERED) gave a cut answer and exit 0."""
+        answer = self.LONG_ANSWER
+        for name, mode in UNBUFFERED_MODES:
+            for sig in STOP_SIGNALS:
+                with self.subTest(stdout=name, signal=sig):
+                    err = self.path("stderr-%s-%d" % (name, sig))
+                    with open(err, "wb") as f:
+                        proc, printed, took, partial, log = self.stop_while_printing(
+                            mode, sig, stderr=f.fileno())
+                    with open(err, encoding="utf-8", errors="replace") as f:
+                        text = f.read()
+                    self.assertNotIn("Traceback", text)
+                    self.assertEqual(proc.returncode, 128 + sig, "a stop while the answer was "
+                                     "printed must give 128+signal: %s" % text[-300:])
+                    self.assertLess(took, 3, "the stop must end the run at once")
+                    # some of it, not none: a stop before the print passes none
+                    self.assertGreater(len(printed), 0, "the stop must cut the answer")
+                    self.assertLess(len(printed), len(answer), "stdout holds part of the answer")
+                    self.assertTrue(answer.encode().startswith(printed))
+                    self.assertIn(STOP_LINE % sig + STOP_LINE_STDOUT, text)
+                    self.assertEqual(self.saved_blocks(partial), [[answer]],
+                                     "the answer that was cut must be kept whole")
+                    self.assertEqual([r["exit"] for r in self.jsonl(log)], [0])
+
+    def test_one_stop_ends_a_run_whose_two_streams_share_an_unread_pipe(self):
+        """`c-lean … 2>&1 | slow`: after the stop the line that says so went
+        to the same full pipe as the answer, and the run waited there until a
+        second stop. What stayed in the buffer of stderr then blocked the
+        interpreter on the way out."""
+        for name, mode in UNBUFFERED_MODES:
+            with self.subTest(streams=name):
+                proc, printed, took, partial, _log = self.stop_while_printing(
+                    mode, signal.SIGTERM, stderr=subprocess.STDOUT)
+                self.assertEqual(proc.returncode, 143, printed[-300:])
+                self.assertLess(took, 3, "one stop must end the run within the wait for stderr")
+                self.assertEqual(self.saved_blocks(partial), [[self.LONG_ANSWER]])
+
+    def full_pipe(self):
+        """(read end, write end) of a pipe that takes nothing more until read."""
+        read_end, write_end = os.pipe()
+        os.set_blocking(write_end, False)
+        try:
+            while True:
+                os.write(write_end, b"x" * 4096)
+        except BlockingIOError:
+            pass
+        os.set_blocking(write_end, True)
+        return read_end, write_end
+
+    def test_a_stop_while_a_short_answer_waits_for_stdout_ends_the_run(self):
+        """An answer smaller than the buffer of stdout sits in it while the
+        flush waits for a full pipe: after the stop the interpreter flushed it
+        again on the way out and blocked there, every stop signal ignored."""
+        for name, mode in UNBUFFERED_MODES:
+            with self.subTest(stdout=name):
+                partial = self.mktemp("c-lean-partial-")
+                log = self.path("usage-%s.jsonl" % name)
+                env = self.script_env([ev_text("1", "the answer"), ev_result("the answer")],
+                                      extra_env=dict(mode, C_LEAN_USAGE_LOG=log,
+                                                     C_LEAN_PARTIAL_DIR=partial))
+                read_end, write_end = self.full_pipe()
+                try:
+                    with open(self.path("stderr-%s" % name), "wb") as err:
+                        proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--system",
+                                                 "S", "hello"], env=env, stdout=write_end,
+                                                stderr=err, preexec_fn=default_sighup)
+                    try:
+                        self.wait_for(lambda: self.logged(log) or proc.poll() is not None,
+                                      secs=60, what="the end of the call")
+                        time.sleep(0.3)
+                        self.assertIsNone(proc.poll(), "the answer must wait for a full stdout")
+                        os.kill(proc.pid, signal.SIGTERM)
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            self.fail("a stop while a short answer waited for stdout must end "
+                                      "the run at once")
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+                            proc.wait()
+                finally:
+                    os.close(read_end)
+                    os.close(write_end)
+                self.assertEqual(proc.returncode, 143)
+                self.assertEqual(self.saved_blocks(partial), [["the answer"]])
+
+    def test_a_stop_while_the_trailer_is_printed_ends_the_run_and_says_so(self):
+        """The trailer goes to stderr before the answer goes to stdout, and a
+        stderr that nobody reads held a stop as stdout did. What its buffer
+        still held then blocked the interpreter on the way out. The stop line
+        and the path of the saved answer were dropped with that stderr; under
+        PYTHONUNBUFFERED the trailer and its lines too (a write under PIPE_BUF
+        that a signal cuts takes nothing), main's own SAVED line among them.
+        The stop line speaks of stdout only when an answer was to go there."""
+        kinds = {"good": ([ev_text("1", "the answer"), ev_result("the answer")], "the answer",
+                          STOP_LINE_STDOUT),
+                 "failed": ([ev_text("1", "half an answer")], "half an answer", "")}
+        for kind, (events, text, tail) in kinds.items():
+            for name, mode in UNBUFFERED_MODES:
+                with self.subTest(call=kind, stderr=name):
+                    self.stop_during_the_trailer(events, text, mode, STOP_LINE % 15 + tail)
+
+    def stop_during_the_trailer(self, events, text, mode, stop_line):
+        partial = self.mktemp("c-lean-partial-")
+        log = self.path("usage-%d.jsonl" % time.time_ns())
+        env = self.script_env(events, extra_env=dict(mode, C_LEAN_USAGE_LOG=log,
+                                                     C_LEAN_PARTIAL_DIR=partial))
+        read_end, write_end = os.pipe()
+        drained = []
+        try:
+            os.set_blocking(write_end, False)
+            try:  # a full pipe: the first line on stderr, the trailer, blocks
+                while True:
+                    os.write(write_end, b"x" * 4096)
+            except BlockingIOError:
+                pass
+            os.set_blocking(write_end, True)
+            proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--system", "S", "hello"],
+                                    env=env, stdout=subprocess.PIPE, stderr=write_end,
+                                    preexec_fn=default_sighup)
+            assert proc.stdout is not None
+            os.close(write_end)
+            write_end = None
+            try:
+                self.wait_for(lambda: self.logged(log) or proc.poll() is not None, secs=60,
+                              what="the end of the call")
+                time.sleep(0.3)
+                self.assertIsNone(proc.poll(), "the trailer must wait for a full stderr")
+                os.kill(proc.pid, signal.SIGTERM)
+                # the reader comes back after the stop: it must get the lines
+                drain = threading.Thread(target=lambda: drained.append(
+                    b"".join(iter(lambda: os.read(read_end, 65536), b""))), daemon=True)
+                drain.start()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.fail("a stop while the trailer was printed must end the run at once, "
+                              "not wait for a stderr that is not read")
+                printed = proc.stdout.read()
+                drain.join(10)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                proc.stdout.close()
+        finally:
+            os.close(read_end)
+            if write_end is not None:
+                os.close(write_end)
+        self.assertEqual((proc.returncode, printed), (143, b""),
+                         "a stop during the trailer must give 143, the answer unprinted")
+        self.assertEqual(self.saved_blocks(partial), [[text]])
+        lines = b"".join(drained).lstrip(b"x").decode("utf-8", "replace").splitlines()
+        self.assertTrue(lines and lines[0].startswith("[c-lean] haiku · "),
+                        "the trailer must reach a stderr read again: %r" % lines)
+        self.assertNotIn("", lines, "nothing may be put in between")
+        self.assertIn(stop_line, lines, "the stop line must reach a stderr read again")
+        self.assertEqual(len([l for l in lines if l.startswith("c-lean: SAVED")]), 1,
+                         "the path of the saved answer must reach stderr: %r" % lines)
+
+    # Loads `c-lean` as a module and runs its main() for real, after wrapping
+    # functions of the core: STOP_PLAN="name[@n][+secs]:signal,…" sends the signal to
+    # the tool itself when the named function returns for the n-th time (1st), or
+    # `secs` later from a thread. A stop then lands at an exact point of the run,
+    # not after a guessed sleep. RECORD_WAIT sets how long a record may wait.
+    STOP_PROBE = r'''
+import importlib.machinery, importlib.util, os, sys, threading, time
+loader = importlib.machinery.SourceFileLoader("c_lean_cli", sys.argv[1])
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("c_lean_cli", loader))
+loader.exec_module(mod)
+if os.environ.get("RECORD_WAIT"):
+    mod.B.RECORD_WAIT_SECS = float(os.environ["RECORD_WAIT"])
+
+
+def wrap(real, sig, nth, later):
+    returns = []
+
+    def wrapped(*a, **k):
+        out = real(*a, **k)
+        returns.append(out)
+        if len(returns) == nth:
+            if later:
+                t = threading.Timer(later, os.kill, (os.getpid(), sig))
+                t.daemon = True
+                t.start()
+            else:
+                os.kill(os.getpid(), sig)
+        return out
+    return wrapped
+
+
+for spec in os.environ["STOP_PLAN"].split(","):
+    name, sig = spec.split(":")
+    name, _, later = name.partition("+")
+    name, _, nth = name.partition("@")
+    setattr(mod.B, name, wrap(getattr(mod.B, name), int(sig), int(nth or 1), float(later or 0)))
+sys.exit(mod.main(sys.argv[2:]))
+'''
+
+    def run_stop_probe(self, plan, args, mode="script", events=None, extra_env=None,
+                       stderr=None, limit=None, why=""):
+        """`stderr`: an fd for it (p.stderr is None then). `limit`: seconds the
+        run may take; a run that takes longer fails the test with `why`."""
+        probe = self.write("stop_probe.py", self.STOP_PROBE)
+        if events is None:
+            events = [ev_text("1", "the answer"), ev_result("the answer")]
+        extra = dict(extra_env or {}, STOP_PLAN=plan)
+        env = (self.script_env(events, extra_env=extra) if mode == "script" else
+               child_env(mode, self.state, dict(self.env, **extra)))
+        try:
+            return subprocess.run([sys.executable, probe, CLI] + args, env=env,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE if stderr is None else stderr,
+                                  text=True, timeout=limit or 60, preexec_fn=default_sighup)
+        except subprocess.TimeoutExpired:
+            if limit is None:
+                raise
+            self.fail("%s (still running %s s on)" % (why, limit))
+
+    # Loads `c-lean` as a module and runs its main() for real, with one of two
+    # moments made exact. HELD_KILL=1: right after the first write to stderr
+    # while the end of the run is printed, a SIGTERM to the tool, before the
+    # write is counted. HELD_FILL=1: right after select() finds room on
+    # stderr, another writer (a file description of its own, as a sibling
+    # job sharing the pipe has) takes all of it. HELD_THREAD=1 starts one
+    # more thread first, one that does not hold the stops back.
+    HELD_PROBE = r'''
+import importlib.machinery, importlib.util, os, select, signal, sys, threading, time
+loader = importlib.machinery.SourceFileLoader("c_lean_cli", sys.argv[1])
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("c_lean_cli", loader))
+loader.exec_module(mod)
+done = []
+if os.environ.get("HELD_THREAD"):
+    threading.Thread(target=time.sleep, args=(120,), daemon=True).start()
+if os.environ.get("HELD_KILL"):
+    real_write = os.write
+
+    def write(fd, data):
+        n = real_write(fd, data)
+        if fd == 2 and mod.B._PRINTING and not done:
+            done.append(1)
+            os.kill(os.getpid(), signal.SIGTERM)
+        return n
+    os.write = write
+if os.environ.get("HELD_FILL"):
+    real_select = select.select
+
+    def fill(r, w, x, *t):
+        out = real_select(r, w, x, *t)
+        if mod.B._PRINTING and 2 in out[1] and not done:
+            done.append(1)
+            other = os.open("/proc/self/fd/2", os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                while True:
+                    os.write(other, b"o" * 4096)
+            except BlockingIOError:
+                pass
+            os.close(other)
+        return out
+    select.select = fill
+sys.exit(mod.main(sys.argv[2:]))
+'''
+
+    def test_a_stop_right_after_a_write_to_stderr_is_counted_first(self):
+        """A stop handled between the return of a write to stderr and the count
+        of what it took lost the count: the trailer was sent again after the
+        stop, and printed twice. A signal mask could not prevent it while any
+        other thread was alive."""
+        probe = self.write("held_probe.py", self.HELD_PROBE)
+        for name, mode in UNBUFFERED_MODES:
+            for thread in ("", "1"):
+                with self.subTest(stderr=name, thread=bool(thread)):
+                    env = self.script_env([ev_text("1", "the answer"), ev_result("the answer")],
+                                          extra_env=dict(mode, HELD_KILL="1",
+                                                         HELD_THREAD=thread or None))
+                    p = subprocess.run([sys.executable, probe, CLI, "-m", "haiku", "--system", "S",
+                                        "hello"], env=env, capture_output=True, text=True,
+                                       timeout=60, preexec_fn=default_sighup)
+                    lines = p.stderr.splitlines()
+                    self.assertEqual(p.returncode, 143, p.stderr[-300:])
+                    self.assertEqual(len([l for l in lines if l.startswith("[c-lean] ")]), 1,
+                                     "the trailer must be printed once: %r" % lines)
+                    self.assertEqual(len([l for l in lines if l.startswith("c-lean: stopped")]), 1)
+
+    @unittest.skipUnless(os.path.isdir("/proc/self/fd"), "another file description of stderr "
+                         "is opened through /proc")
+    def test_a_write_to_stderr_that_blocks_while_the_stops_are_held_ends_on_one_stop(self):
+        """select() found room on stderr, another writer took it, and the write
+        then blocked with the stops held: one SIGTERM, then a second, did
+        nothing, and SIGKILL alone ended the run."""
+        probe = self.write("held_probe.py", self.HELD_PROBE)
+        for name, mode in UNBUFFERED_MODES:
+            with self.subTest(stderr=name):
+                log = self.path("usage-%s.jsonl" % name)
+                env = self.script_env([ev_text("1", "the answer"), ev_result("the answer")],
+                                      extra_env=dict(mode, HELD_FILL="1", C_LEAN_USAGE_LOG=log))
+                read_end, write_end = os.pipe()
+                try:
+                    proc = subprocess.Popen([sys.executable, probe, CLI, "-m", "haiku", "--system",
+                                             "S", "hello"], env=env, stdout=subprocess.DEVNULL,
+                                            stderr=write_end, preexec_fn=default_sighup)
+                    os.close(write_end)
+                    write_end = None
+                    try:
+                        self.wait_for(lambda: self.logged(log) or proc.poll() is not None,
+                                      secs=60, what="the end of the call")
+                        time.sleep(0.5)
+                        self.assertIsNone(proc.poll(), "the trailer must wait for stderr")
+                        os.kill(proc.pid, signal.SIGTERM)
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            self.fail("one stop must end a write that blocked with the stops held")
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+                            proc.wait()
+                finally:
+                    os.close(read_end)
+                    if write_end is not None:
+                        os.close(write_end)
+                self.assertEqual(proc.returncode, 143)
+
+    def test_a_stop_after_the_call_and_before_the_print_ends_the_run(self):
+        """A stop that came after the call and before the print found no write
+        to cut: the print then started, and a reader that does not read held
+        it for ever. The trailer and its lines still come first."""
+        p = self.run_stop_probe("log_call:%d" % signal.SIGTERM,
+                                ["-m", "haiku", "--system", "S", "hello"])
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual((p.returncode, p.stdout), (143, ""), "a stop after the call must end "
+                         "the run before the print: %s" % p.stderr[-300:])
+        lines = p.stderr.splitlines()
+        self.assertIn(" · exit 0 · ", lines[0], "the trailer must still be printed")
+        self.assertEqual([l[:30] for l in lines[1:]],
+                         ["c-lean: stopped — signal 15 ca", "c-lean: SAVED 10 characters in"],
+                         p.stderr)
+        self.assertEqual(self.saved_blocks(), [["the answer"]])
+
+    def test_a_stop_after_the_call_was_judged_is_one_it_did_not_see(self):
+        """The call is judged by the stops it saw, and main() looked again
+        after it had returned: a stop in between counted as seen by the call,
+        and the print went on."""
+        p = self.run_stop_probe("transport_notes:%d" % signal.SIGTERM,
+                                ["-m", "haiku", "--system", "S", "hello"])
+        self.assertEqual((p.returncode, p.stdout), (143, ""), "a stop after the call was judged "
+                         "must end the run before the print: %s" % p.stderr[-300:])
+        self.assertIn("c-lean: stopped — signal 15", p.stderr)
+
+    def test_a_stop_after_a_call_that_returned_early_is_one_it_did_not_see(self):
+        """A call that returns before it judges any stop (a timeout, a binary
+        that cannot be run) left no count behind, and main() took the count
+        after it: a stop in between was taken for one the call had seen."""
+        for what, mode, extra, args, code in (
+                ("a timeout", "hang", {}, ["--timeout", "1"], 124),
+                ("no binary", "single", {"C_LEAN_CLAUDE_BIN": self.path("no-such-claude")}, [],
+                 69)):
+            with self.subTest(call=what):
+                try:
+                    p = self.run_stop_probe("transport_notes:%d" % signal.SIGTERM,
+                                            ["-m", "haiku", "--system", "S"] + args + ["hello"],
+                                            mode=mode, extra_env=extra)
+                finally:
+                    self.kill_recorded()
+                self.assertIn(" · exit %d · " % code, p.stderr, p.stderr[-300:])
+                self.assertEqual(p.returncode, 143, "a stop after a call that returned early "
+                                 "must end the run: %s" % p.stderr[-300:])
+                self.assertIn("c-lean: stopped — signal 15 came", p.stderr)
+
+    def test_a_stop_the_call_judged_does_not_cut_the_print(self):
+        """A stop that came after a good whole `result`, during the call, lets
+        the answer stand: it is printed, and the run gives exit 0."""
+        p = self.run_stop_probe("read_stream:%d" % signal.SIGTERM,
+                                ["-m", "haiku", "--system", "S", "hello"])
+        self.assertIn("came after the answer, and the answer stands", p.stderr)
+        self.assertEqual((p.returncode, p.stdout), (0, "the answer\n"),
+                         "a stop the call judged must not cut the print: %s" % p.stderr[-300:])
+        self.assertNotIn("c-lean: stopped", p.stderr)
+
+    def test_a_stop_as_the_call_is_judged_counts_once(self):
+        """A stop between the read of the stop count and the read of the stop
+        signal was judged by the call (the answer stands) and seen as one
+        after it (the print is cut), both."""
+        # The second read of the count: the one before the call, the one after it.
+        p = self.run_stop_probe("stop_count@2:%d" % signal.SIGTERM,
+                                ["-m", "haiku", "--system", "S", "hello"])
+        self.assertEqual((p.returncode, p.stdout), (143, ""), p.stderr[-300:])
+        self.assertNotIn("came after the answer", p.stderr,
+                         "a stop the print counts must not be judged by the call too")
+
+    def test_a_stop_right_after_the_call_took_the_count_is_reported_once(self):
+        """The call reads the stop count once before it begins, and that read
+        both decides the return before the call and records what was judged.
+        With two reads, a stop between them was reported by that return ("stopped
+        before the call") and then again by the print, as one the call never saw."""
+        p = self.run_stop_probe("stop_count@1:%d" % signal.SIGTERM,
+                                ["-m", "haiku", "--system", "S", "hello"])
+        self.assertEqual((p.returncode, p.stdout), (143, ""), p.stderr[-300:])
+        self.assertEqual(p.stderr.count("c-lean: stopped"), 1,
+                         "a stop the call reported must not be reported again: %s"
+                         % p.stderr[-400:])
+
+    def test_a_second_stop_after_the_call_is_told_from_the_first(self):
+        """A stop during the call after a good whole `result` lets the answer
+        stand. A second stop after the call has the number of a stop already
+        seen when it is the same signal, and none at all when it is not (only
+        the first was kept): it was lost, and the print went on. The stop
+        line named the first signal."""
+        for first, second in ((signal.SIGINT, signal.SIGTERM), (signal.SIGTERM, signal.SIGTERM)):
+            with self.subTest(first=first, second=second):
+                p = self.run_stop_probe("read_stream:%d,log_call:%d" % (first, second),
+                                        ["-m", "haiku", "--system", "S", "hello"])
+                self.assertIn("came after the answer, and the answer stands", p.stderr)
+                self.assertEqual((p.returncode, p.stdout), (128 + second, ""),
+                                 "a second stop after the call must end the run: %s"
+                                 % p.stderr[-300:])
+                self.assertIn("c-lean: stopped — signal %d came" % second, p.stderr,
+                              "the stop line must name the stop that cut the print")
+
+    def test_check_a_stop_after_the_probe_and_before_its_trailer_ends_the_run(self):
+        """--check prints its trailer at the end as a call does, and a stop in
+        between was only recorded."""
+        p = self.run_stop_probe("log_call:%d" % signal.SIGTERM, ["--check"], mode="usageinout")
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(p.returncode, 143, "a stop after the probe must end --check with 143: %s"
+                         % p.stderr[-300:])
+        lines = p.stderr.splitlines()
+        self.assertIn(STOP_LINE % 15, lines, "--check writes no stdout: its stop line must not "
+                      "speak of one: %r" % lines)
+
+    def test_a_stop_after_the_call_does_not_wait_for_the_usage_log_warning(self):
+        """The WARN of a usage log that cannot be written was printed after the
+        call as it came: on a stderr that is not read a stop was only counted,
+        PEP 475 resumed the write, and the run went on until the reader read.
+        It goes out with the trailer now, where a stop ends the print."""
+        for (name, mode), (tool, args, kind) in itertools.product(
+                UNBUFFERED_MODES, (("c-lean", ["-m", "haiku", "--system", "S", "hi"], "script"),
+                                   ("--check", ["--check"], "usageinout"))):
+            with self.subTest(stderr=name, tool=tool):
+                read_end, write_end = self.full_pipe()
+                try:
+                    # a directory cannot be opened as the log: one WARN
+                    p = self.run_stop_probe(
+                        "_fifo_reason:%d" % signal.SIGTERM, args, mode=kind,
+                        extra_env=dict(mode, C_LEAN_USAGE_LOG=self.dir), stderr=write_end,
+                        limit=20, why="a stop after the call must not wait for a usage-log "
+                        "WARN that a stderr nobody reads holds")
+                finally:
+                    os.close(write_end)
+                    os.close(read_end)
+                self.assertEqual((p.returncode, p.stdout), (143, ""))
+
+    def test_a_stop_after_the_call_ends_the_wait_for_a_record(self):
+        """A record waits for a FIFO with no reader (the open), or with a
+        reader that does not read (the write), for RECORD_WAIT_SECS: a stop
+        there was only counted, and the run went on to the end of that time.
+        The record is given up at once, with its WARN; --check's too."""
+        def fifo(name):
+            path = self.path(name)
+            os.mkfifo(path)
+            return path
+        log, probe = fifo("log-open.fifo"), fifo("probe-open.fifo")
+        full = fifo("log-full.fifo")
+        reader = os.open(full, os.O_RDONLY | os.O_NONBLOCK)
+        filler = os.open(full, os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            try:
+                while True:
+                    os.write(filler, b"x" * 4096)
+            except BlockingIOError:
+                pass
+            args = ["-m", "haiku", "--system", "S", "hi"]
+            for wait, plan, run_args, extra, mode in (
+                    ("open", "_is_fifo:%d", args, {"C_LEAN_USAGE_LOG": log}, "script"),
+                    # 0.5 s into the wait for room, from a thread
+                    ("write", "open_record_file+0.5:%d", args, {"C_LEAN_USAGE_LOG": full},
+                     "script"),
+                    ("--check open", "_is_fifo:%d", ["--check"],
+                     {"C_LEAN_CHECK_PROBE_FILE": probe}, "usageinout")):
+                with self.subTest(wait=wait):
+                    p = self.run_stop_probe(plan % signal.SIGTERM, run_args, mode=mode,
+                                            extra_env=dict(extra, RECORD_WAIT="60"), limit=20,
+                                            why="a stop must end the wait for the %s of a record"
+                                            % wait)
+                    self.assertEqual(p.returncode, 143, p.stderr[-300:])
+                    self.assertEqual(len([l for l in p.stderr.splitlines()
+                                          if "WARN could not write" in l]), 1, p.stderr[-400:])
+        finally:
+            os.close(filler)
+            os.close(reader)
+
+    # Runs put_exact on a stderr whose buffer still holds a line a stop cut,
+    # as print() leaves it under a buffered stderr: "bounded" a full pipe that
+    # is never read, through write_bounded; "nonblock" a full O_NONBLOCK pipe
+    # read from 0.3 s on, through write_end, as the trailer is written.
+    LEFTOVER_PROBE = r'''
+import importlib.machinery, importlib.util, io, os, sys, threading, time
+loader = importlib.machinery.SourceFileLoader("c_lean_cli", sys.argv[1])
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("c_lean_cli", loader))
+loader.exec_module(mod)
+case = sys.argv[2]
+r, w = os.pipe()
+os.set_blocking(w, False)
+try:
+    while True:
+        os.write(w, b"x" * 4096)
+except BlockingIOError:
+    pass
+os.set_blocking(w, case == "bounded")
+stream = io.TextIOWrapper(io.BufferedWriter(io.FileIO(w, "w", closefd=False)), encoding="utf-8")
+stream.write("a line a stop cut, ")
+sys.stderr = stream
+if case == "bounded":
+    t0 = time.monotonic()
+    mod.write_bounded(b"the stop line\n")
+    print("took %.1f" % (time.monotonic() - t0), flush=True)
+    mod.silence(stream)  # as c-lean does: the way out must not flush it again
+else:
+    got = bytearray()
+
+    def drain():
+        time.sleep(0.3)
+        end = time.monotonic() + 20
+        while not got.endswith(b"the trailer\n") and time.monotonic() < end:
+            try:
+                got.extend(os.read(r, 65536))
+            except BlockingIOError:
+                time.sleep(0.01)
+    os.set_blocking(r, False)
+    th = threading.Thread(target=drain)
+    th.start()
+    ok = mod.write_end("the trailer\n")
+    th.join()
+    print(ok, got.lstrip(b"x") == b"a line a stop cut, the trailer\n")
+'''
+
+    def test_a_line_left_in_the_buffer_of_stderr_is_waited_for_within_the_bound(self):
+        """A stop that cut a line on a full stderr left it in the buffer of
+        stderr, and the write of the stop lines flushed it first, before
+        their bound was armed: a stderr that is not read held the run past
+        it, for good. The flush is bounded with them now."""
+        probe = self.write("leftover_probe.py", self.LEFTOVER_PROBE)
+        try:
+            p = subprocess.run([sys.executable, probe, CLI, "bounded"], capture_output=True,
+                               text=True, timeout=20, env=child_env("single", self.state, self.env))
+        except subprocess.TimeoutExpired:
+            self.fail("a line left in the buffer of stderr must not hold the stop lines past "
+                      "their bound")
+        self.assertEqual(p.returncode, 0, p.stderr[-300:])
+        self.assertLess(float(p.stdout.split()[1]), 3, p.stdout)
+
+    def test_a_line_left_in_the_buffer_of_a_non_blocking_stderr_is_waited_for(self):
+        """The same flush on a full O_NONBLOCK stderr raised BlockingIOError,
+        and the run ended with exit 120 while its reader was alive: the
+        answer of a good call was lost. What the buffer holds is waited for,
+        and goes out first, as every other write to stderr is."""
+        probe = self.write("leftover_probe.py", self.LEFTOVER_PROBE)
+        p = subprocess.run([sys.executable, probe, CLI, "nonblock"], capture_output=True,
+                           text=True, timeout=60, env=child_env("single", self.state, self.env))
+        self.assertEqual(p.returncode, 0, p.stderr[-300:])
+        self.assertEqual(p.stdout.split(), ["True", "True"],
+                         "a full O_NONBLOCK stderr must be waited for, the line its buffer "
+                         "held first, never cost exit 120")
+
+    def test_a_stop_does_not_wait_for_the_lock_of_its_own_thread(self):
+        """A stop that landed while the main thread held the lock of the live
+        children waited for it, 1 s, inside the signal handler: the holder was
+        the thread the handler had stopped."""
+        self.assertEqual(B.interrupted(), 0)
+        with mock.patch.dict(B._INTERRUPT):  # the stop is this test's alone
+            with B._LIVE_LOCK:
+                t0 = time.monotonic()
+                B.interrupt(signal.SIGTERM)
+                took = time.monotonic() - t0
+        self.assertLess(took, 0.5, "a stop must not wait for a lock its own thread holds")
+
+    def test_help_says_a_stop_while_printing_still_gives_128_plus_n(self):
+        h = " ".join(run([CLI, "-h"], state=self.state, extra_env=self.env).stdout.split())
+        for phrase in ("A stop after the call, until the end of the run is printed, gives "
+                       "128+signal too, and a reader that does not read cannot hold it",
+                       "about 1 s later when the stop lands in a write to stderr that blocks",
+                       "a wait for the usage log or the --check record ends at once too",
+                       "it may hold part of the answer, NOT a result",
+                       "under --schema the text blocks, not the structured output",
+                       "stderr is given at most 1 s for these lines",
+                       "Lines written before the call ends (a WARN about C_LEAN_PASS_ENV or "
+                       "stdin, or one of the call) go to stderr as they come: a reader that "
+                       "does not read can hold them, and a stop then waits for it",
+                       "So it holds the end of the run after a stop before or during the "
+                       "call, until a second stop ends it",
+                       "Exit 120, and 128+N for a stop after the call until the end of the run "
+                       "is printed, are the exceptions",
+                       "and after it until the end of the run is printed",
+                       "a stop after the `result`), whole unless a stop comes after the call, "
+                       "before it is all printed"):
+            self.assertIn(phrase, h, "c-lean -h must say: %s" % phrase)
+        readme = " ".join(open(os.path.join(os.path.dirname(TESTS), "README.md"),
+                               encoding="utf-8").read().split())
+        for phrase in ("about 1 s later when the stop lands in a write to stderr that blocks",
+                       "the text blocks of the call (if any) are saved",
+                       "Lines written before the call ends (a WARN about `C_LEAN_PASS_ENV` or "
+                       "stdin, or one of the call) go to stderr as they come",
+                       "also after the call until the end of the run is printed",
+                       "a stop after the `result`), whole unless a stop comes after the call, "
+                       "before it is all printed"):
+            self.assertIn(phrase, readme, "the README must say: %s" % phrase)
 
     def test_a_stdout_with_no_reader_ends_without_a_second_error(self):
         """An answer small enough for the buffer of stdout failed only when the
@@ -4884,14 +5661,6 @@ if _dir:
         self.assertEqual(len(self.unread_stdin_warnings(p)), 1,
                          "a slow producer must be warned about: " + p.stderr.decode())
         self.on_stdin("x")
-
-    def cli_module(self):
-        import importlib.machinery
-        import importlib.util
-        loader = importlib.machinery.SourceFileLoader("c_lean_cli_probe", CLI)
-        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
-        loader.exec_module(mod)
-        return mod
 
     def test_a_probe_that_fails_costs_a_warn_not_silence(self):
         """If the count of waiting bytes fails for any reason, the answer is

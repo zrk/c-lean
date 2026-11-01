@@ -67,6 +67,7 @@ import sys
 import tempfile
 import threading
 import time
+from typing import TypedDict
 
 # ---------------------------------------------------------------- exit codes
 EXIT_OK = 0
@@ -583,6 +584,9 @@ def _fifo_reason(e: Exception, path) -> str:
 # any size (a long --tag is more than the 64 KiB a pipe holds); one that never
 # does must cost a WARN after this, not a hang before the answer is printed.
 RECORD_WAIT_SECS = 2.0
+# The longest single wait for room, here and in the writes of c-lean: a stop
+# is looked for after each one.
+WAIT_STEP = 0.1
 
 
 def open_record_file(path, flags: int, mode: int = 0o600) -> int:
@@ -597,6 +601,8 @@ def open_record_file(path, flags: int, mode: int = 0o600) -> int:
         except OSError as e:
             if e.errno != errno.ENXIO or time.monotonic() >= deadline or not _is_fifo(path):
                 raise
+            if stop_pending():  # a stop after the call must not wait for a reader
+                raise
         time.sleep(0.03)
 
 
@@ -609,7 +615,9 @@ def _is_fifo(path) -> bool:
 
 def write_record(fd: int, line: str) -> None:
     """Write the record to a non-blocking fd within RECORD_WAIT_SECS; a record
-    left torn is an error with its byte counts, not silence."""
+    left torn is an error with its byte counts, not silence. A stop after
+    the call ends the wait at once, as the end of the time does: it waits in
+    steps of at most 0.1 s, since PEP 475 resumes a select() a stop cut."""
     data = memoryview(line.encode("utf-8", "backslashreplace"))
     done = 0
     deadline = time.monotonic() + RECORD_WAIT_SECS
@@ -618,19 +626,20 @@ def write_record(fd: int, line: str) -> None:
             done += os.write(fd, data[done:])
             continue
         except BlockingIOError:
-            if done == 0 and time.monotonic() >= deadline:
+            if done == 0 and (time.monotonic() >= deadline or stop_pending()):
                 raise  # nothing written, so nothing torn
         left = deadline - time.monotonic()
-        if left <= 0:
+        if left <= 0 or stop_pending():
             raise OSError("wrote %d of %d bytes, the record is torn" % (done, len(data)))
-        select.select([], [fd], [], left)
+        select.select([], [fd], [], min(left, WAIT_STEP))
 
 
-def log_usage(rec: dict, path=None) -> None:
+def log_usage(rec: dict, path=None, say=None) -> None:
     """Append counters and the prompt's sha256 hash, never its text.
 
     This is not anonymization: anyone who holds a candidate prompt can confirm
-    it against the hash.
+    it against the hash. `say`: a list for the WARN of a record that cannot
+    be written, printed with the end of the run, else it is printed now.
     """
     try:
         path = usage_log() if path is None else path
@@ -656,14 +665,28 @@ def log_usage(rec: dict, path=None) -> None:
     except Exception as e:  # logging must never break a run
         # nor may a stderr that can no longer be written: the text blocks of
         # the call are saved after this line
-        _say_during_call(f"{TOOL_NAME}: WARN could not write usage log: %s" % _fifo_reason(e, path))
+        line = f"{TOOL_NAME}: WARN could not write usage log: %s" % _fifo_reason(e, path)
+        if say is None:
+            _say_during_call(line)
+        else:
+            say.append(line)
 
 
 # --------------------------------------------------------- children & signals
 _LIVE_LOCK = threading.Lock()
 _LIVE = set()
-_INTERRUPT = {"signum": 0}
+class _Stops(TypedDict):
+    signum: int  # the first stop
+    last: int  # the latest
+    count: int  # how many came
+    judged: int | None  # the count the call was judged with (_call_claude), None before one
+
+
+_INTERRUPT: _Stops = {"signum": 0, "last": 0, "count": 0, "judged": None}
 _READING_PROMPT = False
+_PRINTING = False
+# on: a stop while printing is held, not raised; stop: one came meanwhile
+_HELD = {"on": False, "stop": False}
 _TREE_WARNED = False
 # The signals that stop a run: Ctrl-C, `kill`, and a closed terminal.
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
@@ -672,6 +695,31 @@ STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 def interrupted() -> int:
     """Non-zero once a stop signal was seen: no new call may be started."""
     return _INTERRUPT["signum"]
+
+
+def stop_count() -> int:
+    """How many stops have come. A stop is told from the ones before it by
+    this, not by its number: a second SIGINT, or any stop after a first one,
+    has the number interrupted() already gives."""
+    return _INTERRUPT["count"]
+
+
+def last_stop() -> int:
+    """The number of the latest stop signal, 0 when none came."""
+    return _INTERRUPT["last"]
+
+
+def stops_judged() -> int:
+    """The stop count the call was judged with, or the count now when no
+    call was made. A stop after it is one the call never saw."""
+    judged = _INTERRUPT["judged"]
+    return stop_count() if judged is None else judged
+
+
+def stop_pending() -> bool:
+    """A stop came after the ones the call was judged with: the run ends with
+    it, and nothing after the call may wait (see write_record)."""
+    return stop_count() != stops_judged()
 
 
 def stop_signal_ignored() -> bool:
@@ -696,6 +744,51 @@ def reading_prompt():
         _READING_PROMPT = False
 
 
+class OutputStopped(Exception):
+    """A stop came while the end of a run (the trailer, the answer) was
+    printed."""
+
+
+@contextmanager
+def printing():
+    """While the end of a run is printed, a stop raises OutputStopped out of
+    the signal handler, once. Otherwise PEP 475 restarts the write after the
+    handler returns: a reader that stopped reading held it for ever, and every
+    stop but SIGKILL waited with it. A write cut short by the signal returns
+    a short count instead, and that answer, cut, went out with exit 0."""
+    global _PRINTING
+    _PRINTING = True
+    try:
+        yield
+    finally:
+        _PRINTING = False
+
+
+def hold_stops() -> None:
+    """From here to release_stops(), a stop while printing is recorded and
+    not raised: what a write took must be counted before the stop cuts the
+    print. A signal mask could not do it: the kernel gives a signal to any
+    thread that does not mask it, and Python runs the handler in the main
+    thread all the same."""
+    _HELD["on"], _HELD["stop"] = True, False
+
+
+def stop_held() -> bool:
+    """A stop came since hold_stops()."""
+    return _HELD["stop"]
+
+
+def release_stops() -> None:
+    """End hold_stops(), and raise OutputStopped for a stop that came
+    meanwhile. A stop from here on raises out of the handler again."""
+    global _PRINTING
+    _HELD["on"] = False  # first: a stop after this raises by itself
+    came, _HELD["stop"] = _HELD["stop"], False
+    if came and _PRINTING:
+        _PRINTING = False
+        raise OutputStopped()
+
+
 def interrupt(signum: int = signal.SIGTERM) -> None:
     """Stop accepting calls and kill every child we started, whole tree.
 
@@ -706,14 +799,17 @@ def interrupt(signum: int = signal.SIGTERM) -> None:
     """
     if not _INTERRUPT["signum"]:
         _INTERRUPT["signum"] = int(signum)
-    # Called from a signal handler, i.e. possibly inside the very thread that is
-    # holding _LIVE_LOCK: a plain `with` here could deadlock the stop itself.
-    # A slightly racy read of the set is the lesser evil.
-    got = _LIVE_LOCK.acquire(timeout=1)
+    _INTERRUPT["last"] = int(signum)
+    _INTERRUPT["count"] += 1
+    # Called from a signal handler, which runs in the main thread, and only the
+    # main thread takes _LIVE_LOCK: when the lock is taken, it is this thread,
+    # stopped inside its `with`, that holds it. Waiting for it then only
+    # delayed the stop by the timeout; the set cannot change while the holder
+    # is stopped, and a proc it was about to add is killed by _call_claude
+    # (see `if interrupted()` after the registration).
+    got = _LIVE_LOCK.acquire(blocking=False)
     try:
         procs = list(_LIVE)
-    except RuntimeError:  # the set changed under us
-        procs = [p for p in _LIVE.copy()] if hasattr(_LIVE, "copy") else []
     finally:
         if got:
             _LIVE_LOCK.release()
@@ -727,11 +823,21 @@ def install_signal_handlers() -> None:
 
     Every inherited SIG_IGN stays ignored; the call then leaves the job
     (see _call_claude). Raising during a prompt read prevents PEP 475 from
-    restarting that read after the handler returns."""
+    restarting that read after the handler returns, and so does raising
+    while the end of the run is printed (see printing)."""
     def handler(signum, frame):  # noqa: ARG001
+        global _PRINTING
         interrupt(signum)
         if _READING_PROMPT:
             raise PromptStopped()
+        if _PRINTING:
+            if _HELD["on"]:
+                _HELD["stop"] = True  # release_stops() raises it
+                return
+            # once: what follows the stop (the file of the answer, the line
+            # that says so) must not be cut by a second one
+            _PRINTING = False
+            raise OutputStopped()
     for s in STOP_SIGNALS:
         if signal.getsignal(s) is signal.SIG_IGN:
             continue
@@ -1456,7 +1562,12 @@ def _cannot_make(what, e, t0) -> Result:
 
 
 def _call_claude(prompt, system, model, effort, schema, timeout):
-    if interrupted():
+    # The stops judged first: the ones before the call. This return reports
+    # them, and one that returns early (a timeout, no binary) has judged no
+    # more. A stop after this read is one the call never saw, until the read
+    # of the count after the call judges it.
+    judged = _INTERRUPT["judged"] = stop_count()
+    if judged and interrupted():
         return Result(ok=False, exit=SIGNAL_EXIT_BASE + interrupted(), text="", wall=False,
                       err="stopped before the call (signal %d)" % interrupted(),
                       secs=0.0, raw=None, interrupted=True)
@@ -1592,7 +1703,10 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
     # Every text block the model wrote, whatever the call comes to below.
     blocks = stream.texts()
 
-    caught = interrupted()
+    # one read of the count decides both: a stop after it is one the call
+    # did not see (see stops_judged), never one it saw too
+    judged = _INTERRUPT["judged"] = stop_count()
+    caught = interrupted() if judged else 0
     # A `result` that came before the stop is still the document of the call:
     # the stop decides the outcome, --json prints what was received.
     seen_doc = stream.doc if isinstance(stream.doc, dict) else None
@@ -1741,8 +1855,9 @@ def call_model(prompt, *, system=None, model=None, effort=None, schema=None,
     return r
 
 
-def log_call(r: Result, prompt, tag="", tool=TOOL_NAME) -> None:
-    """Append the usage-log line of one call, with r.exit as its exit code."""
+def log_call(r: Result, prompt, tag="", tool=TOOL_NAME, say=None) -> None:
+    """Append the usage-log line of one call, with r.exit as its exit code;
+    `say` as in log_usage."""
     log_usage({
         "ts": now_iso(), "tool": tool, "tag": tag, "backend": r.backend or "",
         "model": r.model or "", "effort": r.effort or "",
@@ -1757,7 +1872,7 @@ def log_call(r: Result, prompt, tag="", tool=TOOL_NAME) -> None:
         "secs": round(r.secs or 0.0, 2), "exit": r.exit, "wall": bool(r.wall),
         "prompt_sha256": sha256(prompt),
         "prompt_chars": len(prompt),
-    })
+    }, say=say)
 
 
 def trailer(r: Result, tool=TOOL_NAME) -> str:

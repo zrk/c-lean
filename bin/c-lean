@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""@TOOL@ — one model call with no harness context, on the subscription.
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import c_lean_core as B  # noqa: E402
+
+HELP = """@TOOL@ — one model call with no harness context, on the subscription.
 
 Why this exists
   A Claude subagent drags tens of thousands of tokens of harness (system prompt,
@@ -323,19 +334,9 @@ Exit codes
   130/143/129 stopped by SIGINT/SIGTERM/SIGHUP
     — before or during the call, unless a good whole `result` already came
 """
-from __future__ import annotations
-
-import argparse
-import json
-import math
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-import c_lean_core as B  # noqa: E402
-
-__doc__ = (__doc__.replace("@TOOL@", B.TOOL_NAME).replace("@ENV@", B.ENV_PREFIX)
-           .replace("@PIECES@", B.PIECES_KEY))
+# python -OO strips docstrings, so the help is a constant, not __doc__
+HELP = (HELP.replace("@TOOL@", B.TOOL_NAME).replace("@ENV@", B.ENV_PREFIX)
+        .replace("@PIECES@", B.PIECES_KEY))
 
 CHECK_MAX_INPUT = 1500
 CHECK_SYSTEM = ("You are a terse evaluator. Always answer in English. "
@@ -355,7 +356,7 @@ def build_parser():
     p = Parser(
         prog=B.TOOL_NAME, add_help=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=__doc__)
+        description=HELP)
     p.add_argument("prompt", nargs="*", help=argparse.SUPPRESS)
     p.add_argument("-f", "--file", dest="files", action="append", default=[],
                    help="read the prompt from FILE (repeatable)")
@@ -473,7 +474,7 @@ def check_verdict(r, seen):
     if not r.ok:
         fails.append("call failed: %s" % r.err)
     elif not seen.strip():
-    # --check exists to prove the pipe works before a paid call; an empty
+        # --check exists to prove the pipe works before a paid call; an empty
         # answer is the pipe not working, and it used to print OK.
         fails.append("empty answer — not a result")
     if r.tokens_unknown or (r.ok and r.total_in == 0):
@@ -697,7 +698,7 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.help:
-        return B.EXIT_OK if write_end(out=__doc__) else B.EXIT_STREAM
+        return B.EXIT_OK if write_end(out=HELP) else B.EXIT_STREAM
     if args.effort is not None and not args.check:  # --check ignores -e (see do_check)
         effort = args.effort.lower()
         if effort not in B.EFFORTS:

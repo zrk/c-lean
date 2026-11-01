@@ -2475,6 +2475,16 @@ M += [
 ]
 
 M += [
+ ('fix D8 the help is read from __doc__ under python -OO',
+  'c-lean',
+  'HELP = (HELP.replace("@TOOL@", B.TOOL_NAME)',
+  # __debug__ is False under -OO, where __doc__ is None: only that path breaks
+  'HELP = ((HELP if __debug__ else __doc__).replace("@TOOL@", B.TOOL_NAME)',
+  'test_help_and_a_call_work_under_python_optimize_2',
+  'c-lean -h must work under python -OO'),
+]
+
+M += [
  ('agents: a model in the frontmatter fails',
   'agents/sub-scout.md',
   'omitClaudeMd: true\n',

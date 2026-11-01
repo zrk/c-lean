@@ -514,6 +514,18 @@ class Case(unittest.TestCase):
         for stale in ("default 600 s)", " 600 s", "1800 s", "3000 s"):
             self.assertNotIn(stale, s.stdout, "c-lean -h must not promise the old timeout: %s" % stale)
 
+    def test_help_and_a_call_work_under_python_optimize_2(self):
+        # python -OO (PYTHONOPTIMIZE=2) strips docstrings: the help must not come from __doc__
+        plain = run([CLI, "-h"], state=self.state, extra_env=dict(self.env, PYTHONOPTIMIZE=None))
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        opt = run([CLI, "-h"], state=self.state, extra_env=dict(self.env, PYTHONOPTIMIZE="2"))
+        self.assertEqual(opt.returncode, 0, "c-lean -h must work under python -OO: " + opt.stderr)
+        self.assertEqual(opt.stdout, plain.stdout, "c-lean -h must print the same help under python -OO")
+        p = run([CLI, "-m", "haiku", "x"], mode="single", state=self.state,
+                extra_env=dict(self.env, PYTHONOPTIMIZE="2"))
+        self.assertEqual(p.returncode, 0, "c-lean must make its call under python -OO: " + p.stderr)
+        self.assertIn("ECHO:x", p.stdout)
+
     def test_trailer_prints_think_inside_out(self):
         """`think` is part of `out`; printed side by side the two invited a sum
         that overstated the spend."""

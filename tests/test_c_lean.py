@@ -20,8 +20,10 @@ import itertools
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -31,6 +33,7 @@ import time
 import types
 import unittest
 from datetime import datetime, timezone
+from typing import Any
 from unittest import mock
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
@@ -43,6 +46,24 @@ os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 # writer of the files of unprinted text
 sys.path.insert(0, BIN)
 import c_lean_core as B  # noqa: E402
+
+# Every child that does not get a stdin of its own inherits ours, and c-lean
+# warns about a pipe with bytes waiting on stdin: the suite must not depend on
+# what the runner (a CI step, `sleep 9 | python3 tests/test_c_lean.py`) left there.
+# Our own sys.stdin keeps the runner's stdin (a dup of the original fd 0), so
+# that `breakpoint()` in a terminal still works; only fd 0 itself, which the
+# children inherit, becomes /dev/null.
+_runner_stdin: int | None
+try:
+    _runner_stdin = os.dup(0)
+except OSError:  # a runner started with stdin closed
+    _runner_stdin = None
+_devnull = os.open(os.devnull, os.O_RDONLY)
+os.dup2(_devnull, 0)
+if _devnull != 0:
+    os.close(_devnull)
+if _runner_stdin is not None and sys.stdin is not None:
+    sys.stdin = os.fdopen(_runner_stdin, "r", encoding="utf-8", errors="replace")
 
 CLI = os.path.join(BIN, B.TOOL_NAME)
 FAKE = os.path.join(TESTS, "fake_claude.py")
@@ -228,8 +249,12 @@ def ignore_sighup():
 def run(cmd, mode="ok", state=None, extra_env=None, stdin="", cwd=None):
     env = child_env(mode, state, extra_env)
     # a hang is a finding, not a reason for the suite to wait for ever
+    # Nothing to say on stdin means /dev/null, as inside Claude Code's Bash tool:
+    # an empty pipe is a pipe, and a call with words would WARN about it
+    # (see stdin_holds_data in bin/c-lean).
+    feed: dict[str, Any] = {"input": stdin} if stdin else {"stdin": subprocess.DEVNULL}
     p = subprocess.run([sys.executable] + cmd, capture_output=True, text=True, env=env,
-                       input=stdin, cwd=cwd, timeout=180)
+                       cwd=cwd, timeout=180, **feed)
     return p
 
 
@@ -3749,8 +3774,9 @@ if _dir:
     def run_bytes(self, args, mode="single", stdin=b"", extra_env=None, **kw):
         """`c-lean args` with bytes on stdin and both streams kept as bytes."""
         env = child_env(mode, self.state, dict(self.env, **(extra_env or {})))
-        return subprocess.run([sys.executable, CLI] + args, env=env, input=stdin,
-                              capture_output=True, timeout=180, **kw)
+        feed: dict[str, Any] = {"input": stdin} if stdin else {"stdin": subprocess.DEVNULL}
+        return subprocess.run([sys.executable, CLI] + args, env=env,
+                              capture_output=True, timeout=180, **feed, **kw)
 
     def test_a_file_or_stdin_that_is_not_utf8_is_a_usage_error(self):
         """A file given to -f, --system-file or --schema, and the prompt on
@@ -4698,6 +4724,366 @@ if _dir:
         self.assertEqual((p.returncode, p.stdout), (0, "ECHO:" + prompt + "\n"),
                          "a good prompt from -f - must reach the CLI whole: " + p.stderr)
         self.on_stdin(prompt)
+
+    # --- how the prompt is put together, and stdin that is not read
+    def run_stdin(self, args, kind, data=b"DATA\n", mode="single"):
+        """`c-lean -m haiku args` with stdin of the given kind, as bytes. A pipe,
+        a socket and a file are given `data`; `empty` is an empty file; `tty` is
+        a pseudo-terminal; `devnull` is /dev/null, which is what stdin is inside
+        Claude Code's Bash tool; `closed` is `<&-`."""
+        env = child_env(mode, self.state, self.env)
+        cmd = [sys.executable, CLI, "-m", "haiku"] + args
+        kw, closers = {}, []
+        if kind == "pipe":
+            # written before the spawn: the state c-lean meets must not depend
+            # on how fast the child starts
+            r, w = os.pipe()
+            os.write(w, data)
+            os.close(w)
+            kw["stdin"] = r
+            closers.append(lambda: os.close(r))
+        elif kind in ("file", "empty"):
+            f = open(self.write_bytes("stdin-%s.bin" % kind, data if kind == "file" else b""), "rb")
+            kw["stdin"] = f
+            closers.append(f)
+        elif kind == "socket":
+            a, b = socket.socketpair()
+            a.sendall(data)
+            a.close()
+            kw["stdin"] = b
+            closers.append(b)
+        elif kind in ("eofpipe", "openpipe"):
+            # an os.pipe() whose state at start is exact: no writer left and
+            # nothing written / the writer still open and silent
+            r, w = os.pipe()
+            kw["stdin"] = r
+            closers.append(lambda: os.close(r))
+            if kind == "openpipe":
+                closers.append(lambda: os.close(w))
+            else:
+                os.close(w)
+        elif kind == "fileend":
+            f = open(self.write_bytes("stdin-fileend.bin", data), "rb")
+            f.read()  # the offset is at the end, as after the last pass of `while read`
+            kw["stdin"] = f
+            closers.append(f)
+        elif kind == "wronly":
+            fd = os.open(self.write_bytes("stdin-wronly.bin", data), os.O_WRONLY)
+            kw["stdin"] = fd
+            closers.append(lambda: os.close(fd))
+        elif kind == "listening":
+            srv = socket.socket(socket.AF_UNIX)
+            # a short path: sun_path holds about 100 bytes, and a long TMPDIR
+            # would make the bind an error instead of a test
+            short = tempfile.mkdtemp(dir="/tmp")
+            self.tmpdirs.append(short)
+            srv.bind(os.path.join(short, "s"))
+            srv.listen(1)
+            kw["stdin"] = srv.fileno()
+            closers.append(srv)
+        elif kind == "opensocket":
+            # what Node's stdio "pipe" is on Linux: a socketpair, the peer open and silent
+            a, b = socket.socketpair()
+            kw["stdin"] = b
+            closers += [a, b]
+        elif kind == "eofsocket":
+            a, b = socket.socketpair()
+            a.shutdown(socket.SHUT_WR)  # the peer has shut down for writing
+            kw["stdin"] = b
+            closers += [a, b]
+        elif kind == "devnull":
+            kw["stdin"] = subprocess.DEVNULL
+        elif kind == "tty":
+            master, slave = os.openpty()
+            kw["stdin"] = slave
+            closers += [lambda: os.close(master), lambda: os.close(slave)]
+        elif kind == "closed":
+            kw.update(stdin=None, preexec_fn=self.no_stdin)
+        else:
+            raise AssertionError(kind)
+        try:
+            # a probe or a read that waits for stdin is a failure of the test,
+            # not a reason to wait a minute and end in an error
+            return subprocess.run(cmd, env=env, capture_output=True, timeout=20, **kw)
+        except subprocess.TimeoutExpired:
+            self.fail("c-lean waited for stdin (%s) instead of going on" % kind)
+        finally:
+            for c in closers:
+                c() if callable(c) else c.close()
+
+    def unread_stdin_warnings(self, p):
+        return [l for l in p.stderr.decode("utf-8", "replace").splitlines()
+                if "WARN stdin was not read" in l]
+
+    def test_stdin_that_was_not_read_is_warned_about_once(self):
+        """`echo DATA | c-lean -m haiku "Summarize this:"` sent only the words,
+        exit 0, and the piped data was ignored without a word. It stays unread
+        (an inherited pipe that never closes would hang the call), and one WARN
+        says so and names both ways out."""
+        path = self.write("ctx.md", "CONTEXT")
+        for kind in ("pipe", "file", "socket"):
+            for args, prompt in ((["Summarize this:"], "Summarize this:"),
+                                 (["-f", path], "CONTEXT"),
+                                 (["Q", "-f", path], "Q\n\nCONTEXT")):
+                with self.subTest(kind=kind, args=args):
+                    p = self.run_stdin(args, kind)
+                    err = p.stderr.decode("utf-8", "replace")
+                    self.assertEqual(p.returncode, 0, err)
+                    warns = self.unread_stdin_warnings(p)
+                    self.assertEqual(len(warns), 1,
+                                     "unread data on stdin must cost exactly one WARN: " + err)
+                    for hint in ("c-lean: WARN", "-f -", "</dev/null"):
+                        self.assertIn(hint, warns[0], "the WARN must say how to include the "
+                                      "data and how to silence it")
+                    self.on_stdin(prompt)
+
+    def test_a_pipe_already_at_eof_with_nothing_in_it_gives_no_warning(self):
+        """`true | c-lean -m haiku x` and `subprocess.run(..., input="")` lose
+        nothing: the pipe is at EOF with 0 bytes. A UNIX socket whose peer has
+        shut down for writing is the same."""
+        for kind in ("eofpipe", "eofsocket"):
+            with self.subTest(kind=kind):
+                p = self.run_stdin(["words"], kind)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(self.unread_stdin_warnings(p), [],
+                                 "%s at EOF with nothing in it must not WARN" % kind)
+                self.on_stdin("words")
+
+    def test_an_idle_open_socket_gives_no_warning_and_no_wait(self):
+        """Claude Code's Bash tool spawns the shell with stdin an open socketpair
+        (Node and Bun make one for stdio "pipe"), and appends `< /dev/null` to
+        the command only when its text holds no `<` (a prompt like "is 3 < 5"
+        has one): the call then meets an open stdin that stays idle. It must
+        not WARN, and it must not wait for it."""
+        p = self.run_stdin(["is 3 < 5"], "opensocket")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.unread_stdin_warnings(p), [],
+                         "an idle open socket must not WARN")
+        self.on_stdin("is 3 < 5")
+
+    def test_a_pipe_whose_writer_is_still_open_is_warned_about_and_not_waited_for(self):
+        """A producer that is still running has sent nothing yet: its data would
+        be dropped without a word. The WARN comes, and the call does not wait."""
+        p = self.run_stdin(["words"], "openpipe")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(self.unread_stdin_warnings(p)), 1,
+                         "an open pipe that is not at EOF must WARN: " + p.stderr.decode())
+        self.on_stdin("words")
+
+    def test_a_slow_producer_in_a_shell_pipeline_is_warned_about(self):
+        """`(sleep 0.5; echo DATA) | c-lean -m haiku x` sent only "x" and the
+        data was lost without a word, whenever the producer took more than
+        about 50 ms. The check is made at the start, before any byte comes, or
+        after it came: either way it warns."""
+        env = child_env("single", self.state, self.env)
+        cmd = "(sleep 0.5; echo DATA) | %s %s -m haiku x" % (
+            shlex.quote(sys.executable), shlex.quote(CLI))
+        p = subprocess.run(["sh", "-c", cmd], env=env, capture_output=True, timeout=30,
+                           stdin=subprocess.DEVNULL)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(self.unread_stdin_warnings(p)), 1,
+                         "a slow producer must be warned about: " + p.stderr.decode())
+        self.on_stdin("x")
+
+    def cli_module(self):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("c_lean_cli_probe", CLI)
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(mod)
+        return mod
+
+    def test_a_probe_that_fails_costs_a_warn_not_silence(self):
+        """If the count of waiting bytes fails for any reason, the answer is
+        the conservative one: warn. A pipe at EOF and an idle socket are the
+        controls that stay silent."""
+        mod = self.cli_module()
+        for kind in ("pipe", "socket"):
+            with self.subTest(kind=kind):
+                if kind == "pipe":
+                    r, w = os.pipe()
+                    os.close(w)  # EOF, nothing in it
+                    peer = None
+                else:
+                    r, peer = socket.socketpair()
+                    r = r.detach()
+                with os.fdopen(r) as stream, mock.patch.object(sys, "stdin", stream):
+                    self.assertFalse(mod.stdin_holds_data(), "the control case must not WARN")
+                    with mock.patch.object(mod.fcntl, "ioctl", side_effect=OSError("failed")):
+                        self.assertTrue(mod.stdin_holds_data(),
+                                        "a failed probe must WARN, never stay silent")
+                if peer is not None:
+                    peer.close()
+
+    def test_a_stop_signal_in_the_probe_is_not_swallowed(self):
+        """The stop handler raises PromptStopped in the main thread, and the
+        probe can be the code it lands in: it must reach the caller, as in
+        every other read of the prompt (a WARN and a hang were the result)."""
+        mod = self.cli_module()
+        r, w = os.pipe()
+        os.write(w, b"x")
+        with os.fdopen(r) as pipe, mock.patch.object(sys, "stdin", pipe), \
+                mock.patch.object(mod.fcntl, "ioctl", side_effect=B.PromptStopped()):
+            with self.assertRaises(B.PromptStopped, msg="the probe must let a stop through"):
+                mod.stdin_holds_data()
+        os.close(w)
+
+    def test_the_stdin_warning_on_a_broken_stderr_keeps_the_call_and_the_usage_line(self):
+        """A WARN on a stderr that can no longer be written must not cost the
+        call: base made it, logged it and exited 120; the WARN raised out of
+        the prompt step instead (traceback, exit 1, no call, no log line)."""
+        r, w = os.pipe()
+        os.write(w, b"DATA\n")
+        os.close(w)
+        stderr = self.broken_stderr()
+        try:
+            p = subprocess.run([sys.executable, CLI, "-m", "haiku", "words"], stdin=r,
+                               env=child_env("single", self.state, self.env),
+                               stdout=subprocess.PIPE, stderr=stderr, timeout=60,
+                               preexec_fn=default_sighup)
+        finally:
+            os.close(r)
+            os.close(stderr)
+        self.assertEqual(self.calls(), 1, "the call must still be made")
+        self.assertEqual(p.returncode, 120, "a broken stderr is exit 120, not a traceback")
+        self.assertEqual([x["exit"] for x in self.jsonl(self.log)], [0],
+                         "the usage-log line must still be written")
+
+    def test_a_file_argument_that_is_stdin_is_not_reported_as_unread(self):
+        """`-f /dev/stdin < data` reads the data, so it must not WARN that
+        stdin was not read."""
+        if not os.path.exists("/dev/stdin"):
+            self.skipTest("no /dev/stdin")
+        for kind in ("pipe", "file"):
+            with self.subTest(kind=kind):
+                p = self.run_stdin(["words", "-f", "/dev/stdin"], kind)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(self.unread_stdin_warnings(p), [],
+                                 "-f /dev/stdin reads stdin: nothing is unread")
+                self.on_stdin("words\n\nDATA\n")
+
+    def test_a_stdin_that_never_closes_is_not_waited_for(self):
+        """Words plus an inherited pipe whose writer stays open (a Node parent
+        with default stdio) must not hang the call: stdin is not read."""
+        env = child_env("single", self.state, self.env)
+        r, w = os.pipe()
+        os.write(w, b"DATA\n")  # before the spawn, so that the state is exact
+        proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "words"], env=env,
+                                stdin=r, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        os.close(r)
+        assert proc.stdout is not None and proc.stderr is not None
+        try:
+            try:
+                proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                self.fail("the call must not wait for a stdin that never closes")
+            err = proc.stderr.read().decode("utf-8", "replace")
+            self.assertEqual(proc.returncode, 0, err)
+            self.assertEqual(len(self.unread_stdin_warnings(types.SimpleNamespace(stderr=err.encode()))),
+                             1, err)
+            self.on_stdin("words")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            os.close(w)
+            for f in (proc.stdout, proc.stderr):
+                f.close()
+
+    def test_no_warning_when_stdin_holds_no_data_or_is_in_use(self):
+        """No WARN for /dev/null (stdin inside Claude Code's Bash tool), a
+        terminal, a closed stdin, an empty file, nor when -f - reads stdin."""
+        for kind in ("devnull", "tty", "closed", "empty", "fileend", "wronly", "listening"):
+            with self.subTest(kind=kind):
+                p = self.run_stdin(["words"], kind)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(self.unread_stdin_warnings(p), [],
+                                 "%s must not be reported as unread data" % kind)
+                self.assertNotIn(b"-f -", p.stderr)
+                self.on_stdin("words")
+        for kind in ("pipe", "file", "socket"):
+            with self.subTest(kind=kind, flag="-f -"):
+                p = self.run_stdin(["words", "-f", "-"], kind)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(self.unread_stdin_warnings(p), [],
+                                 "-f - reads stdin, so nothing is unread")
+                self.on_stdin("words\n\nDATA\n")
+        with self.subTest(case="stdin is the only input"):
+            p = self.run_stdin([], "pipe")
+            self.assertEqual((p.returncode, self.unread_stdin_warnings(p)), (0, []), p.stderr)
+            self.on_stdin("DATA\n")
+
+    def test_the_prompt_is_words_first_then_the_files_in_the_order_given(self):
+        a, b = self.write("a.md", "AAA"), self.write("b.md", "BBB")
+        for args, stdin, prompt in (
+                (["-f", a, "QUESTION"], b"", "QUESTION\n\nAAA"),
+                (["-f", a, "-f", b, "Q"], b"", "Q\n\nAAA\n\nBBB"),
+                (["-f", b, "-f", a], b"", "BBB\n\nAAA"),
+                (["-f", a, "-f", "-", "-f", b], b"STDIN", "AAA\n\nSTDIN\n\nBBB"),
+                (["-f", "-", "-f", a, "Q"], b"STDIN", "Q\n\nSTDIN\n\nAAA"),
+                (["one", "two", "-f", a, "three"], b"", "one two three\n\nAAA")):
+            with self.subTest(args=args):
+                p = self.run_stdin(args, "pipe", data=stdin)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.on_stdin(prompt)
+
+    def test_words_may_stand_between_the_options(self):
+        """`c-lean -m haiku first -e low second` was a usage error (exit 64,
+        "unrecognized arguments"): the words had to stand together."""
+        for args, prompt in ((["first", "-e", "low", "second"], "first second"),
+                             (["-e", "low", "first", "--json", "second", "third"],
+                              "first second third"),
+                             (["first", "--tag", "t", "second", "--allow-empty"], "first second"),
+                             (["a", "-m", "opus", "b"], "a b")):
+            with self.subTest(args=args):
+                p = self.run_stdin(args, "devnull")
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.on_stdin(prompt)
+        self.run_stdin(["first", "-e", "low", "second"], "devnull")
+        self.assertEqual(self.flag("--effort"), "low", "the option between the words must count")
+        self.run_stdin(["a", "-m", "opus", "b"], "devnull")
+        self.assertEqual(self.flag("--model"), "opus", "the last -m must win, as before")
+
+    def test_a_double_dash_ends_the_options_for_the_words_after_it(self):
+        for args, prompt in ((["--", "-e", "low"], "-e low"),
+                             (["first", "-e", "low", "--", "-m", "--json"], "first -m --json"),
+                             (["--", "-m", "--json"], "-m --json")):
+            with self.subTest(args=args):
+                p = self.run_stdin(args, "devnull")
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.on_stdin(prompt)
+        self.assertNotIn("--effort", self.argv(), "words after `--` are not options")
+
+    def test_usage_errors_of_the_command_line_stay_exit_64(self):
+        for args, message in ((["words", "--bogus"], "c-lean: unrecognized arguments: --bogus"),
+                              (["a", "-e", "low", "b", "-x"], "c-lean: unrecognized arguments: -x"),
+                              (["words", "-f"], "c-lean: argument -f/--file: expected one argument"),
+                              (["a", "--timeout", "x", "b"], "c-lean: argument --timeout: invalid")):
+            with self.subTest(args=args):
+                p = self.run_stdin(args, "devnull")
+                self.assertEqual(p.returncode, 64, p.stderr)
+                self.assertTrue(p.stderr.decode("utf-8", "replace").startswith(message),
+                                p.stderr)
+                self.assertEqual((p.stdout, self.calls()), (b"", 0))
+
+    def test_help_states_the_rules_for_assembling_the_prompt(self):
+        h = " ".join(run([CLI, "-h"], state=self.state, extra_env=self.env).stdout.split())
+        for phrase in ("first the words, then each -f FILE in the order given",
+                       "they may stand between options", "After `--` every argument is a word",
+                       "-f - reads stdin and puts it at that place",
+                       "stdin is read only when it is the only input",
+                       "it is NOT read and one WARN on stderr says so",
+                       "any pipe that is not at EOF and empty", "only bytes already waiting",
+                       "only bytes left after its offset",
+                       "a write-only fd and a listening socket give no WARN",
+                       "`-f /dev/stdin` is not reported as unread",
+                       "a file that reports size 0 (/proc, cgroup v1 files)",
+                       "a datagram socket whose first datagram is empty",
+                       "a named FIFO that gets a new writer after EOF",
+                       "give </dev/null to c-lean there",
+                       "a socket whose first bytes come later (use -f - for it)",
+                       "</dev/null silences the WARN"):
+            self.assertIn(phrase, h, "help must state how the prompt is assembled: " + phrase)
 
     def test_schema_from_a_file_reaches_the_cli_as_json(self):
         schema = '{"type":"object","properties":{"verdict":{"type":"string"}}}'

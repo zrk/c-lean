@@ -4,7 +4,7 @@ on ITS assert (the rule: never trust a test you have not seen fail).
 
 usage: redphase.py [REPORT.json] [--only SUBSTRING]
 
-Only bin/, agents/ and tests/ are copied into a fresh temp directory per case.
+Only bin/, agents/, tests/ and README.md are copied into a fresh temp directory per case.
 The copy is broken and tested through C_LEAN_BIN_DIR and C_LEAN_AGENTS_DIR;
 repository files stay intact.
 Each copy, including the unmutated one, uses a TMPDIR inside its own tree,
@@ -14,7 +14,7 @@ The temp tree is removed at the end.
 A case is (label, file, old, new, test, expected substring). `old`/`new` may
 also be a tuple of (old, new) pairs when the pre-fix shape touched several
 lines at once; every pair is applied to the same copy. A file under tests/ or
-agents/ is named by its path, any other by its name in bin/. A test of class
+agents/ is named by its path, README.md by its name, any other by its name in bin/. A test of class
 Case is named by its method, a test of another class as Class.method.
 """
 import argparse
@@ -264,6 +264,66 @@ M = [('log line is written',
   '        if k in ALLOW_ENV or k in TRANSPORT_ENV or k in extra or k.startswith(ALLOW_ENV_PREFIX):',
   'test_proxy_and_ca_do_not_travel_by_default',
   'reached the child'),
+ ('fix D-env the opt-outs reach the child',
+  'c_lean_core.py',
+  '        if (k in extra and k in TRANSPORT_ENV) or k in OPT_OUT_ENV:',
+  '        if k in extra and k in TRANSPORT_ENV:',
+  'test_telemetry_opt_outs_reach_the_child',
+  'must reach the child'),
+ ('fix D-env the opt-outs are never set by default',
+  'c_lean_core.py',
+  '    return env\n\n\n_REFUSED_WARNED',
+  '    for k in OPT_OUT_ENV:\n        env.setdefault(k, "1")\n    return env\n\n\n_REFUSED_WARNED',
+  'test_telemetry_opt_outs_reach_the_child',
+  'must never set an opt-out itself'),
+ ('fix D-env a refused pass-env name is dropped silently',
+  'c_lean_core.py',
+  '    warn_refused_pass_env()\n',
+  '',
+  'test_refused_pass_env_names_warn_and_stay_out',
+  'one WARN naming'),
+ ('fix D-env the refusal warning must not print the value',
+  'c_lean_core.py',
+  '"can move the call off the subscription or load code) and is not passed" % n)',
+  '"can move the call off the subscription or load code) and is not passed" % (n + "=" + os.environ.get(n, "")))',
+  'test_refused_pass_env_names_warn_and_stay_out',
+  'a value must never be printed'),
+ ('fix D-env the opt-out exception must not widen to the CLAUDE_ prefix',
+  'c_lean_core.py',
+  '        if (k in extra and k in TRANSPORT_ENV) or k in OPT_OUT_ENV:',
+  '        if (k in extra and k in TRANSPORT_ENV) or k in OPT_OUT_ENV or k in extra:',
+  'test_refused_pass_env_names_warn_and_stay_out',
+  'a refused name reached the child'),
+ ('fix D-env a pass-env entry with =value echoes the value',
+  'c_lean_core.py',
+  '            shown = "entry %r" % head if ok else "entry #%d" % pos',
+  '            shown = "entry %r" % n[:60]',
+  'test_pass_env_entry_with_a_value_never_echoes_it',
+  'the value after = must never be printed'),
+ ('fix D-env a pasted key without a name is echoed',
+  'c_lean_core.py',
+  '            shown = "entry %r" % head if ok else "entry #%d" % pos',
+  '            shown = "entry %r" % head[:60]',
+  'test_pass_env_entry_with_a_value_never_echoes_it',
+  'no part of a pasted key may be printed'),
+ ('fix D-env an entry that is not a name is passed under a WARN that says it is not',
+  'c_lean_core.py',
+  '                  if PASS_ENV_NAME.fullmatch(n.strip()))',
+  '                  if n.strip())',
+  'test_pass_env_entry_that_is_not_a_name_is_not_passed',
+  'an entry that is not a name reached the child'),
+ ('fix D-env the README names the opt-outs',
+  'README.md',
+  'pass when you export them in the shell; c-lean never sets them.',
+  'pass when you set them; c-lean never sets them.',
+  'test_help_and_readme_say_which_opt_outs_pass',
+  'README'),
+ ('fix D-env the docs name the opt-outs',
+  'c-lean',
+  'DISABLE_TELEMETRY, DO_NOT_TRACK\n    and DISABLE_ERROR_REPORTING pass when you export them in the shell',
+  'DISABLE_TELEMETRY\n    and DISABLE_ERROR_REPORTING pass when you export them in the shell',
+  'test_help_and_readme_say_which_opt_outs_pass',
+  'help must name the opt-out DO_NOT_TRACK'),
  ('the trailer names the binary that ran',
   'c_lean_core.py',
   '               (" · bin %s" % r.binary) if r.binary else "",',
@@ -1331,13 +1391,13 @@ M = [('log line is written',
  ('scrubbed_env stays a pure allow list',
   'c_lean_core.py',
   (('    env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(OUTPUT_CAP)\n', ''),
-   ('            env[k] = v\n    return env\n\n\ndef over_cap',
+   ('            env[k] = v\n    return env\n\n\n_REFUSED_WARNED',
     '            env[k] = v\n'
     '    env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(OUTPUT_CAP)\n'
     '    return env\n'
     '\n'
     '\n'
-    'def over_cap')),
+    '_REFUSED_WARNED')),
   None,
   'test_scrubbed_env_stays_a_pure_allow_list',
   'unexpectedly found'),
@@ -1451,8 +1511,8 @@ M = [('log line is written',
   'usage log file must retain mode 0600 under a restrictive umask'),
  ('pass-env adds requested names',
   'c_lean_core.py',
-  '    extra = tuple(n.strip() for n in (src.get(ENV_PREFIX + "PASS_ENV") or "").split(",") if '
-  'n.strip())',
+  '    extra = tuple(n.strip() for n in (src.get(ENV_PREFIX + "PASS_ENV") or "").split(",")\n'
+  '                  if PASS_ENV_NAME.fullmatch(n.strip()))',
   '    extra = ()',
   'test_pass_env_adds_requested_names',
   'pass-env must add requested HTTPS_PROXY'),
@@ -2548,12 +2608,14 @@ def source_of(fname):
         return os.path.join(SRC, fname)
     if fname.startswith("agents/"):
         return os.path.join(AGENTS, fname[len("agents/"):])
+    if fname == "README.md":
+        return os.path.join(SRC, fname)
     return os.path.join(BIN, fname)
 
 
 def copy_of(tree, fname):
     """The same file in the copy `tree`."""
-    if fname.startswith(("tests/", "agents/")):
+    if fname.startswith(("tests/", "agents/")) or fname == "README.md":
         return os.path.join(tree, fname)
     return os.path.join(tree, "bin", fname)
 
@@ -2575,6 +2637,8 @@ def make_copy(root, name):
     shutil.copytree(BIN, os.path.join(dst, "bin"), ignore=ignore)
     shutil.copytree(AGENTS, os.path.join(dst, "agents"), ignore=ignore)
     shutil.copytree(os.path.join(SRC, "tests"), os.path.join(dst, "tests"), ignore=ignore)
+    # the README is read by the test that locks what it says about the environment
+    shutil.copy(os.path.join(SRC, "README.md"), os.path.join(dst, "README.md"))
     return dst
 
 

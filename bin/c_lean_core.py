@@ -110,7 +110,8 @@ def usage_log() -> str:
 # (ANTHROPIC_CUSTOM_HEADERS, CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CONFIG_DIR,
 # CLAUDE_ENV_FILE) move the call off this subscription, while
 # CLAUDE_CODE_MAX_OUTPUT_TOKENS / MAX_THINKING_TOKENS silently cut the answer.
-# Only these names (plus the LC_* and C_LEAN_* families) reach the child.
+# Only these names (plus the LC_* and C_LEAN_* families, and the OPT_OUT_ENV
+# names below) reach the child.
 ALLOW_ENV = (
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TZ",
     "TMPDIR", "TEMP", "TMP", "TERM", "PWD",
@@ -126,6 +127,17 @@ ALLOW_ENV_PREFIX = ("LC_", ENV_PREFIX)
 TRANSPORT_ENV = ("SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
                  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
                  "http_proxy", "https_proxy", "no_proxy", "all_proxy")
+# Opt-outs the CLI reads (found as names in CLI 2.1.316). They only REDUCE
+# traffic, so they pass when the caller has them set, ahead of the CLAUDE_
+# deny prefix and without C_LEAN_PASS_ENV. We never set them ourselves, and
+# --setting-sources "" keeps the CLI from reading the `env` block of
+# settings.json, so the shell is the only place they can come from. Exact names
+# only: this is not a prefix, and CLAUDE_CODE_USE_BEDROCK & co. stay refused.
+OPT_OUT_ENV = ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY",
+               "DO_NOT_TRACK", "DISABLE_ERROR_REPORTING")
+# What an entry of C_LEAN_PASS_ENV must look like. Anything else ("MY-VAR",
+# "NAME=value", a pasted key) is not passed, and the WARN says so.
+PASS_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # Never passed, whatever the allow list or C_LEAN_PASS_ENV says. NODE_/PYTHON/LD_/
 # DYLD_/NPM_/BUN_/DENO_ are here because they are code loaders: the CLI is a node
 # program, so NODE_OPTIONS="--require injected.js" runs a stranger's file inside
@@ -357,15 +369,18 @@ def scrubbed_env(source=None) -> dict:
     """Build the child environment from the allow list (see ALLOW_ENV).
 
     C_LEAN_PASS_ENV="A,B" adds names for an unusual machine. The denied prefixes
-    hold even then, with one deliberate exception: the transport names above may
-    be let back in by name, because a corporate proxy or CA is a real need and
-    refusing it outright would just push somebody into editing this file.
+    hold even then, with two deliberate exceptions: the transport names above may
+    be let back in by name (a corporate proxy or CA is a real need, and refusing
+    it outright would just push somebody into editing this file), and the
+    OPT_OUT_ENV names pass on their own. An entry that is not a variable name
+    (see PASS_ENV_NAME) is not passed; warn_refused_pass_env says so.
     """
     src = dict(os.environ if source is None else source)
-    extra = tuple(n.strip() for n in (src.get(ENV_PREFIX + "PASS_ENV") or "").split(",") if n.strip())
+    extra = tuple(n.strip() for n in (src.get(ENV_PREFIX + "PASS_ENV") or "").split(",")
+                  if PASS_ENV_NAME.fullmatch(n.strip()))
     env = {}
     for k, v in src.items():
-        if k in extra and k in TRANSPORT_ENV:
+        if (k in extra and k in TRANSPORT_ENV) or k in OPT_OUT_ENV:
             env[k] = v
             continue
         if k.startswith(DENY_ENV_PREFIX):
@@ -373,6 +388,38 @@ def scrubbed_env(source=None) -> dict:
         if k in ALLOW_ENV or k in extra or k.startswith(ALLOW_ENV_PREFIX):
             env[k] = v
     return env
+
+
+_REFUSED_WARNED: set = set()
+
+
+def warn_refused_pass_env(source=None) -> None:
+    """One WARN per name in C_LEAN_PASS_ENV that the denied prefixes refuse.
+
+    scrubbed_env() stays pure (it is also called for the trailer), so the
+    warning is a separate step of the call. It names the variable and the
+    reason, never the value: the value may be a credential."""
+    src = os.environ if source is None else source
+    entries = (src.get(ENV_PREFIX + "PASS_ENV") or "").split(",")
+    for pos, n in enumerate((e.strip() for e in entries), 1):
+        if not n or n in TRANSPORT_ENV or n in OPT_OUT_ENV:
+            continue
+        if not PASS_ENV_NAME.fullmatch(n):
+            # "NAME=value" is a likely slip, and a pasted key has no name at
+            # all: echo the part before "=" only when it is a valid name,
+            # otherwise the position of the entry and nothing from it.
+            head = n.split("=", 1)[0]
+            ok = PASS_ENV_NAME.fullmatch(head) is not None
+            shown = "entry %r" % head if ok else "entry #%d" % pos
+            if shown not in _REFUSED_WARNED:
+                _REFUSED_WARNED.add(shown)
+                _say_during_call(f"{TOOL_NAME}: WARN {ENV_PREFIX}PASS_ENV: {shown} is not a variable "
+                                 "name (give names only, no =value) and is not passed")
+            continue
+        if n.startswith(DENY_ENV_PREFIX) and n not in _REFUSED_WARNED:
+            _REFUSED_WARNED.add(n)
+            _say_during_call(f"{TOOL_NAME}: WARN {ENV_PREFIX}PASS_ENV: %s is refused (its prefix "
+                             "can move the call off the subscription or load code) and is not passed" % n)
 
 
 def over_cap(doc):
@@ -1346,6 +1393,7 @@ def _call_claude(prompt, system, model, effort, schema, timeout):
                       secs=0.0, raw=None, interrupted=True)
     binary = claude_bin()
     system = system_prompt_arg(system)
+    warn_refused_pass_env()
     env = scrubbed_env()
     # Ours alone: scrubbed_env() never lets the caller's value in, and what is
     # put here after it is not the caller's either (see OUTPUT_CAP).

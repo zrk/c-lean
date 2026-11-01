@@ -65,9 +65,10 @@ Flags
 Guarantees
   * subscription only — the child gets an ALLOW-listed environment (PATH, HOME,
     USER, LOGNAME, SHELL, LANG, LC_*, TZ, TMPDIR, TERM, @ENV@*).
-    Every ANTHROPIC_* and CLAUDE_* name is dropped, so an API key, an OAuth
-    token, ANTHROPIC_CUSTOM_HEADERS, CLAUDE_CONFIG_DIR, CLAUDE_ENV_FILE or
-    CLAUDE_CODE_MAX_OUTPUT_TOKENS cannot ride in from the calling session.
+    Every ANTHROPIC_* and CLAUDE_* name is dropped (bar the four opt-outs
+    below), so an API key, an OAuth token, ANTHROPIC_CUSTOM_HEADERS,
+    CLAUDE_CONFIG_DIR, CLAUDE_ENV_FILE or CLAUDE_CODE_MAX_OUTPUT_TOKENS cannot
+    ride in from the calling session.
     `@TOOL@` sets that one itself, to 128000 (OUTPUT_CAP in c_lean_core.py): the
     CLI lowers the number to the upper bound of the model without a word, so
     a model whose default cap is below its bound writes up to the bound.
@@ -80,8 +81,15 @@ Guarantees
     refused outright: they would run a stranger's file inside the call.
     Proxy and CA names (HTTPS_PROXY, NODE_EXTRA_CA_CERTS, SSL_CERT_FILE …) do NOT
     travel by default either; name them in @ENV@PASS_ENV="A,B" if a machine needs
-    them, and the trailer then says so. The CLI's API-key-only mode is never
-    used: this call needs the subscription login.
+    them, and the trailer then says so. The traffic opt-outs
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, DISABLE_TELEMETRY, DO_NOT_TRACK
+    and DISABLE_ERROR_REPORTING pass when you export them in the shell, and are
+    never set for you. The settings.json `env` block is not read (the CLI runs
+    with --setting-sources ""): export them in the shell instead. A name in
+    @ENV@PASS_ENV that is refused costs one WARN naming it, never its value;
+    so does an entry that is not a variable name (letters, digits, _), and
+    that entry is not passed. The CLI's API-key-only mode is never used: this
+    call needs the subscription login.
   * no context — --tools "" --setting-sources "" --strict-mcp-config
     --disable-slash-commands --no-session-persistence, cwd = fresh private tmpdir.
     The system prompt is what --system or --system-file gave, and empty when

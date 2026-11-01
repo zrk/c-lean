@@ -666,6 +666,91 @@ class Case(unittest.TestCase):
         got = sorted(k for k in ("HTTPS_PROXY", "NODE_EXTRA_CA_CERTS", "no_proxy") if k in env)
         self.assertEqual(got, [], "these reached the child: %s" % got)
 
+    OPT_OUTS = ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY",
+                "DO_NOT_TRACK", "DISABLE_ERROR_REPORTING")
+
+    def test_telemetry_opt_outs_reach_the_child(self):
+        """The user's opt-outs only reduce traffic. The CLAUDE_ deny prefix used to
+        eat CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC and the others never got in, so
+        an opt-out in the shell was lost. They pass when set, and only then."""
+        p = run([CLI, "-m", "haiku", "--system", "S", "x"], mode="envdump", state=self.state,
+                extra_env=dict(self.env, **{n: "opt-" + n for n in self.OPT_OUTS}))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        env = json.load(open(os.path.join(self.state, "env.json")))
+        for n in self.OPT_OUTS:
+            self.assertEqual(env.get(n), "opt-" + n, "the opt-out %s must reach the child" % n)
+        self.assertNotIn("WARN C_LEAN_PASS_ENV", p.stderr)
+        # the runner's own environment may carry an opt-out: take them out
+        p = run([CLI, "-m", "haiku", "--system", "S", "x"], mode="envdump", state=self.state,
+                extra_env=dict(self.env, **{n: None for n in self.OPT_OUTS}))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        env = json.load(open(os.path.join(self.state, "env.json")))
+        got = [n for n in self.OPT_OUTS if n in env]
+        self.assertEqual(got, [], "c-lean must never set an opt-out itself: %s" % got)
+
+    def test_refused_pass_env_names_warn_and_stay_out(self):
+        """The opt-out exception is exact names: auth and routing names stay refused
+        even when listed, with one WARN that names the variable but not its value."""
+        bad = {"CLAUDE_CODE_USE_BEDROCK": "sekrit-1", "CLAUDE_CODE_OAUTH_TOKEN": "sekrit-2",
+               "ANTHROPIC_BASE_URL": "http://sekrit-3.invalid"}
+        p = run([CLI, "-m", "haiku", "--system", "S", "x"], mode="envdump", state=self.state,
+                extra_env=dict(self.env, C_LEAN_PASS_ENV=",".join(bad), **bad))
+        # the fake refuses to start with an auth/routing name: say what that means
+        self.assertNotIn("banned env var", p.stderr, "a refused name reached the child")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        env = json.load(open(os.path.join(self.state, "env.json")))
+        got = sorted(k for k in bad if k in env)
+        self.assertEqual(got, [], "these reached the child: %s" % got)
+        warns = [l for l in p.stderr.splitlines() if "WARN" in l and "PASS_ENV" in l]
+        for n in bad:
+            self.assertEqual(len([l for l in warns if n in l]), 1,
+                             "one WARN naming %s expected: %s" % (n, p.stderr))
+        self.assertNotIn("sekrit", p.stderr, "a value must never be printed")
+
+    def test_pass_env_entry_with_a_value_never_echoes_it(self):
+        """`C_LEAN_PASS_ENV='ANTHROPIC_API_KEY=sk-...'` is a slip that put a key on
+        stderr in the WARN. Only the part before the = may be shown."""
+        p = run([CLI, "-m", "haiku", "--system", "S", "x"], mode="envdump", state=self.state,
+                extra_env=dict(self.env, C_LEAN_PASS_ENV="ANTHROPIC_API_KEY=sk-ant-SECRET123"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for stream in (p.stdout, p.stderr):
+            self.assertNotIn("SECRET123", stream, "the value after = must never be printed")
+        self.assertIn("not a variable name", p.stderr)
+        self.assertIn("ANTHROPIC_API_KEY", p.stderr)
+        # a pasted key has no name at all: not even its start may be echoed
+        p = run([CLI, "-m", "haiku", "--system", "S", "x"], mode="envdump", state=self.state,
+                extra_env=dict(self.env, C_LEAN_PASS_ENV="HOME,sk-ant-api03-SECRET,=SECRET2"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for stream in (p.stdout, p.stderr):
+            for part in ("sk-ant", "api03", "SECRET"):
+                self.assertNotIn(part, stream, "no part of a pasted key may be printed")
+        self.assertIn("entry #2 is not a variable name", p.stderr)
+
+    def test_pass_env_entry_that_is_not_a_name_is_not_passed(self):
+        """The WARN says such an entry "is not passed": it must be true. MY-VAR and
+        my.var are set and listed, and used to reach the child under that WARN."""
+        p = run([CLI, "-m", "haiku", "--system", "S", "x"], mode="envdump", state=self.state,
+                extra_env=dict(self.env, C_LEAN_PASS_ENV="MY-VAR,my.var,GOOD_VAR",
+                               **{"MY-VAR": "v1", "my.var": "v2", "GOOD_VAR": "v3"}))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        env = json.load(open(os.path.join(self.state, "env.json")))
+        got = sorted(k for k in ("MY-VAR", "my.var") if k in env)
+        self.assertEqual(got, [], "an entry that is not a name reached the child: %s" % got)
+        self.assertEqual(env.get("GOOD_VAR"), "v3", "a plain name must still pass")
+        for pos in (1, 2):
+            warns = [l for l in p.stderr.splitlines() if "entry #%d is not a variable name" % pos in l]
+            self.assertEqual(len(warns), 1, "one WARN for entry #%d expected: %s" % (pos, p.stderr))
+
+    def test_help_and_readme_say_which_opt_outs_pass(self):
+        p = run([CLI, "-h"], state=self.state, extra_env=self.env)
+        text = " ".join(p.stdout.split())
+        readme = " ".join(open(os.path.join(os.path.dirname(TESTS), "README.md")).read().split())
+        for where, t in (("help", text), ("README", readme)):
+            for n in self.OPT_OUTS:
+                self.assertIn(n, t, "%s must name the opt-out %s" % (where, n))
+            self.assertIn("settings.json", t, where)
+            self.assertIn("export them in the shell", t, where)
+
     def test_trailer_names_the_binary_it_used(self):
         """The binary comes from C_LEAN_CLAUDE_BIN or the parent's PATH, so a swap
         must be visible in the one line the operator reads."""

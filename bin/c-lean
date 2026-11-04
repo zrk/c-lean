@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
-"""@TOOL@ — one model call with no harness context, on the subscription.
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import json
+import math
+import os
+import select
+import signal
+import socket
+import stat
+import struct
+import sys
+import termios
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import c_lean_core as B  # noqa: E402
+
+HELP = """@TOOL@ — one model call with no harness context, on the subscription.
 
 Why this exists
   A Claude subagent drags tens of thousands of tokens of harness (system prompt,
@@ -28,6 +48,36 @@ Usage
   @TOOL@ -m haiku --allow-empty "…"          an empty answer is a valid result
   @TOOL@ --check                             one live Haiku probe: prefix size + language
 
+The prompt
+  The prompt is put together in one fixed order, whatever order the command
+  line has: first the words, then each -f FILE in the order given. The words
+  are all positional arguments in the order typed, joined by single spaces;
+  they may stand between options, so `first -e low second` is the prompt
+  "first second". After `--` every argument is a word. The parts are joined
+  by a blank line, and a part that is only whitespace is dropped. -f -
+  reads stdin and puts it at that place, so
+  `cat data | @TOOL@ -m haiku "Summarize:" -f -` sends "Summarize:" and then
+  the data, and `-f ctx.md "Q"` sends Q first and ctx.md after it.
+  Without -f - stdin is read only when it is the only input, i.e. there is
+  no word and no -f. `-f /dev/stdin` is not reported as unread. When a
+  prompt comes from words or -f and stdin holds data, it is NOT read and one
+  WARN on stderr says so; -f - includes it, </dev/null silences the WARN.
+  What counts as data depends on the kind of stdin, and nothing is read or
+  waited for to tell:
+    pipe     any pipe that is not at EOF and empty, so a producer that is still
+             running counts even before its first byte (`curl … | @TOOL@ "x"`)
+    socket   only bytes already waiting (a socket is what Claude Code's Bash
+             tool leaves open and idle on a command with a `<` in its text)
+    file     only bytes left after its offset
+  A terminal, /dev/null, any other character device, a closed stdin, a
+  write-only fd and a listening socket give no WARN. The gaps, none of them
+  warned about: a socket whose first bytes come later (use -f - for it), a
+  file that reports size 0 (/proc, cgroup v1 files), a datagram socket whose
+  first datagram is empty, and a named FIFO that gets a new writer after EOF.
+  In a loop, `while read -r x; do @TOOL@ … "$x"; done < list` or `cat list |`,
+  stdin is the list and every pass but the last gives the WARN: give
+  </dev/null to @TOOL@ there.
+
 Flags
   -f, --file FILE       read a prompt file; repeatable, - reads stdin
   -m, --model MODEL     model alias or full id; required unless --check
@@ -54,9 +104,10 @@ Flags
 Guarantees
   * subscription only — the child gets an ALLOW-listed environment (PATH, HOME,
     USER, LOGNAME, SHELL, LANG, LC_*, TZ, TMPDIR, TERM, @ENV@*).
-    Every ANTHROPIC_* and CLAUDE_* name is dropped, so an API key, an OAuth
-    token, ANTHROPIC_CUSTOM_HEADERS, CLAUDE_CONFIG_DIR, CLAUDE_ENV_FILE or
-    CLAUDE_CODE_MAX_OUTPUT_TOKENS cannot ride in from the calling session.
+    Every ANTHROPIC_* and CLAUDE_* name is dropped (bar the four opt-outs
+    below), so an API key, an OAuth token, ANTHROPIC_CUSTOM_HEADERS,
+    CLAUDE_CONFIG_DIR, CLAUDE_ENV_FILE or CLAUDE_CODE_MAX_OUTPUT_TOKENS cannot
+    ride in from the calling session.
     `@TOOL@` sets that one itself, to 128000 (OUTPUT_CAP in c_lean_core.py): the
     CLI lowers the number to the upper bound of the model without a word, so
     a model whose default cap is below its bound writes up to the bound.
@@ -69,8 +120,17 @@ Guarantees
     refused outright: they would run a stranger's file inside the call.
     Proxy and CA names (HTTPS_PROXY, NODE_EXTRA_CA_CERTS, SSL_CERT_FILE …) do NOT
     travel by default either; name them in @ENV@PASS_ENV="A,B" if a machine needs
-    them, and the trailer then says so. The CLI's API-key-only mode is never
-    used: this call needs the subscription login.
+    them, and the trailer then says so. The traffic opt-outs
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, DISABLE_TELEMETRY, DO_NOT_TRACK
+    and DISABLE_ERROR_REPORTING pass when you export them in the shell, and are
+    never set for you. The settings.json `env` block is not read (the CLI runs
+    with --setting-sources ""): export them in the shell instead. A name in
+    @ENV@PASS_ENV that is refused costs one WARN naming it, never its value;
+    so does an entry that is not a variable name (letters, digits, _), and
+    that entry is not passed. The CLI's API-key-only mode is never used: this
+    call needs the subscription login. This promise covers the environment and
+    configuration the call is given, not how the CLI authenticates or bills on
+    this machine.
   * no context — --tools "" --setting-sources "" --strict-mcp-config
     --disable-slash-commands --no-session-persistence, cwd = fresh private tmpdir.
     The system prompt is what --system or --system-file gave, and empty when
@@ -79,7 +139,9 @@ Guarantees
     --system-prompt "" is passed when there is none. What is left is the floor
     the CLI adds on its own, ~0.6K input tokens (measured 2026-10-27 on CLI
     2.1.311 with haiku: 579 with an empty system prompt; on CLI 2.1.288 the
-    built-in one gave 6,598).
+    built-in one gave 6,598). A separate data point, not the same setup:
+    on CLI 2.1.316 with haiku, --check (effort low, with its own short
+    system prompt) reported 412 input tokens (2026-11-01).
   * the prompt is never on the command line of the CLI: it goes on stdin. A
     system prompt goes in a file of its own, with mode 0600 and outside the
     cwd of the call, passed with --system-prompt-file. The file is removed
@@ -150,7 +212,14 @@ Guarantees
     lost at a seam (a newline was, in 12 of 12 measured seams after the
     output cap), and @TOOL@ does not guess it back: read the seams. --json
     prints the result document plus one key, @PIECES@, the text of each
-    block; the key is there only when the blocks were joined.
+    block; the key is there only when the blocks were joined. --json prints
+    the document of any call that received one, whatever the outcome (a cut
+    answer, an error, a limit wall, a stop after the `result`), whole
+    unless a stop comes after the call, before it is all printed (see The
+    exit code of a stop). The exit code and stderr are the same as without it,
+    except exit 120 when stdout can no longer be written, as for any
+    answer. A call that ended before any
+    `result` has no document, and stdout stays empty.
     Blocks are joined only when they can be trusted to be one answer: the
     CLI took no message back, every message from the first text block to
     the last one continues the message before it in one of the four ways
@@ -226,7 +295,8 @@ Guarantees
     kept as for any other.
   * the exit code in the trailer and in the usage-log line is the exit code
     of the process: an empty answer, or no structured output under
-    --schema, is exit 1 in all three places. Exit 120 is the one exception
+    --schema, is exit 1 in all three places. Exit 120, and 128+N for a stop
+    after the call until the end of the run is printed, are the exceptions
     (see Known limitations).
   * an empty answer is a failure, not a result (--allow-empty turns that off):
     `@TOOL@ … > answer.md` used to leave an empty file behind and exit 0.
@@ -282,7 +352,22 @@ Known limitations
     A good whole `result` already received is the exception: the answer stands,
     a WARN says the stop came after the answer, and that event decides the call.
     A child that dies of a signal @TOOL@ did not catch keeps its signal exit
-    (128+N). Signals landing after the exit has been decided cannot change it.
+    (128+N). A stop after the call, until the end of the run is printed,
+    gives 128+signal too, and a reader that does not read cannot hold it:
+    the print ends at once, or about 1 s later when the stop lands in a
+    write to stderr that blocks, and a wait for the usage log or the
+    --check record ends at once too. Nothing more goes to stdout then (it
+    may hold part of the answer, NOT a result), the text blocks are saved
+    to a file as those of an answer not printed are (under --schema the
+    text blocks, not the structured output), and a line on stderr says so,
+    after the trailer when that was not printed yet; stderr is given at
+    most 1 s for these lines. The trailer and the usage-log line keep the
+    exit @TOOL@ had decided. Signals landing after that cannot change it.
+    Lines written before the call ends (a WARN about @ENV@PASS_ENV or
+    stdin, or one of the call) go to stderr as they come: a reader that
+    does not read can hold them, and a stop then waits for it. So it
+    holds the end of the run after a stop before or during the call, until
+    a second stop ends it.
   * Exit 120. When stdout or stderr can no longer be written (a closed
     terminal, or a pipe whose reader has exited), the next write there fails.
     @TOOL@ then prints nothing more and exits 120, without a traceback,
@@ -321,23 +406,22 @@ Exit codes
     whose reader has exited (see Known limitations) ·
   137 the child died of SIGKILL while @TOOL@ caught no stop signal ·
   130/143/129 stopped by SIGINT/SIGTERM/SIGHUP
-    — before or during the call, unless a good whole `result` already came
+    — before or during the call, unless a good whole `result` already came,
+    and after it until the end of the run is printed
 """
-from __future__ import annotations
-
-import argparse
-import json
-import math
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-import c_lean_core as B  # noqa: E402
-
-__doc__ = (__doc__.replace("@TOOL@", B.TOOL_NAME).replace("@ENV@", B.ENV_PREFIX)
-           .replace("@PIECES@", B.PIECES_KEY))
+# python -OO strips docstrings, so the help is a constant, not __doc__
+HELP = (HELP.replace("@TOOL@", B.TOOL_NAME).replace("@ENV@", B.ENV_PREFIX)
+        .replace("@PIECES@", B.PIECES_KEY))
 
 CHECK_MAX_INPUT = 1500
+STOP_LINES_WAIT = 1.0  # seconds the lines of a stopped print may wait for stderr
+# Seconds a write to stderr may block with the stops held (see put_exact) before
+# a stop that waits is let in: about the time a person gives a Ctrl-C before
+# pressing it again, and far above a write that has room (microseconds).
+WRITE_WATCHDOG = 1.0
+# The longest single wait of a write for room, or for a stop held meanwhile: a
+# stop taken by another thread runs only once the main thread wakes up.
+WAIT_STEP = B.WAIT_STEP
 CHECK_SYSTEM = ("You are a terse evaluator. Always answer in English. "
                 "Reply with exactly one word and nothing else.")
 CHECK_PROMPT = "Reply with the single word: OK"
@@ -355,7 +439,7 @@ def build_parser():
     p = Parser(
         prog=B.TOOL_NAME, add_help=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=__doc__)
+        description=HELP)
     p.add_argument("prompt", nargs="*", help=argparse.SUPPRESS)
     p.add_argument("-f", "--file", dest="files", action="append", default=[],
                    help="read the prompt from FILE (repeatable)")
@@ -380,7 +464,128 @@ def build_parser():
     return p
 
 
-def gather_prompt(args, parser) -> str:
+def parse_command_line(parser, argv):
+    """Words may stand between the options: `first -e low second` is the prompt
+    "first second", the words in the order they were typed.
+
+    `--` is cut off by hand. Before 3.13 parse_intermixed_args reads what
+    follows a leading `--` as options again (`-- -e low` loses its words,
+    `-- --json` switches --json on), where parse_args took everything after it
+    as words. argparse never takes `--` as the value of an option, so the
+    first one is always the separator."""
+    if "--" in argv:
+        cut = argv.index("--")
+        argv, after = argv[:cut], argv[cut + 1:]
+    else:
+        after = []
+    args = parser.parse_intermixed_args(argv)
+    args.prompt = args.prompt + after
+    return args
+
+
+def bytes_pending(fd: int):
+    """How many bytes wait in a pipe or socket, by FIONREAD: the call neither
+    reads nor waits, so it cannot hang on a pipe that a parent keeps open.
+    None when the kernel cannot say; the caller then warns."""
+    try:
+        return struct.unpack("i", fcntl.ioctl(fd, termios.FIONREAD, struct.pack("i", 0)))[0]
+    except (OSError, ValueError, struct.error):
+        # not PromptStopped: a stop signal must go on to end the call
+        return None
+
+
+def pipe_is_at_eof_and_empty(fd: int) -> bool:
+    """True when every writer of the pipe is gone and nothing was written:
+    readable at once (select with timeout 0, never a wait) and 0 bytes waiting.
+    Anything else is False, a probe that fails included, and then c-lean warns."""
+    try:
+        if not select.select([fd], [], [], 0)[0]:
+            return False  # a writer is still there: bytes may come
+    except (OSError, ValueError):
+        return False
+    return bytes_pending(fd) == 0
+
+
+def unreadable_or_listening(fd: int, st) -> bool:
+    """A write-only fd or a listening socket has nothing to read."""
+    try:
+        if fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY:
+            return True
+        if stat.S_ISSOCK(st.st_mode):
+            with socket.socket(fileno=os.dup(fd)) as sock:
+                return bool(sock.getsockopt(socket.SOL_SOCKET,
+                                            socket.SO_ACCEPTCONN))
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def stdin_holds_data() -> bool:
+    """True when stdin may hold data that this call will not read, by kind:
+      pipe (FIFO)   unless it is at EOF and empty. A producer that is still
+                    running counts even if it has sent nothing yet, so a slow
+                    `curl | c-lean "x"` is not dropped without a word.
+      socket        only when bytes are pending. Node and Bun give a command
+                    a socketpair for stdio "pipe": Claude Code's Bash tool
+                    leaves its stdin an open, idle one when the command text
+                    holds a `<` (it appends `< /dev/null` otherwise), and that
+                    call must stay silent.
+      regular file  only when its offset is short of its size, so the last
+                    pass of `while read …; do c-lean …; done < list` is
+                    silent.
+    A tty, /dev/null and any other character device, a closed stdin, a
+    write-only fd and a listening socket are not data. A probe that fails
+    warns: a WARN costs less than silence. Nothing is read and nothing waits.
+
+    The remaining gap: a socket whose first bytes arrive after the check is
+    not warned about; a file that reports size 0 (/proc, cgroup v1 files) is
+    not either, whatever is left in it; nor is a datagram socket whose first
+    datagram is empty, though data is queued behind it (FIONREAD counts the
+    first datagram only); a named FIFO can get a new writer after EOF; and on
+    a platform where the Bash tool gives a FIFO (macOS under Bun is
+    plausible, unverified) a command with a `<` in its text would get the
+    WARN."""
+    if sys.stdin is None:
+        return False
+    try:
+        fd = sys.stdin.fileno()
+        st = os.fstat(fd)
+    except (OSError, ValueError):  # a bad fd, or a stdin object with no fd
+        return False
+    if unreadable_or_listening(fd, st):
+        return False
+    if stat.S_ISFIFO(st.st_mode):
+        return not pipe_is_at_eof_and_empty(fd)
+    if stat.S_ISSOCK(st.st_mode):
+        pending = bytes_pending(fd)
+        return pending is None or pending > 0
+    if stat.S_ISREG(st.st_mode):
+        try:
+            offset = os.lseek(fd, 0, os.SEEK_CUR)
+        except OSError:
+            offset = 0
+        return offset < st.st_size
+    return False
+
+
+def stdin_is_a_file_argument(files) -> bool:
+    """`-f /dev/stdin` (or /proc/self/fd/0) names stdin as a file: it is read
+    like `-f -`. Same device and inode as fd 0 is the test."""
+    try:
+        st0 = os.fstat(sys.stdin.fileno())
+    except (AttributeError, OSError, ValueError):
+        return False
+    for path in files:
+        try:
+            st = os.stat(os.path.expanduser(path))
+        except (OSError, ValueError):
+            continue
+        if (st.st_dev, st.st_ino) == (st0.st_dev, st0.st_ino):
+            return True
+    return False
+
+
+def gather_prompt(args) -> str:
     parts = []
     if args.prompt:
         parts.append(" ".join(args.prompt))
@@ -392,6 +597,17 @@ def gather_prompt(args, parser) -> str:
     # a closed stdin (`<&-`) is None and holds no prompt: an empty one, not a traceback
     if not parts and sys.stdin is not None and not sys.stdin.isatty():
         parts.append(B.read_stdin_arg("the prompt on stdin"))
+    elif not stdin_is_a_file_argument(args.files) and stdin_holds_data():
+        # (`-f -` needs no test of its own: stdin is then read to its end, and
+        # at its end it holds no data)
+        # Never read it here: a pipe inherited from a parent that keeps it open
+        # would hang the call. Say so instead of dropping the data in silence.
+        # Written like the WARNs of a running call: a stderr that can no longer
+        # be written must not cost the call (exit 120 and the usage-log line).
+        B._say_during_call(
+            f"{B.TOOL_NAME}: WARN stdin was not read: the prompt came from words or "
+            "-f, and stdin is only read when it is the only input. Add -f - to "
+            "include it, or redirect </dev/null to silence this")
     text = "\n\n".join(x for x in parts if x.strip())
     if not text.strip():
         B.print_err(f"{B.TOOL_NAME}: empty prompt (give text, -f FILE, or pipe stdin)")
@@ -414,6 +630,7 @@ def do_check(args) -> int:
     tool = B.TOOL_NAME + " --check"
     r = B.call_model(CHECK_PROMPT, system=CHECK_SYSTEM, model="haiku", effort="low",
                      timeout=timeout, backend=args.backend, tag="check", tool=tool, log=False)
+    stop_seen = B.stops_judged()  # a stop after these cuts the print (see finish)
     # the answer as `c-lean` would print it: every block joined, else the result
     seen = (B.splice(r.pieces)[0] if r.pieces else r.text) or ""
     probe = {"ts": B.now_iso(), "kind": "check", "exit": r.exit, "wall": bool(r.wall),
@@ -426,7 +643,9 @@ def do_check(args) -> int:
     # a probe that fails is exit 1 whatever the call gave, and the trailer, the
     # usage log and the probe record must say so
     r.exit = code
-    B.log_call(r, CHECK_PROMPT, tag="check", tool=tool)
+    # its WARN goes with the trailer, as every line after the call does: a
+    # stop must not wait for a stderr that is not read (see finish)
+    B.log_call(r, CHECK_PROMPT, tag="check", tool=tool, say=say)
     probe["exit"] = code
     # Before anything is printed, as the usage-log line is: a stream that can
     # no longer be written must not cost the record. A record that cannot be
@@ -436,7 +655,7 @@ def do_check(args) -> int:
         warn = write_probe(probe_path, probe)
         if warn:
             say.append(warn)
-    return finish(code, B.trailer(r, tool), say)
+    return finish(code, B.trailer(r, tool), say, seen=stop_seen)
 
 
 def write_probe(path, probe):
@@ -445,18 +664,22 @@ def write_probe(path, probe):
     a file that is already there keeps its mode."""
     try:
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = B.open_record_file(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL)
             made = True
         except FileExistsError:
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+            fd = B.open_record_file(path, os.O_WRONLY | os.O_APPEND)
             made = False
-        with os.fdopen(fd, "a", encoding="utf-8", errors="backslashreplace") as f:
+        try:
             if made:
                 os.fchmod(fd, 0o600)  # a umask can take bits off the mode given to open
-            f.write(json.dumps(probe, ensure_ascii=False) + "\n")
+            # O_NONBLOCK as in the usage log: a FIFO with no reader, or one
+            # that does not drain, gives a WARN, not a hang.
+            B.write_record(fd, json.dumps(probe, ensure_ascii=False) + "\n")
+        finally:
+            os.close(fd)
     except Exception as e:  # noqa: BLE001 — the record must not change the exit or end in a traceback
         return (f"{B.TOOL_NAME} --check: WARN could not write the probe record to %s: %s"
-                % (path, getattr(e, "strerror", None) or e))
+                % (path, B._fifo_reason(e, path)))
     return None
 
 
@@ -473,7 +696,7 @@ def check_verdict(r, seen):
     if not r.ok:
         fails.append("call failed: %s" % r.err)
     elif not seen.strip():
-    # --check exists to prove the pipe works before a paid call; an empty
+        # --check exists to prove the pipe works before a paid call; an empty
         # answer is the pipe not working, and it used to print OK.
         fails.append("empty answer — not a result")
     if r.tokens_unknown or (r.ok and r.total_in == 0):
@@ -544,26 +767,53 @@ def to_keep(r) -> list:
     return r.blocks if any(b.strip() for b in r.blocks) else []
 
 
+def json_text(r):
+    """The `--json` form of the CLI's result document: the document as the CLI
+    gave it; its `result` is the last text block only, so the blocks of a joined
+    answer ride along under one key. No key when nothing was joined: the
+    document then is what was printed. None when the document cannot be dumped:
+    Python 3.12 indents with a pure-Python encoder that runs out of stack on a
+    document nested ~1000 deep (measured on 3.12.3), so it is dumped again
+    without `indent`. The compact dump has not been seen to fail where
+    `json.loads` read the document, so giving up (nothing to print, never a
+    traceback) is defensive only."""
+    doc = dict(r.raw, **{B.PIECES_KEY: r.pieces}) if r.pieces else r.raw
+    for indent in (2, None):
+        try:
+            return json.dumps(doc, ensure_ascii=False, indent=indent) + "\n"
+        except RecursionError:
+            pass
+    return None
+
+
 def settle(args, r, schema, timeout, limit_source):
     """What the call comes to, with nothing printed yet: (exit code, lines for
     stderr after the trailer, text for stdout or None, why its text blocks are
     not all on stdout or None when they are)."""
     say = [f"{B.TOOL_NAME}: WARN %s" % r.linger] if r.linger else []
+    # --json is asked for most when the call went wrong (cut off? refused? a
+    # wall?): whenever a `result` document was received it is printed, whatever
+    # the outcome. None when there is none (killed before any `result`).
+    doc_out = json_text(r) if args.json and isinstance(r.raw, dict) else None
     if r.wall:
         say.append(f"{B.TOOL_NAME}: LIMIT WALL — stop and wait for the window to reset. %s" % r.err)
-        return B.EXIT_WALL, say, None, r.why or "the call hit the limit wall"
+        return B.EXIT_WALL, say, doc_out, r.why or "the call hit the limit wall"
     if r.interrupted:
         say.append(f"{B.TOOL_NAME}: stopped — %s" % (r.err or "interrupted"))
-        return r.exit or B.EXIT_FAIL, say, None, r.why or "the call was stopped by a signal"
+        return r.exit or B.EXIT_FAIL, say, doc_out, r.why or "the call was stopped by a signal"
     if r.exit == B.EXIT_TIMEOUT:
         say.append(f"{B.TOOL_NAME}: %s" % B.timeout_message(timeout, limit_source, r.finished,
                                                   len(to_keep(r))))
-        return B.EXIT_TIMEOUT, say, None, r.why or "the call was killed by the timeout"
+        return B.EXIT_TIMEOUT, say, doc_out, r.why or "the call was killed by the timeout"
     if not r.ok:
         say.append(f"{B.TOOL_NAME}: %s" % (r.err or "failed"))
-        return r.exit or B.EXIT_FAIL, say, None, r.why or "the call failed"
+        return r.exit or B.EXIT_FAIL, say, doc_out, r.why or "the call failed"
     if r.warn:
         say.append(f"{B.TOOL_NAME}: WARN %s" % r.warn)
+    if args.json and doc_out is None:
+        say.append(f"{B.TOOL_NAME}: --json: the document of the CLI is nested too deep to "
+                   "print — not a result")
+        return B.EXIT_FAIL, say, None, "the document of the CLI could not be printed"
     # What goes to stdout: every text block of an answer that came in several,
     # or the `result` of the document, which is the last one.
     answer, seams = B.splice(r.pieces) if r.pieces else (r.text, [])
@@ -595,16 +845,15 @@ def settle(args, r, schema, timeout, limit_source):
         # what it is needed to explain (cut off? refused? a wall?). Report the
         # failure, but do not swallow the thing that was asked for.
 
+    # Under --schema a call with no structured output is a failure with or
+    # without --json (--json only changes what is printed with it). An empty
+    # answer was reported above, as without --json.
+    if schema and r.structured is None and not empty:
+        say.append(f"{B.TOOL_NAME}: --schema given but the CLI returned no structured_output")
+        return B.EXIT_FAIL, say, (doc_out if args.json else r.text + "\n"), unprinted
     if args.json:
-        # the document as the CLI gave it; its `result` is the last text block
-        # only, so the blocks of a joined answer ride along under one key. No
-        # key when nothing was joined: the document then is what was printed.
-        doc = dict(r.raw, **{B.PIECES_KEY: r.pieces}) if r.pieces else r.raw
-        out = json.dumps(doc, ensure_ascii=False, indent=2) + "\n"
+        out = doc_out
     elif schema:
-        if r.structured is None:
-            say.append(f"{B.TOOL_NAME}: --schema given but the CLI returned no structured_output")
-            return B.EXIT_FAIL, say, r.text + "\n", unprinted
         out = json.dumps(r.structured, ensure_ascii=False) + "\n"
     else:
         out = answer + "\n"
@@ -635,7 +884,7 @@ def keep(r, prompt, reason) -> str:
             "printed, NOT a result" % (size, path))
 
 
-def write_end(err=None, out=None) -> bool:
+def write_end(err=None, out=None, taken=None) -> bool:
     """Write `err` to stderr, then `out` to stdout; False when one of them can
     no longer be written (a pipe whose reader has exited, a closed terminal, a
     full disk, a stdout closed from the start). Nothing more is written then.
@@ -647,25 +896,155 @@ def write_end(err=None, out=None) -> bool:
     `out` goes out as UTF-8 bytes whatever the encoding of stdout: under an
     ASCII one, a non-ASCII answer ended in a UnicodeEncodeError traceback and
     was lost. A lone surrogate (half of a pair the model wrote) goes out as
-    the escape the saved file has. stderr keeps its own encoding: Python
-    writes it with backslashreplace, so no text fails there."""
+    the escape the saved file has. stderr keeps its own encoding, with
+    backslashreplace as Python writes it, so no text fails there.
+
+    A stop while this writes (B.printing) raises B.OutputStopped out of it;
+    taken then says what stderr took of err_bytes(err) (see put_exact)."""
     stream = None
     try:
         if err is not None and sys.stderr is not None:
             stream = sys.stderr
-            stream.write(err)
-            stream.flush()
+            put_exact(stream, err_bytes(err), new_taken() if taken is None else taken)
         if out is not None:
             stream = sys.stdout
             if stream is None:
                 return False
-            stream.flush()  # whatever the text layer holds goes first
-            stream.buffer.write(out.encode("utf-8", "backslashreplace"))
-            stream.buffer.flush()
+            put(stream, out.encode("utf-8", "backslashreplace"))
     except OSError:
         silence(stream)
         return False
     return True
+
+
+def put(stream, data) -> None:
+    """Write every byte of `data` to the buffer under `stream`, after what its
+    text layer holds, and flush it.
+
+    Under `python -u` or PYTHONUNBUFFERED the buffer is the raw file, and one
+    write() of it can take part of the bytes: the pipe of a reader that exits
+    mid-answer, a signal. The rest was dropped and the run ended with exit 0.
+    A file the parent left O_NONBLOCK takes no more while its reader is slow
+    (None from the raw file, BlockingIOError from a buffered one): that is
+    waited for, as a blocking file waits, and it cost a good answer exit 120."""
+    stream.flush()
+    buf = stream.buffer
+    view = memoryview(data)
+    while True:
+        try:
+            while view:
+                n = buf.write(view)
+                if n is None:
+                    raise BlockingIOError(errno.EAGAIN, "no room", 0)
+                view = view[n:]
+            buf.flush()
+            return
+        except BlockingIOError as e:
+            view = view[e.characters_written:]  # what a buffered file took is its own now
+            select.select([], [buf], [], WAIT_STEP)  # a stop another thread took runs after it
+
+
+def err_bytes(text) -> bytes:
+    """`text` as stderr writes it: its own encoding, with backslashreplace."""
+    return text.encode(getattr(sys.stderr, "encoding", None) or "utf-8", "backslashreplace")
+
+
+def new_taken() -> dict:
+    """What a file took of a put_exact: `took` bytes, and `lost` when the
+    rest was given up on (see put_exact)."""
+    return {"took": 0, "lost": False}
+
+
+class Stalled(Exception):
+    """stderr took nothing more in time: a write held back the stops while a
+    stop waited, or the time a bounded write had ran out."""
+
+
+def put_exact(stream, data, taken, deadline=None) -> None:
+    """Write every byte of `data` to the file under `stream`, past its buffer
+    (after what it holds), and add to taken["took"] each byte the file took.
+    `deadline` (time.monotonic()) bounds the whole write: Stalled after it.
+
+    A stop that cuts this must know what is left to send: Python's buffer
+    hides it. A write it took whole may still sit in it unwritten, and a
+    raw write under PIPE_BUF bytes that a signal cuts takes none, so the
+    trailer and its lines (a SAVED path among them) were lost.
+
+    The wait for room is where a stop cuts this. The write comes after it,
+    a piece of at most PIPE_BUF bytes, with the stops held (B.hold_stops): a
+    stop handled between the return of the write and the count lost the
+    count, and the trailer was printed twice. Room seen by select() does not
+    promise that the write will not block (another writer of the same pipe
+    takes it first, a terminal stalls), and a write that blocked with the
+    stops held could be ended by SIGKILL alone: SIGALRM looks every
+    WAIT_STEP seconds whether a stop waits, and once the stops have been
+    held for WRITE_WATCHDOG seconds and one does, the write is given up on
+    (taken["lost"]), never sent again, and the stop goes on. A look in
+    short steps sees a stop handled after SIGALRM (one another thread took,
+    or a signal of a higher number) at the next step, not a whole
+    WRITE_WATCHDOG later; the wait for room is cut in such steps too.
+    A file left O_NONBLOCK is waited for, as in put(), and so is what the
+    buffer of `stream` still holds (a line a stop cut), within `deadline`:
+    a flush that waited for room before the timer was armed held the stop
+    lines, and the run, past it; a full O_NONBLOCK one cost exit 120."""
+    fd = stream.fileno()
+    view = memoryview(data)
+    held = [0.0]  # since when the stops are held, 0 when they are not
+
+    def wait():
+        """What to arm the timer with now, None for nothing."""
+        secs = WAIT_STEP if held[0] else None
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            secs = left if secs is None else min(secs, left)
+        return secs
+
+    def arm():
+        secs = wait()
+        if secs is not None:
+            if secs <= 0:
+                raise Stalled()
+            signal.setitimer(signal.ITIMER_REAL, secs)
+
+    def ring(signum, frame):  # noqa: ARG001
+        if held[0] and B.stop_held() and time.monotonic() - held[0] >= WRITE_WATCHDOG:
+            raise Stalled()
+        arm()  # no stop waits, or not for long yet: wait on
+
+    old = signal.signal(signal.SIGALRM, ring)
+    try:
+        while True:  # what the buffer holds goes first
+            arm()
+            try:
+                stream.flush()
+                break
+            except BlockingIOError:
+                select.select([], [fd], [], WAIT_STEP)
+        while view:
+            arm()
+            if not select.select([], [fd], [], WAIT_STEP)[1]:
+                continue
+            B.hold_stops()
+            try:
+                held[0] = time.monotonic()
+                arm()
+                try:
+                    n = os.write(fd, view[:select.PIPE_BUF])
+                except BlockingIOError:  # another writer took the room first
+                    n = 0
+                taken["took"] += n
+            except Stalled:
+                taken["lost"] = True
+                raise
+            finally:
+                held[0] = 0.0
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                B.release_stops()  # a stop that came meanwhile raises here
+            view = view[n:]
+    finally:
+        # The timer is c-lean's alone: it is stopped here, not restored.
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, signal.SIG_DFL if old is None else old)
 
 
 def silence(stream) -> None:
@@ -684,20 +1063,80 @@ def silence(stream) -> None:
         pass
 
 
-def finish(code, trailer, say, out=None) -> int:
+def finish(code, trailer, say, out=None, save=None, seen=None) -> int:
     """Print the end of a run, the trailer and the lines of `say` on stderr
     and then the answer on stdout, and return the exit code: `code`, or 120
-    when a stream could no longer be written (see Exit 120 in the help)."""
-    if not write_end(trailer + "".join(line + "\n" for line in say), out):
-        return B.EXIT_STREAM
+    when a stream could no longer be written (see Exit 120 in the help), or
+    128+N when stop signal N came after the call, before this was all printed.
+
+    `seen` is B.stops_judged(): a stop after the ones the call was judged
+    with, and before the print, counts as one during the print. It was only
+    recorded, and a reader that does not read then held the print, and the
+    run, for ever. `save(reason)` keeps the text blocks of the call and
+    returns the line that says so; None when they are kept already or there
+    are none."""
+    err = trailer + "".join(line + "\n" for line in say)
+    taken = new_taken()  # what stderr took of err
+    try:
+        with B.printing():
+            if seen is not None and B.stop_count() != seen:
+                raise B.OutputStopped()
+            if not write_end(err, taken=taken):
+                return B.EXIT_STREAM
+            if out is not None and not write_end(out=out):
+                return B.EXIT_STREAM
+    except (B.OutputStopped, Stalled):
+        # what of the trailer and its lines stderr did not take goes first,
+        # unless stderr was given up on
+        rest = (None if taken["lost"] or sys.stderr is None
+                else err_bytes(err)[taken["took"]:])
+        return stopped_printing(rest, save, answer=out is not None)
     return code
+
+
+def stopped_printing(rest, save, answer=True) -> int:
+    """The end of a run that a stop cut after the call, before its end was
+    all printed: stdout may hold part of the answer, so the run ends with
+    128+N, never with the exit of the call; the text blocks are kept as for
+    an answer that was not printed. `rest` is the bytes of the trailer and
+    its lines that stderr had yet to take, all of them when the stop came
+    before them; None when stderr was given up on, and nothing more goes
+    there. `answer`: an answer was to go to stdout (not under --check)."""
+    signum = B.last_stop()  # the stop that cut the print, not the first one
+    lines = [f"{B.TOOL_NAME}: stopped — signal %d came after the call, before the end of the run "
+             "was all printed" % signum
+             + (": stdout may hold part of the answer, NOT a result" if answer else "")]
+    if save is not None:
+        lines.append(save("the run was stopped by signal %d after the call, before its answer "
+                          "was all printed" % signum))
+    if rest is not None:
+        write_bounded(rest + err_bytes("".join(line + "\n" for line in lines)))
+    # what the buffers still hold must not block the interpreter on the way
+    # out, with every stop signal ignored by then
+    silence(sys.stdout)
+    silence(sys.stderr)
+    return B.SIGNAL_EXIT_BASE + signum
+
+
+def write_bounded(data) -> None:
+    """Write the bytes `data` to stderr, waiting at most STOP_LINES_WAIT
+    seconds for them to be taken. A stop must end the run: a stderr that is
+    not read (a full pipe, or the one pipe of both streams under 2>&1) held
+    these lines, and the run, until a second stop. What is not taken by then
+    is lost."""
+    if sys.stderr is None:
+        return
+    try:
+        put_exact(sys.stderr, data, new_taken(), deadline=time.monotonic() + STOP_LINES_WAIT)
+    except (Stalled, ValueError, OSError):
+        pass
 
 
 def main(argv=None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parse_command_line(parser, sys.argv[1:] if argv is None else argv)
     if args.help:
-        return B.EXIT_OK if write_end(out=__doc__) else B.EXIT_STREAM
+        return B.EXIT_OK if write_end(out=HELP) else B.EXIT_STREAM
     if args.effort is not None and not args.check:  # --check ignores -e (see do_check)
         effort = args.effort.lower()
         if effort not in B.EFFORTS:
@@ -732,7 +1171,7 @@ def main(argv=None) -> int:
         # A FIFO given to --system-file or --schema can wait for its writer as
         # long as one given to -f: a stop must end each of these reads at once.
         with B.reading_prompt():
-            prompt = gather_prompt(args, parser)
+            prompt = gather_prompt(args)
             system = gather_system(args)
             schema = B.read_text_arg(args.schema) if args.schema is not None else None
     except B.PromptStopped:
@@ -749,18 +1188,25 @@ def main(argv=None) -> int:
     r = B.call_model(prompt, system=system, model=args.model, effort=args.effort,
                      schema=schema, timeout=timeout, backend=args.backend,
                      tag=args.tag, tool=B.TOOL_NAME, log=False)
+    stop_seen = B.stops_judged()  # a stop after these cuts the print (see finish)
     code, say, out, unprinted = settle(args, r, schema, timeout, limit_source)
     # Some exits are decided here, not by the call (an empty answer, a missing
     # structured output): the trailer and the usage log must say this one.
     r.exit = code
-    B.log_call(r, prompt, tag=args.tag, tool=B.TOOL_NAME)
+    # its WARN goes with the trailer, as every line after the call does: a
+    # stop must not wait for a stderr that is not read (see finish)
+    B.log_call(r, prompt, tag=args.tag, tool=B.TOOL_NAME, say=say)
     # The file comes first, before a single line is printed: a stream that can
     # no longer be written (see Exit 120 in the help) must not cost the text too.
     if unprinted and to_keep(r):
         say.append(keep(r, prompt, unprinted))
     if B.cap_over_note(r):
         say.append(f"{B.TOOL_NAME}: WARN %s" % B.cap_over_note(r))
-    return finish(code, B.trailer(r), say, out)
+    # A stop while the answer is printed leaves part of it on stdout at most:
+    # its text blocks are kept then, as those of an answer not printed are.
+    save = (None if unprinted or out is None or not to_keep(r)
+            else lambda reason: keep(r, prompt, reason))
+    return finish(code, B.trailer(r), say, out, save, seen=stop_seen)
 
 
 if __name__ == "__main__":

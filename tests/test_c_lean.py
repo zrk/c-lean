@@ -16,11 +16,14 @@ replays those breakages on a throwaway copy.
 import atexit
 import contextlib
 import hashlib
+import itertools
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -30,6 +33,7 @@ import time
 import types
 import unittest
 from datetime import datetime, timezone
+from typing import Any
 from unittest import mock
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +46,24 @@ os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 # writer of the files of unprinted text
 sys.path.insert(0, BIN)
 import c_lean_core as B  # noqa: E402
+
+# Every child that does not get a stdin of its own inherits ours, and c-lean
+# warns about a pipe with bytes waiting on stdin: the suite must not depend on
+# what the runner (a CI step, `sleep 9 | python3 tests/test_c_lean.py`) left there.
+# Our own sys.stdin keeps the runner's stdin (a dup of the original fd 0), so
+# that `breakpoint()` in a terminal still works; only fd 0 itself, which the
+# children inherit, becomes /dev/null.
+_runner_stdin: int | None
+try:
+    _runner_stdin = os.dup(0)
+except OSError:  # a runner started with stdin closed
+    _runner_stdin = None
+_devnull = os.open(os.devnull, os.O_RDONLY)
+os.dup2(_devnull, 0)
+if _devnull != 0:
+    os.close(_devnull)
+if _runner_stdin is not None and sys.stdin is not None:
+    sys.stdin = os.fdopen(_runner_stdin, "r", encoding="utf-8", errors="replace")
 
 CLI = os.path.join(BIN, B.TOOL_NAME)
 FAKE = os.path.join(TESTS, "fake_claude.py")
@@ -159,8 +181,39 @@ if os.environ.get("PROBE_NOW"):
     mod.B.save_blocks = lambda *a, **k: real(*a, now=now, **k)
 sys.exit(mod.main(sys.argv[2:]))
 '''
+# Python 3.12 indents with a pure-Python encoder that runs out of stack on a document
+# nested ~1500 deep; on the other versions that cannot be had cheaply, so the dump of
+# the result document raises RecursionError when it is given an `indent` (PROBE_DEEP=
+# indent) or whatever it is given (PROBE_DEEP=all).
+DEEP_PROBE = r'''
+import importlib.machinery, importlib.util, json, os, sys
+loader = importlib.machinery.SourceFileLoader("c_lean_cli", sys.argv[1])
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("c_lean_cli", loader))
+loader.exec_module(mod)
+real, how = json.dumps, os.environ["PROBE_DEEP"]
+
+
+def dumps(obj, *a, **k):
+    if isinstance(obj, dict) and obj.get("type") == "result" and (
+            how == "all" or k.get("indent") is not None):
+        raise RecursionError("maximum recursion depth exceeded")
+    return real(obj, *a, **k)
+
+
+json.dumps = dumps
+sys.exit(mod.main(sys.argv[2:]))
+'''
 # every signal that stops a run: Ctrl-C, `kill`, a closed terminal
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+# extra_env for the tool's two ways of writing stdout: buffered (the default
+# of child_env), and the raw file of `python -u` and PYTHONUNBUFFERED
+# The line of a stop after the call, before the end of the run was all
+# printed; its tail only when an answer was to go to stdout.
+STOP_LINE = ("c-lean: stopped — signal %d came after the call, before the end of the run "
+             "was all printed")
+STOP_LINE_STDOUT = ": stdout may hold part of the answer, NOT a result"
+UNBUFFERED_MODES = (("buffered", {"PYTHONUNBUFFERED": None}),
+                    ("unbuffered", {"PYTHONUNBUFFERED": "1"}))
 # the names that must never reach the child: keys, tokens, transport switches,
 # a foreign config dir, the thinking cap, and one plain unrelated name
 LEAKY_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_HOST",
@@ -171,6 +224,12 @@ LEAKY_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_HOST",
 
 def child_env(mode="ok", state=None, extra_env=None):
     env = dict(os.environ)
+    # The tool runs buffered, as a plain `c-lean` does and as on the CI
+    # runners, whatever the shell of the suite exports: under PYTHONUNBUFFERED
+    # stdout.buffer is the raw file, whose write() may be short, and a test
+    # passed or failed on the caller's environment. A test of that mode asks
+    # for it (UNBUFFERED_MODES).
+    env.pop("PYTHONUNBUFFERED", None)
     env["C_LEAN_CLAUDE_BIN"] = FAKE
     env["C_LEAN_FAKE_MODE"] = mode
     env["C_LEAN_FAKE_STATE"] = state or tempfile.mkdtemp(prefix="c-lean-state-")
@@ -205,9 +264,47 @@ def ignore_sighup():
 def run(cmd, mode="ok", state=None, extra_env=None, stdin="", cwd=None):
     env = child_env(mode, state, extra_env)
     # a hang is a finding, not a reason for the suite to wait for ever
+    # Nothing to say on stdin means /dev/null, as inside Claude Code's Bash tool:
+    # an empty pipe is a pipe, and a call with words would WARN about it
+    # (see stdin_holds_data in bin/c-lean).
+    feed: dict[str, Any] = {"input": stdin} if stdin else {"stdin": subprocess.DEVNULL}
     p = subprocess.run([sys.executable] + cmd, capture_output=True, text=True, env=env,
-                       input=stdin, cwd=cwd, timeout=180)
+                       cwd=cwd, timeout=180, **feed)
     return p
+
+
+def pid_alive(pid):
+    """Is `pid` a live process? A zombie (state Z) or a dead one (X) is not:
+    kill(pid, 0) succeeds for a zombie, and where PID 1 reaps orphans lazily
+    (Docker without --init, some VMs) a killed grandchild sits in Z for a while.
+    An unknown state counts as alive: a "left alive" assert must fail loudly
+    rather than pass because `ps` was refused by a sandbox or is missing."""
+    pid = int(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass  # EPERM: it exists, just is not ours
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as f:
+            # "pid (comm) S ...": comm may hold spaces and parens, so cut at the last ")".
+            state = f.read().rpartition(b")")[2].split()[0].decode("ascii", "replace")
+    except (FileNotFoundError, ProcessLookupError):
+        # ESRCH: reaped between the open and the read of its stat file
+        if os.path.isdir("/proc/self"):
+            return False  # Linux, and it exited since the kill above
+        state = None
+    except (OSError, IndexError):
+        state = None
+    if state is None:  # no /proc (macOS)
+        try:
+            out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                                 text=True).stdout.split()
+        except OSError:
+            out = []
+        state = out[0] if out and out[0][0].isupper() else None
+    return state is None or state[0] not in "ZX"
 
 
 class Case(unittest.TestCase):
@@ -283,11 +380,42 @@ class Case(unittest.TestCase):
 
 
     def alive(self, pid):
+        return pid_alive(pid)
+
+    def test_a_state_that_cannot_be_read_counts_as_alive(self):
+        """No /proc and a `ps` that is refused, absent, silent or garbled must not
+        read as "dead": every "left alive" assert would then pass on nothing."""
+        me = os.getpid()
+        def ps(out):
+            return types.SimpleNamespace(stdout=out)
+        for what, run in (("ps refused", mock.Mock(side_effect=PermissionError)),
+                          ("ps absent", mock.Mock(side_effect=FileNotFoundError)),
+                          ("ps silent", mock.Mock(return_value=ps(""))),
+                          ("ps garbled", mock.Mock(return_value=ps("???\n")))):
+            with mock.patch("builtins.open", side_effect=PermissionError), \
+                 mock.patch.object(subprocess, "run", run):
+                self.assertTrue(pid_alive(me), "state unknown (%s) must count as alive" % what)
+        with mock.patch("builtins.open", side_effect=PermissionError), \
+             mock.patch.object(subprocess, "run", return_value=ps("Z+\n")):
+            self.assertFalse(pid_alive(me), "ps reporting a zombie must count as dead")
+        if os.path.isdir("/proc/self"):
+            with mock.patch("builtins.open", side_effect=ProcessLookupError), \
+                 mock.patch.object(subprocess, "run", return_value=ps("")):
+                self.assertFalse(pid_alive(me), "a process reaped while its stat file "
+                                                "was being read must count as dead")
+
+    def test_a_zombie_is_not_alive(self):
+        """The liveness check the process-tree tests rely on: a killed child that
+        nobody has reaped yet is a zombie, and kill(pid, 0) still succeeds for it."""
+        kid = subprocess.Popen(["sleep", "60"])
         try:
-            os.kill(int(pid), 0)
-            return True
-        except OSError:
-            return False
+            self.assertTrue(self.alive(kid.pid), "a running process must count as alive")
+            kid.kill()  # not waited for, so it stays a zombie of ours
+            self.wait_for(lambda: not self.alive(kid.pid), secs=5, what="the zombie to count as dead")
+            os.kill(kid.pid, 0)  # still in the process table, which is the point
+        finally:
+            kid.wait()
+        self.assertFalse(self.alive(kid.pid), "a reaped process is gone")
 
     def wait_for(self, fn, secs=20, what="condition"):
         t0 = time.time()
@@ -449,6 +577,18 @@ class Case(unittest.TestCase):
         for stale in ("default 600 s)", " 600 s", "1800 s", "3000 s"):
             self.assertNotIn(stale, s.stdout, "c-lean -h must not promise the old timeout: %s" % stale)
 
+    def test_help_and_a_call_work_under_python_optimize_2(self):
+        # python -OO (PYTHONOPTIMIZE=2) strips docstrings: the help must not come from __doc__
+        plain = run([CLI, "-h"], state=self.state, extra_env=dict(self.env, PYTHONOPTIMIZE=None))
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        opt = run([CLI, "-h"], state=self.state, extra_env=dict(self.env, PYTHONOPTIMIZE="2"))
+        self.assertEqual(opt.returncode, 0, "c-lean -h must work under python -OO: " + opt.stderr)
+        self.assertEqual(opt.stdout, plain.stdout, "c-lean -h must print the same help under python -OO")
+        p = run([CLI, "-m", "haiku", "x"], mode="single", state=self.state,
+                extra_env=dict(self.env, PYTHONOPTIMIZE="2"))
+        self.assertEqual(p.returncode, 0, "c-lean must make its call under python -OO: " + p.stderr)
+        self.assertIn("ECHO:x", p.stdout)
+
     def test_trailer_prints_think_inside_out(self):
         """`think` is part of `out`; printed side by side the two invited a sum
         that overstated the spend."""
@@ -491,12 +631,9 @@ class Case(unittest.TestCase):
         parent, kid = open(os.path.join(self.state, "hang.pids")).read().split()
         alive = []
         for pid in (parent, kid):
-            try:
-                os.kill(int(pid), 0)
+            if self.alive(pid):
                 alive.append(pid)
                 os.kill(int(pid), 9)
-            except OSError:
-                pass
         self.assertEqual(alive, [], "timeout left %s alive (child or grandchild)" % alive)
 
 
@@ -591,6 +728,91 @@ class Case(unittest.TestCase):
         env = json.load(open(os.path.join(self.state, "env.json")))
         got = sorted(k for k in ("HTTPS_PROXY", "NODE_EXTRA_CA_CERTS", "no_proxy") if k in env)
         self.assertEqual(got, [], "these reached the child: %s" % got)
+
+    OPT_OUTS = ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY",
+                "DO_NOT_TRACK", "DISABLE_ERROR_REPORTING")
+
+    def test_telemetry_opt_outs_reach_the_child(self):
+        """The user's opt-outs only reduce traffic. The CLAUDE_ deny prefix used to
+        eat CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC and the others never got in, so
+        an opt-out in the shell was lost. They pass when set, and only then."""
+        p = run([CLI, "-m", "haiku", "--system", "S", "x"], mode="envdump", state=self.state,
+                extra_env=dict(self.env, **{n: "opt-" + n for n in self.OPT_OUTS}))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        env = json.load(open(os.path.join(self.state, "env.json")))
+        for n in self.OPT_OUTS:
+            self.assertEqual(env.get(n), "opt-" + n, "the opt-out %s must reach the child" % n)
+        self.assertNotIn("WARN C_LEAN_PASS_ENV", p.stderr)
+        # the runner's own environment may carry an opt-out: take them out
+        p = run([CLI, "-m", "haiku", "--system", "S", "x"], mode="envdump", state=self.state,
+                extra_env=dict(self.env, **{n: None for n in self.OPT_OUTS}))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        env = json.load(open(os.path.join(self.state, "env.json")))
+        got = [n for n in self.OPT_OUTS if n in env]
+        self.assertEqual(got, [], "c-lean must never set an opt-out itself: %s" % got)
+
+    def test_refused_pass_env_names_warn_and_stay_out(self):
+        """The opt-out exception is exact names: auth and routing names stay refused
+        even when listed, with one WARN that names the variable but not its value."""
+        bad = {"CLAUDE_CODE_USE_BEDROCK": "sekrit-1", "CLAUDE_CODE_OAUTH_TOKEN": "sekrit-2",
+               "ANTHROPIC_BASE_URL": "http://sekrit-3.invalid"}
+        p = run([CLI, "-m", "haiku", "--system", "S", "x"], mode="envdump", state=self.state,
+                extra_env=dict(self.env, C_LEAN_PASS_ENV=",".join(bad), **bad))
+        # the fake refuses to start with an auth/routing name: say what that means
+        self.assertNotIn("banned env var", p.stderr, "a refused name reached the child")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        env = json.load(open(os.path.join(self.state, "env.json")))
+        got = sorted(k for k in bad if k in env)
+        self.assertEqual(got, [], "these reached the child: %s" % got)
+        warns = [l for l in p.stderr.splitlines() if "WARN" in l and "PASS_ENV" in l]
+        for n in bad:
+            self.assertEqual(len([l for l in warns if n in l]), 1,
+                             "one WARN naming %s expected: %s" % (n, p.stderr))
+        self.assertNotIn("sekrit", p.stderr, "a value must never be printed")
+
+    def test_pass_env_entry_with_a_value_never_echoes_it(self):
+        """`C_LEAN_PASS_ENV='ANTHROPIC_API_KEY=sk-...'` is a slip that put a key on
+        stderr in the WARN. Only the part before the = may be shown."""
+        p = run([CLI, "-m", "haiku", "--system", "S", "x"], mode="envdump", state=self.state,
+                extra_env=dict(self.env, C_LEAN_PASS_ENV="ANTHROPIC_API_KEY=sk-ant-SECRET123"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for stream in (p.stdout, p.stderr):
+            self.assertNotIn("SECRET123", stream, "the value after = must never be printed")
+        self.assertIn("not a variable name", p.stderr)
+        self.assertIn("ANTHROPIC_API_KEY", p.stderr)
+        # a pasted key has no name at all: not even its start may be echoed
+        p = run([CLI, "-m", "haiku", "--system", "S", "x"], mode="envdump", state=self.state,
+                extra_env=dict(self.env, C_LEAN_PASS_ENV="HOME,sk-ant-api03-SECRET,=SECRET2"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for stream in (p.stdout, p.stderr):
+            for part in ("sk-ant", "api03", "SECRET"):
+                self.assertNotIn(part, stream, "no part of a pasted key may be printed")
+        self.assertIn("entry #2 is not a variable name", p.stderr)
+
+    def test_pass_env_entry_that_is_not_a_name_is_not_passed(self):
+        """The WARN says such an entry "is not passed": it must be true. MY-VAR and
+        my.var are set and listed, and used to reach the child under that WARN."""
+        p = run([CLI, "-m", "haiku", "--system", "S", "x"], mode="envdump", state=self.state,
+                extra_env=dict(self.env, C_LEAN_PASS_ENV="MY-VAR,my.var,GOOD_VAR",
+                               **{"MY-VAR": "v1", "my.var": "v2", "GOOD_VAR": "v3"}))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        env = json.load(open(os.path.join(self.state, "env.json")))
+        got = sorted(k for k in ("MY-VAR", "my.var") if k in env)
+        self.assertEqual(got, [], "an entry that is not a name reached the child: %s" % got)
+        self.assertEqual(env.get("GOOD_VAR"), "v3", "a plain name must still pass")
+        for pos in (1, 2):
+            warns = [l for l in p.stderr.splitlines() if "entry #%d is not a variable name" % pos in l]
+            self.assertEqual(len(warns), 1, "one WARN for entry #%d expected: %s" % (pos, p.stderr))
+
+    def test_help_and_readme_say_which_opt_outs_pass(self):
+        p = run([CLI, "-h"], state=self.state, extra_env=self.env)
+        text = " ".join(p.stdout.split())
+        readme = " ".join(open(os.path.join(os.path.dirname(TESTS), "README.md")).read().split())
+        for where, t in (("help", text), ("README", readme)):
+            for n in self.OPT_OUTS:
+                self.assertIn(n, t, "%s must name the opt-out %s" % (where, n))
+            self.assertIn("settings.json", t, where)
+            self.assertIn("export them in the shell", t, where)
 
     def test_trailer_names_the_binary_it_used(self):
         """The binary comes from C_LEAN_CLAUDE_BIN or the parent's PATH, so a swap
@@ -812,8 +1034,9 @@ if _dir:
 
 
     def test_single_sighup_to_the_process_group_stops_the_call(self):
-        """SIGHUP to the whole job stops the call with exit 128+1, whether
-        the CLI exits first or the wrapper's SIGKILL reaches it first."""
+        """SIGHUP to the whole job stops the call with exit 128+1. The fake
+        and its child ignore SIGHUP, so only c-lean's own kill of the tree
+        can end them; a leaked child fails the test."""
         proc = self.start_call([CLI, "-m", "haiku", "--system", "S", "hello"],
                                 mode="sleeper", new_session=True)
         try:
@@ -1128,6 +1351,110 @@ if _dir:
                          "apart from c_lean_pieces the document must be the CLI's own")
         one = json.loads(self.call("single", "--json").stdout)
         self.assertNotIn("c_lean_pieces", one, "an ordinary call has no pieces to carry")
+
+    def test_json_prints_the_document_whatever_the_outcome(self):
+        """--json is asked for most when the call went wrong. All but
+        emptysingle (which printed at base) used to leave stdout empty; the
+        exit code is the one the call has."""
+        for mode, code in (("maxtokens", 1), ("terminal", 1), ("fail", 1), ("limit", 75),
+                           ("contfail", 1), ("emptysingle", 1)):
+            with self.subTest(mode=mode):
+                p = self.call(mode, "--json")
+                self.assertEqual(p.returncode, code, p.stderr)
+                self.assertTrue(p.stdout.strip(), "--json must print the document of a call "
+                                "that failed in mode %s (stdout None on failure)" % mode)
+                doc = json.loads(p.stdout)
+                self.assertIsInstance(doc, dict)
+                plain = json.loads(self.fake(mode, "json"))
+                for key in ("is_error", "subtype"):
+                    self.assertEqual(doc.get(key), plain.get(key),
+                                     "the document must be the CLI's own (%s)" % key)
+                if mode in ("fail", "limit", "contfail"):
+                    self.assertTrue(doc["is_error"], mode)
+                if mode == "fail":
+                    self.assertEqual(doc["subtype"], "error")
+                # the same stdout as without --json, apart from the document
+                self.assertEqual(self.call(mode).returncode, code)
+
+    def test_json_of_a_document_the_encoder_cannot_indent_is_printed_compact(self):
+        """A document nested too deep for the indenting encoder (3.12) was a
+        traceback with no trailer and no log line, on the failure path and on
+        the ok path alike. It is dumped again without `indent`."""
+        for mode, code in (("fail", 1), ("single", 0)):
+            with self.subTest(mode=mode):
+                p = run(["-c", DEEP_PROBE, CLI, "-m", "haiku", "--system", "S", "--json", "hello"],
+                        mode=mode, state=self.state, extra_env=dict(self.env, PROBE_DEEP="indent"))
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertTrue(p.stdout.strip(), "the document must still be printed, "
+                                "compact: %r (%s)" % (p.stdout, p.stderr[-200:]))
+                self.assertEqual(json.loads(p.stdout)["type"], "result")
+                self.assertEqual(p.returncode, code, p.stderr)
+                self.assertEqual(p.stdout.count("\n"), 1, "compact means one line")
+                self.assertEqual(self.jsonl(self.log)[-1]["exit"], code)
+
+    def test_json_of_a_document_that_cannot_be_dumped_at_all_is_an_ordinary_failure(self):
+        for mode, code, rc_log in (("fail", 1, 1), ("single", 1, 1)):  # ok too: no document
+            with self.subTest(mode=mode):
+                p = run(["-c", DEEP_PROBE, CLI, "-m", "haiku", "--system", "S", "--json", "hello"],
+                        mode=mode, state=self.state, extra_env=dict(self.env, PROBE_DEEP="all"))
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual((p.returncode, p.stdout), (code, ""), p.stderr)
+                self.assertEqual(self.jsonl(self.log)[-1]["exit"], rc_log)
+                self.assertIn("[c-lean]", p.stderr, "the trailer must be there")
+
+    def test_json_under_schema_without_structured_output_fails_as_without_json(self):
+        """--json changes what is printed, not how the call ends: the check for
+        a missing structured_output was skipped with it (exit 0, no line)."""
+        args = ["-m", "haiku", "--system", "S", "--schema", self.SCHEMA, "hello"]
+        plain = run([CLI] + args, mode="single", state=self.state, extra_env=self.env)
+        p = run([CLI, "--json"] + args, mode="single", state=self.state, extra_env=self.env)
+        self.assertEqual(plain.returncode, 1, plain.stderr)
+        self.assertEqual(p.returncode, 1, "--json must not turn the failure into exit 0: %s"
+                         % p.stderr)
+        line = "--schema given but the CLI returned no structured_output"
+        self.assertIn(line, plain.stderr)
+        self.assertIn(line, p.stderr)
+        self.assertEqual([r["exit"] for r in self.jsonl(self.log)], [1, 1])
+        self.assertEqual(json.loads(p.stdout), json.loads(self.fake("single", "json")) | {
+            "uuid": json.loads(p.stdout)["uuid"]}, "stdout must be exactly the document")
+
+    def test_json_prints_a_document_that_came_before_a_stop_or_a_kill(self):
+        """The signal outcomes dropped the document they had received."""
+        good = self.path("good-then-kill.json")
+        with open(good, "w") as f:
+            json.dump({"events": [ev_result("done")], "end": "kill"}, f)
+        p = run([CLI, "-m", "haiku", "--json", "hello"], mode="script", state=self.state,
+                extra_env=dict(self.env, C_LEAN_FAKE_SCRIPT=good))
+        self.assertEqual(p.returncode, 128 + signal.SIGKILL, p.stderr)
+        self.assertTrue(p.stdout.strip(), "a document received before the CLI was killed must "
+                        "be printed (stdout None on failure)")
+        self.assertEqual(json.loads(p.stdout)["result"], "done")
+        bad = self.path("error-then-hang.json")
+        with open(bad, "w") as f:
+            json.dump({"events": [ev_result("", is_error=True,
+                                            subtype="error_during_execution")],
+                       "end": "hang"}, f)
+        env = child_env("script", self.state, dict(self.env, C_LEAN_FAKE_SCRIPT=bad))
+        proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--json", "hello"],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, preexec_fn=default_sighup)
+        try:
+            time.sleep(1.5)  # the document is out and the grace of 5 s is running
+            os.kill(proc.pid, signal.SIGTERM)
+            out, err = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+        self.assertEqual(proc.returncode, 128 + signal.SIGTERM, err)
+        self.assertTrue(out.strip(), "a document received before the stop must be printed "
+                        "(stdout None on failure): %r" % out)
+        self.assertTrue(json.loads(out)["is_error"])
+
+    def test_json_of_a_call_with_no_document_leaves_stdout_empty(self):
+        p = self.call("cutstream", "--json")
+        self.assertNotEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, "", "no `result` was received: there is no document to print")
 
     def test_json_of_blocks_that_were_not_joined_is_the_document_alone(self):
         """--json with a WARN: the document goes out as the CLI gave it, with
@@ -1952,6 +2279,8 @@ if _dir:
                        "The JSON schema of --schema does go on the command\n    line",
                        "The trailer says\n    CONTINUED xN", "c_lean_pieces",
                        "the key is there only when the blocks were joined",
+                       "--json prints\n    the document of any call that received one, whatever "
+                       "the outcome",
                        "A whitespace character can be\n    lost at a seam",
                        "at most 3 times", "With --schema nothing is joined",
                        # the kinds of continuation
@@ -3419,7 +3748,10 @@ if _dir:
         select, waits = selector.select, []
         def record(wait):
             waits.append(wait)
-            return select(wait)
+            # Record first, wait a sane time: epoll refuses a huge timeout
+            # with OverflowError, which would hide the assert below (kqueue
+            # accepts it) when the slice is lost.
+            return select(min(wait, B.WATCH_SLICE))
         selector.select = record
         with mock.patch.object(B.selectors, "DefaultSelector", return_value=selector):
             out, _err, _reason, _gone = B._communicate(proc, B.MAX_TIMEOUT)
@@ -3457,8 +3789,9 @@ if _dir:
     def run_bytes(self, args, mode="single", stdin=b"", extra_env=None, **kw):
         """`c-lean args` with bytes on stdin and both streams kept as bytes."""
         env = child_env(mode, self.state, dict(self.env, **(extra_env or {})))
-        return subprocess.run([sys.executable, CLI] + args, env=env, input=stdin,
-                              capture_output=True, timeout=180, **kw)
+        feed: dict[str, Any] = {"input": stdin} if stdin else {"stdin": subprocess.DEVNULL}
+        return subprocess.run([sys.executable, CLI] + args, env=env,
+                              capture_output=True, timeout=180, **feed, **kw)
 
     def test_a_file_or_stdin_that_is_not_utf8_is_a_usage_error(self):
         """A file given to -f, --system-file or --schema, and the prompt on
@@ -3554,14 +3887,20 @@ if _dir:
         self.assertEqual(self.calls(), 0)
 
     def test_a_warning_during_the_call_with_stderr_closed_keeps_the_answer(self):
-        """The WARN of a usage log that cannot be written went to stdout when
-        stderr was closed from the start, and then the run ended with 120
-        and no answer. Such a stderr does not fail: its lines are dropped."""
-        p = self.run_bytes(["-m", "haiku", "hello"], preexec_fn=self.no_stderr,
-                           extra_env={"C_LEAN_USAGE_LOG": self.mktemp("c-lean-log-")})
-        self.assertEqual((p.returncode, p.stdout), (0, b"ECHO:hello\n"),
-                         "with stderr closed, stdout must hold the answer and nothing else")
-        self.assertEqual(self.calls(), 1)
+        """A WARN went to stdout when stderr was closed from the start, and
+        then the run ended with 120 and no answer. Such a stderr does not
+        fail: its lines are dropped. One WARN is written during the call (a
+        refused C_LEAN_PASS_ENV name), one with the trailer (a usage log
+        that cannot be written)."""
+        for warn, extra in (("during the call", {"C_LEAN_PASS_ENV": "ANTHROPIC_API_KEY"}),
+                            ("after the call", {"C_LEAN_USAGE_LOG": self.mktemp("c-lean-log-")})):
+            with self.subTest(warn=warn):
+                before = self.calls()
+                p = self.run_bytes(["-m", "haiku", "hello"], preexec_fn=self.no_stderr,
+                                   extra_env=extra)
+                self.assertEqual((p.returncode, p.stdout), (0, b"ECHO:hello\n"),
+                                 "with stderr closed, stdout must hold the answer and nothing else")
+                self.assertEqual(self.calls(), before + 1)
 
     def test_a_good_call_with_stderr_closed_prints_the_answer(self):
         """A stderr closed from the start (`c-lean 2>&-`) cost the answer of a
@@ -3636,32 +3975,788 @@ if _dir:
         return child_env("script", self.state, dict(self.env, C_LEAN_FAKE_SCRIPT=path,
                                                     **(extra_env or {})))
 
+    LONG_ANSWER = "".join("line %06d of a long answer\n" % n for n in range(12000)).strip()
+
     def test_a_reader_that_goes_away_mid_answer_ends_quietly_with_120(self):
         """`c-lean … | head -c 10` with an answer of about 300 KB: the write met
         a closed pipe and ended in a BrokenPipeError traceback, exit 1, where
-        -h promises exit 120."""
-        answer = "".join("line %06d of a long answer\n" % n for n in range(12000)).strip()
+        -h promises exit 120. Under PYTHONUNBUFFERED the one write() of the
+        answer took 64 KiB, the rest was dropped, and the run gave exit 0."""
+        answer = self.LONG_ANSWER
         self.assertGreater(len(answer), 300000)
-        proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--system", "S", "hello"],
-                                env=self.script_env([ev_text("1", answer), ev_result(answer)]),
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, bufsize=0, preexec_fn=default_sighup)
+        for name, mode in UNBUFFERED_MODES:
+            with self.subTest(stdout=name):
+                log = self.path("usage-%s.jsonl" % name)
+                env = self.script_env([ev_text("1", answer), ev_result(answer)],
+                                      extra_env=dict(mode, C_LEAN_USAGE_LOG=log))
+                proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--system", "S",
+                                         "hello"], env=env, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, bufsize=0,
+                                        preexec_fn=default_sighup)
+                assert proc.stdout is not None and proc.stderr is not None
+                try:
+                    head = proc.stdout.read(10)
+                    proc.stdout.close()
+                    err = proc.stderr.read().decode("utf-8", "replace")
+                    proc.wait(timeout=60)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+                self.assertEqual(head, answer[:10].encode())
+                self.assertNotIn("Traceback", err)
+                self.assertNotIn("Exception ignored", err)
+                self.assertEqual(proc.returncode, 120, "a reader that went away must give exit "
+                                 "120: %s" % err[-300:])
+                self.assertIn(" · exit 0 · ", err, "the trailer was written before the answer")
+                self.assertEqual([r["exit"] for r in self.jsonl(log)], [0])
+
+    def logged(self, path):
+        """The usage log holds a whole line: the call has ended, and the print
+        of its end comes next."""
         try:
-            head = proc.stdout.read(10)
-            proc.stdout.close()
-            err = proc.stderr.read().decode("utf-8", "replace")
-            proc.wait(timeout=60)
+            with open(path) as f:
+                return f.read().endswith("\n")
+        except OSError:
+            return False
+
+    def cli_module(self):
+        """`c-lean` loaded as a module in this process, for its writers alone:
+        nothing here calls main(), which installs signal handlers."""
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("c_lean_cli", CLI)
+        spec = importlib.util.spec_from_loader("c_lean_cli", loader)
+        assert spec is not None
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+
+    class ShortFile:
+        """A stdout or stderr whose buffer, like the raw file of
+        PYTHONUNBUFFERED, takes at most `step` bytes a write()."""
+        encoding = "utf-8"
+
+        def __init__(self, step):
+            self.got, self.step = bytearray(), step
+            self.buffer = self
+
+        def write(self, data):
+            n = min(len(data), self.step)
+            self.got += bytes(data[:n])
+            return n
+
+        def flush(self):
+            pass
+
+        def fileno(self):
+            raise ValueError("no file under this stream")  # silence() must not dup2 a real fd
+
+    def test_a_short_write_never_ends_with_exit_0_and_a_cut_answer(self):
+        """The answer went out in one write() of stdout.buffer and its count
+        was not looked at. Under PYTHONUNBUFFERED that buffer is the raw file:
+        a short write (a reader gone mid-answer, a signal) dropped the rest of
+        the answer, and the run gave exit 0."""
+        mod = self.cli_module()
+        answer = "é" + "x" * 99999 + "\n"
+        for step in (4096, 1, 65536):
+            with self.subTest(step=step):
+                out = self.ShortFile(step)
+                # stderr is written past its buffer, to its file (see put_exact)
+                with open(self.path("stderr-%d" % step), "w+", encoding="utf-8") as err, \
+                        mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+                    rc = mod.finish(0, "trailer · ü\n", [], answer)
+                    err.seek(0)
+                    trailer = err.read()
+                self.assertEqual((rc, len(out.got)), (0, len(answer.encode("utf-8"))),
+                                 "every byte of the answer must be written, short writes or not")
+                self.assertEqual((bytes(out.got), trailer), (answer.encode("utf-8"), "trailer · ü\n"))
+
+    def test_a_slow_reader_of_a_non_blocking_stdout_gets_the_whole_answer(self):
+        """A stdout the parent left O_NONBLOCK, read slowly: the first write()
+        that found the pipe full ended the run with exit 120, and a good
+        answer was lost after 64 KiB."""
+        answer = self.LONG_ANSWER
+        for name, mode in UNBUFFERED_MODES:
+            with self.subTest(stdout=name):
+                env = self.script_env([ev_text("1", answer), ev_result(answer)], extra_env=mode)
+                read_end, write_end = os.pipe()
+                os.set_blocking(write_end, False)
+                try:
+                    proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--system", "S",
+                                             "hello"], env=env, stdout=write_end,
+                                            stderr=subprocess.PIPE, preexec_fn=default_sighup)
+                    assert proc.stderr is not None
+                finally:
+                    os.close(write_end)
+                got = bytearray()
+                try:
+                    t0 = time.monotonic()
+                    while time.monotonic() - t0 < 60:
+                        chunk = os.read(read_end, 16384)
+                        if not chunk:
+                            break
+                        got += chunk
+                        time.sleep(0.005)
+                    err = proc.stderr.read().decode("utf-8", "replace")
+                    proc.wait(timeout=60)
+                finally:
+                    os.close(read_end)
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+                    proc.stderr.close()
+                self.assertEqual((proc.returncode, len(got)), (0, len(answer) + 1),
+                                 "a slow reader of a non-blocking stdout must get the whole "
+                                 "answer and exit 0: %s" % err[-300:])
+                self.assertEqual(bytes(got), (answer + "\n").encode())
+
+    def stop_while_printing(self, mode, sig, stderr=subprocess.PIPE, answer=None):
+        """Start a call with a long answer and a stdout nobody reads, send
+        `sig` once the print has begun, and wait at most 5 s for the end.
+        Returns (proc, stdout, seconds the stop took, partial dir, usage log)."""
+        answer = answer or self.LONG_ANSWER
+        partial, log = self.mktemp("c-lean-partial-"), self.path("usage-%d.jsonl" % time.time_ns())
+        env = self.script_env([ev_text("1", answer), ev_result(answer)],
+                              extra_env=dict(mode, C_LEAN_USAGE_LOG=log, C_LEAN_PARTIAL_DIR=partial))
+        proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--system", "S", "hello"],
+                                env=env, stdout=subprocess.PIPE, stderr=stderr,
+                                preexec_fn=default_sighup)
+        assert proc.stdout is not None
+        self.addCleanup(proc.stdout.close)
+        try:
+            # the usage-log line is written just before the print: once it is
+            # there the tool prints, and nobody reads stdout
+            self.wait_for(lambda: self.logged(log) or proc.poll() is not None, secs=60,
+                          what="the end of the call")
+            time.sleep(0.3)
+            self.assertIsNone(proc.poll(), "the end of the run must not fit in the pipes, or "
+                              "nothing here is tested")
+            os.kill(proc.pid, sig)
+            t0 = time.monotonic()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.fail("signal %d while the end of the run was printed must end the run at "
+                          "once, not wait for a reader that does not read" % sig)
+            return proc, proc.stdout.read(), time.monotonic() - t0, partial, log
         finally:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
-        self.assertEqual(head, answer[:10].encode())
-        self.assertNotIn("Traceback", err)
-        self.assertNotIn("Exception ignored", err)
-        self.assertEqual(proc.returncode, 120, "a reader that went away must give exit 120: %s"
-                         % err[-300:])
-        self.assertIn(" · exit 0 · ", err, "the trailer was written before the answer")
-        self.assertEqual([r["exit"] for r in self.jsonl(self.log)], [0])
+
+    def test_a_stop_while_the_answer_is_printed_ends_the_run_and_keeps_the_answer(self):
+        """After the call, a stop found no exception to raise into: PEP 475
+        restarted the write of the answer, and with a reader that does not
+        read SIGTERM, SIGINT and SIGHUP did nothing; SIGKILL alone ended the
+        run. A write that the signal cut short instead (a live reader, the
+        raw stdout of PYTHONUNBUFFERED) gave a cut answer and exit 0."""
+        answer = self.LONG_ANSWER
+        for name, mode in UNBUFFERED_MODES:
+            for sig in STOP_SIGNALS:
+                with self.subTest(stdout=name, signal=sig):
+                    err = self.path("stderr-%s-%d" % (name, sig))
+                    with open(err, "wb") as f:
+                        proc, printed, took, partial, log = self.stop_while_printing(
+                            mode, sig, stderr=f.fileno())
+                    with open(err, encoding="utf-8", errors="replace") as f:
+                        text = f.read()
+                    self.assertNotIn("Traceback", text)
+                    self.assertEqual(proc.returncode, 128 + sig, "a stop while the answer was "
+                                     "printed must give 128+signal: %s" % text[-300:])
+                    self.assertLess(took, 3, "the stop must end the run at once")
+                    # some of it, not none: a stop before the print passes none
+                    self.assertGreater(len(printed), 0, "the stop must cut the answer")
+                    self.assertLess(len(printed), len(answer), "stdout holds part of the answer")
+                    self.assertTrue(answer.encode().startswith(printed))
+                    self.assertIn(STOP_LINE % sig + STOP_LINE_STDOUT, text)
+                    self.assertEqual(self.saved_blocks(partial), [[answer]],
+                                     "the answer that was cut must be kept whole")
+                    self.assertEqual([r["exit"] for r in self.jsonl(log)], [0])
+
+    def test_one_stop_ends_a_run_whose_two_streams_share_an_unread_pipe(self):
+        """`c-lean … 2>&1 | slow`: after the stop the line that says so went
+        to the same full pipe as the answer, and the run waited there until a
+        second stop. What stayed in the buffer of stderr then blocked the
+        interpreter on the way out."""
+        for name, mode in UNBUFFERED_MODES:
+            with self.subTest(streams=name):
+                proc, printed, took, partial, _log = self.stop_while_printing(
+                    mode, signal.SIGTERM, stderr=subprocess.STDOUT)
+                self.assertEqual(proc.returncode, 143, printed[-300:])
+                self.assertLess(took, 3, "one stop must end the run within the wait for stderr")
+                self.assertEqual(self.saved_blocks(partial), [[self.LONG_ANSWER]])
+
+    def full_pipe(self):
+        """(read end, write end) of a pipe that takes nothing more until read."""
+        read_end, write_end = os.pipe()
+        os.set_blocking(write_end, False)
+        try:
+            while True:
+                os.write(write_end, b"x" * 4096)
+        except BlockingIOError:
+            pass
+        os.set_blocking(write_end, True)
+        return read_end, write_end
+
+    def test_a_stop_while_a_short_answer_waits_for_stdout_ends_the_run(self):
+        """An answer smaller than the buffer of stdout sits in it while the
+        flush waits for a full pipe: after the stop the interpreter flushed it
+        again on the way out and blocked there, every stop signal ignored."""
+        for name, mode in UNBUFFERED_MODES:
+            with self.subTest(stdout=name):
+                partial = self.mktemp("c-lean-partial-")
+                log = self.path("usage-%s.jsonl" % name)
+                env = self.script_env([ev_text("1", "the answer"), ev_result("the answer")],
+                                      extra_env=dict(mode, C_LEAN_USAGE_LOG=log,
+                                                     C_LEAN_PARTIAL_DIR=partial))
+                read_end, write_end = self.full_pipe()
+                try:
+                    with open(self.path("stderr-%s" % name), "wb") as err:
+                        proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--system",
+                                                 "S", "hello"], env=env, stdout=write_end,
+                                                stderr=err, preexec_fn=default_sighup)
+                    try:
+                        self.wait_for(lambda: self.logged(log) or proc.poll() is not None,
+                                      secs=60, what="the end of the call")
+                        time.sleep(0.3)
+                        self.assertIsNone(proc.poll(), "the answer must wait for a full stdout")
+                        os.kill(proc.pid, signal.SIGTERM)
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            self.fail("a stop while a short answer waited for stdout must end "
+                                      "the run at once")
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+                            proc.wait()
+                finally:
+                    os.close(read_end)
+                    os.close(write_end)
+                self.assertEqual(proc.returncode, 143)
+                self.assertEqual(self.saved_blocks(partial), [["the answer"]])
+
+    def test_a_stop_while_the_trailer_is_printed_ends_the_run_and_says_so(self):
+        """The trailer goes to stderr before the answer goes to stdout, and a
+        stderr that nobody reads held a stop as stdout did. What its buffer
+        still held then blocked the interpreter on the way out. The stop line
+        and the path of the saved answer were dropped with that stderr; under
+        PYTHONUNBUFFERED the trailer and its lines too (a write under PIPE_BUF
+        that a signal cuts takes nothing), main's own SAVED line among them.
+        The stop line speaks of stdout only when an answer was to go there."""
+        kinds = {"good": ([ev_text("1", "the answer"), ev_result("the answer")], "the answer",
+                          STOP_LINE_STDOUT),
+                 "failed": ([ev_text("1", "half an answer")], "half an answer", "")}
+        for kind, (events, text, tail) in kinds.items():
+            for name, mode in UNBUFFERED_MODES:
+                with self.subTest(call=kind, stderr=name):
+                    self.stop_during_the_trailer(events, text, mode, STOP_LINE % 15 + tail)
+
+    def stop_during_the_trailer(self, events, text, mode, stop_line):
+        partial = self.mktemp("c-lean-partial-")
+        log = self.path("usage-%d.jsonl" % time.time_ns())
+        env = self.script_env(events, extra_env=dict(mode, C_LEAN_USAGE_LOG=log,
+                                                     C_LEAN_PARTIAL_DIR=partial))
+        read_end, write_end = os.pipe()
+        drained = []
+        try:
+            os.set_blocking(write_end, False)
+            try:  # a full pipe: the first line on stderr, the trailer, blocks
+                while True:
+                    os.write(write_end, b"x" * 4096)
+            except BlockingIOError:
+                pass
+            os.set_blocking(write_end, True)
+            proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "--system", "S", "hello"],
+                                    env=env, stdout=subprocess.PIPE, stderr=write_end,
+                                    preexec_fn=default_sighup)
+            assert proc.stdout is not None
+            os.close(write_end)
+            write_end = None
+            try:
+                self.wait_for(lambda: self.logged(log) or proc.poll() is not None, secs=60,
+                              what="the end of the call")
+                time.sleep(0.3)
+                self.assertIsNone(proc.poll(), "the trailer must wait for a full stderr")
+                os.kill(proc.pid, signal.SIGTERM)
+                # the reader comes back after the stop: it must get the lines
+                drain = threading.Thread(target=lambda: drained.append(
+                    b"".join(iter(lambda: os.read(read_end, 65536), b""))), daemon=True)
+                drain.start()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.fail("a stop while the trailer was printed must end the run at once, "
+                              "not wait for a stderr that is not read")
+                printed = proc.stdout.read()
+                drain.join(10)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                proc.stdout.close()
+        finally:
+            os.close(read_end)
+            if write_end is not None:
+                os.close(write_end)
+        self.assertEqual((proc.returncode, printed), (143, b""),
+                         "a stop during the trailer must give 143, the answer unprinted")
+        self.assertEqual(self.saved_blocks(partial), [[text]])
+        lines = b"".join(drained).lstrip(b"x").decode("utf-8", "replace").splitlines()
+        self.assertTrue(lines and lines[0].startswith("[c-lean] haiku · "),
+                        "the trailer must reach a stderr read again: %r" % lines)
+        self.assertNotIn("", lines, "nothing may be put in between")
+        self.assertIn(stop_line, lines, "the stop line must reach a stderr read again")
+        self.assertEqual(len([l for l in lines if l.startswith("c-lean: SAVED")]), 1,
+                         "the path of the saved answer must reach stderr: %r" % lines)
+
+    # Loads `c-lean` as a module and runs its main() for real, after wrapping
+    # functions of the core: STOP_PLAN="name[@n][+secs]:signal,…" sends the signal to
+    # the tool itself when the named function returns for the n-th time (1st), or
+    # `secs` later from a thread. A stop then lands at an exact point of the run,
+    # not after a guessed sleep. RECORD_WAIT sets how long a record may wait.
+    STOP_PROBE = r'''
+import importlib.machinery, importlib.util, os, sys, threading, time
+loader = importlib.machinery.SourceFileLoader("c_lean_cli", sys.argv[1])
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("c_lean_cli", loader))
+loader.exec_module(mod)
+if os.environ.get("RECORD_WAIT"):
+    mod.B.RECORD_WAIT_SECS = float(os.environ["RECORD_WAIT"])
+
+
+def wrap(real, sig, nth, later):
+    returns = []
+
+    def wrapped(*a, **k):
+        out = real(*a, **k)
+        returns.append(out)
+        if len(returns) == nth:
+            if later:
+                t = threading.Timer(later, os.kill, (os.getpid(), sig))
+                t.daemon = True
+                t.start()
+            else:
+                os.kill(os.getpid(), sig)
+        return out
+    return wrapped
+
+
+for spec in os.environ["STOP_PLAN"].split(","):
+    name, sig = spec.split(":")
+    name, _, later = name.partition("+")
+    name, _, nth = name.partition("@")
+    setattr(mod.B, name, wrap(getattr(mod.B, name), int(sig), int(nth or 1), float(later or 0)))
+sys.exit(mod.main(sys.argv[2:]))
+'''
+
+    def run_stop_probe(self, plan, args, mode="script", events=None, extra_env=None,
+                       stderr=None, limit=None, why=""):
+        """`stderr`: an fd for it (p.stderr is None then). `limit`: seconds the
+        run may take; a run that takes longer fails the test with `why`."""
+        probe = self.write("stop_probe.py", self.STOP_PROBE)
+        if events is None:
+            events = [ev_text("1", "the answer"), ev_result("the answer")]
+        extra = dict(extra_env or {}, STOP_PLAN=plan)
+        env = (self.script_env(events, extra_env=extra) if mode == "script" else
+               child_env(mode, self.state, dict(self.env, **extra)))
+        try:
+            return subprocess.run([sys.executable, probe, CLI] + args, env=env,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE if stderr is None else stderr,
+                                  text=True, timeout=limit or 60, preexec_fn=default_sighup)
+        except subprocess.TimeoutExpired:
+            if limit is None:
+                raise
+            self.fail("%s (still running %s s on)" % (why, limit))
+
+    # Loads `c-lean` as a module and runs its main() for real, with one of two
+    # moments made exact. HELD_KILL=1: right after the first write to stderr
+    # while the end of the run is printed, a SIGTERM to the tool, before the
+    # write is counted. HELD_FILL=1: right after select() finds room on
+    # stderr, another writer (a file description of its own, as a sibling
+    # job sharing the pipe has) takes all of it. HELD_THREAD=1 starts one
+    # more thread first, one that does not hold the stops back.
+    HELD_PROBE = r'''
+import importlib.machinery, importlib.util, os, select, signal, sys, threading, time
+loader = importlib.machinery.SourceFileLoader("c_lean_cli", sys.argv[1])
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("c_lean_cli", loader))
+loader.exec_module(mod)
+done = []
+if os.environ.get("HELD_THREAD"):
+    threading.Thread(target=time.sleep, args=(120,), daemon=True).start()
+if os.environ.get("HELD_KILL"):
+    real_write = os.write
+
+    def write(fd, data):
+        n = real_write(fd, data)
+        if fd == 2 and mod.B._PRINTING and not done:
+            done.append(1)
+            os.kill(os.getpid(), signal.SIGTERM)
+        return n
+    os.write = write
+if os.environ.get("HELD_FILL"):
+    real_select = select.select
+
+    def fill(r, w, x, *t):
+        out = real_select(r, w, x, *t)
+        if mod.B._PRINTING and 2 in out[1] and not done:
+            done.append(1)
+            other = os.open("/proc/self/fd/2", os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                while True:
+                    os.write(other, b"o" * 4096)
+            except BlockingIOError:
+                pass
+            os.close(other)
+        return out
+    select.select = fill
+sys.exit(mod.main(sys.argv[2:]))
+'''
+
+    def test_a_stop_right_after_a_write_to_stderr_is_counted_first(self):
+        """A stop handled between the return of a write to stderr and the count
+        of what it took lost the count: the trailer was sent again after the
+        stop, and printed twice. A signal mask could not prevent it while any
+        other thread was alive."""
+        probe = self.write("held_probe.py", self.HELD_PROBE)
+        for name, mode in UNBUFFERED_MODES:
+            for thread in ("", "1"):
+                with self.subTest(stderr=name, thread=bool(thread)):
+                    env = self.script_env([ev_text("1", "the answer"), ev_result("the answer")],
+                                          extra_env=dict(mode, HELD_KILL="1",
+                                                         HELD_THREAD=thread or None))
+                    p = subprocess.run([sys.executable, probe, CLI, "-m", "haiku", "--system", "S",
+                                        "hello"], env=env, capture_output=True, text=True,
+                                       timeout=60, preexec_fn=default_sighup)
+                    lines = p.stderr.splitlines()
+                    self.assertEqual(p.returncode, 143, p.stderr[-300:])
+                    self.assertEqual(len([l for l in lines if l.startswith("[c-lean] ")]), 1,
+                                     "the trailer must be printed once: %r" % lines)
+                    self.assertEqual(len([l for l in lines if l.startswith("c-lean: stopped")]), 1)
+
+    @unittest.skipUnless(os.path.isdir("/proc/self/fd"), "another file description of stderr "
+                         "is opened through /proc")
+    def test_a_write_to_stderr_that_blocks_while_the_stops_are_held_ends_on_one_stop(self):
+        """select() found room on stderr, another writer took it, and the write
+        then blocked with the stops held: one SIGTERM, then a second, did
+        nothing, and SIGKILL alone ended the run."""
+        probe = self.write("held_probe.py", self.HELD_PROBE)
+        for name, mode in UNBUFFERED_MODES:
+            with self.subTest(stderr=name):
+                log = self.path("usage-%s.jsonl" % name)
+                env = self.script_env([ev_text("1", "the answer"), ev_result("the answer")],
+                                      extra_env=dict(mode, HELD_FILL="1", C_LEAN_USAGE_LOG=log))
+                read_end, write_end = os.pipe()
+                try:
+                    proc = subprocess.Popen([sys.executable, probe, CLI, "-m", "haiku", "--system",
+                                             "S", "hello"], env=env, stdout=subprocess.DEVNULL,
+                                            stderr=write_end, preexec_fn=default_sighup)
+                    os.close(write_end)
+                    write_end = None
+                    try:
+                        self.wait_for(lambda: self.logged(log) or proc.poll() is not None,
+                                      secs=60, what="the end of the call")
+                        time.sleep(0.5)
+                        self.assertIsNone(proc.poll(), "the trailer must wait for stderr")
+                        os.kill(proc.pid, signal.SIGTERM)
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            self.fail("one stop must end a write that blocked with the stops held")
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+                            proc.wait()
+                finally:
+                    os.close(read_end)
+                    if write_end is not None:
+                        os.close(write_end)
+                self.assertEqual(proc.returncode, 143)
+
+    def test_a_stop_after_the_call_and_before_the_print_ends_the_run(self):
+        """A stop that came after the call and before the print found no write
+        to cut: the print then started, and a reader that does not read held
+        it for ever. The trailer and its lines still come first."""
+        p = self.run_stop_probe("log_call:%d" % signal.SIGTERM,
+                                ["-m", "haiku", "--system", "S", "hello"])
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual((p.returncode, p.stdout), (143, ""), "a stop after the call must end "
+                         "the run before the print: %s" % p.stderr[-300:])
+        lines = p.stderr.splitlines()
+        self.assertIn(" · exit 0 · ", lines[0], "the trailer must still be printed")
+        self.assertEqual([l[:30] for l in lines[1:]],
+                         ["c-lean: stopped — signal 15 ca", "c-lean: SAVED 10 characters in"],
+                         p.stderr)
+        self.assertEqual(self.saved_blocks(), [["the answer"]])
+
+    def test_a_stop_after_the_call_was_judged_is_one_it_did_not_see(self):
+        """The call is judged by the stops it saw, and main() looked again
+        after it had returned: a stop in between counted as seen by the call,
+        and the print went on."""
+        p = self.run_stop_probe("transport_notes:%d" % signal.SIGTERM,
+                                ["-m", "haiku", "--system", "S", "hello"])
+        self.assertEqual((p.returncode, p.stdout), (143, ""), "a stop after the call was judged "
+                         "must end the run before the print: %s" % p.stderr[-300:])
+        self.assertIn("c-lean: stopped — signal 15", p.stderr)
+
+    def test_a_stop_after_a_call_that_returned_early_is_one_it_did_not_see(self):
+        """A call that returns before it judges any stop (a timeout, a binary
+        that cannot be run) left no count behind, and main() took the count
+        after it: a stop in between was taken for one the call had seen."""
+        for what, mode, extra, args, code in (
+                ("a timeout", "hang", {}, ["--timeout", "1"], 124),
+                ("no binary", "single", {"C_LEAN_CLAUDE_BIN": self.path("no-such-claude")}, [],
+                 69)):
+            with self.subTest(call=what):
+                try:
+                    p = self.run_stop_probe("transport_notes:%d" % signal.SIGTERM,
+                                            ["-m", "haiku", "--system", "S"] + args + ["hello"],
+                                            mode=mode, extra_env=extra)
+                finally:
+                    self.kill_recorded()
+                self.assertIn(" · exit %d · " % code, p.stderr, p.stderr[-300:])
+                self.assertEqual(p.returncode, 143, "a stop after a call that returned early "
+                                 "must end the run: %s" % p.stderr[-300:])
+                self.assertIn("c-lean: stopped — signal 15 came", p.stderr)
+
+    def test_a_stop_the_call_judged_does_not_cut_the_print(self):
+        """A stop that came after a good whole `result`, during the call, lets
+        the answer stand: it is printed, and the run gives exit 0."""
+        p = self.run_stop_probe("read_stream:%d" % signal.SIGTERM,
+                                ["-m", "haiku", "--system", "S", "hello"])
+        self.assertIn("came after the answer, and the answer stands", p.stderr)
+        self.assertEqual((p.returncode, p.stdout), (0, "the answer\n"),
+                         "a stop the call judged must not cut the print: %s" % p.stderr[-300:])
+        self.assertNotIn("c-lean: stopped", p.stderr)
+
+    def test_a_stop_as_the_call_is_judged_counts_once(self):
+        """A stop between the read of the stop count and the read of the stop
+        signal was judged by the call (the answer stands) and seen as one
+        after it (the print is cut), both."""
+        # The second read of the count: the one before the call, the one after it.
+        p = self.run_stop_probe("stop_count@2:%d" % signal.SIGTERM,
+                                ["-m", "haiku", "--system", "S", "hello"])
+        self.assertEqual((p.returncode, p.stdout), (143, ""), p.stderr[-300:])
+        self.assertNotIn("came after the answer", p.stderr,
+                         "a stop the print counts must not be judged by the call too")
+
+    def test_a_stop_right_after_the_call_took_the_count_is_reported_once(self):
+        """The call reads the stop count once before it begins, and that read
+        both decides the return before the call and records what was judged.
+        With two reads, a stop between them was reported by that return ("stopped
+        before the call") and then again by the print, as one the call never saw."""
+        p = self.run_stop_probe("stop_count@1:%d" % signal.SIGTERM,
+                                ["-m", "haiku", "--system", "S", "hello"])
+        self.assertEqual((p.returncode, p.stdout), (143, ""), p.stderr[-300:])
+        self.assertEqual(p.stderr.count("c-lean: stopped"), 1,
+                         "a stop the call reported must not be reported again: %s"
+                         % p.stderr[-400:])
+
+    def test_a_second_stop_after_the_call_is_told_from_the_first(self):
+        """A stop during the call after a good whole `result` lets the answer
+        stand. A second stop after the call has the number of a stop already
+        seen when it is the same signal, and none at all when it is not (only
+        the first was kept): it was lost, and the print went on. The stop
+        line named the first signal."""
+        for first, second in ((signal.SIGINT, signal.SIGTERM), (signal.SIGTERM, signal.SIGTERM)):
+            with self.subTest(first=first, second=second):
+                p = self.run_stop_probe("read_stream:%d,log_call:%d" % (first, second),
+                                        ["-m", "haiku", "--system", "S", "hello"])
+                self.assertIn("came after the answer, and the answer stands", p.stderr)
+                self.assertEqual((p.returncode, p.stdout), (128 + second, ""),
+                                 "a second stop after the call must end the run: %s"
+                                 % p.stderr[-300:])
+                self.assertIn("c-lean: stopped — signal %d came" % second, p.stderr,
+                              "the stop line must name the stop that cut the print")
+
+    def test_check_a_stop_after_the_probe_and_before_its_trailer_ends_the_run(self):
+        """--check prints its trailer at the end as a call does, and a stop in
+        between was only recorded."""
+        p = self.run_stop_probe("log_call:%d" % signal.SIGTERM, ["--check"], mode="usageinout")
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(p.returncode, 143, "a stop after the probe must end --check with 143: %s"
+                         % p.stderr[-300:])
+        lines = p.stderr.splitlines()
+        self.assertIn(STOP_LINE % 15, lines, "--check writes no stdout: its stop line must not "
+                      "speak of one: %r" % lines)
+
+    def test_a_stop_after_the_call_does_not_wait_for_the_usage_log_warning(self):
+        """The WARN of a usage log that cannot be written was printed after the
+        call as it came: on a stderr that is not read a stop was only counted,
+        PEP 475 resumed the write, and the run went on until the reader read.
+        It goes out with the trailer now, where a stop ends the print."""
+        for (name, mode), (tool, args, kind) in itertools.product(
+                UNBUFFERED_MODES, (("c-lean", ["-m", "haiku", "--system", "S", "hi"], "script"),
+                                   ("--check", ["--check"], "usageinout"))):
+            with self.subTest(stderr=name, tool=tool):
+                read_end, write_end = self.full_pipe()
+                try:
+                    # a directory cannot be opened as the log: one WARN
+                    p = self.run_stop_probe(
+                        "_fifo_reason:%d" % signal.SIGTERM, args, mode=kind,
+                        extra_env=dict(mode, C_LEAN_USAGE_LOG=self.dir), stderr=write_end,
+                        limit=20, why="a stop after the call must not wait for a usage-log "
+                        "WARN that a stderr nobody reads holds")
+                finally:
+                    os.close(write_end)
+                    os.close(read_end)
+                self.assertEqual((p.returncode, p.stdout), (143, ""))
+
+    def test_a_stop_after_the_call_ends_the_wait_for_a_record(self):
+        """A record waits for a FIFO with no reader (the open), or with a
+        reader that does not read (the write), for RECORD_WAIT_SECS: a stop
+        there was only counted, and the run went on to the end of that time.
+        The record is given up at once, with its WARN; --check's too."""
+        def fifo(name):
+            path = self.path(name)
+            os.mkfifo(path)
+            return path
+        log, probe = fifo("log-open.fifo"), fifo("probe-open.fifo")
+        full = fifo("log-full.fifo")
+        reader = os.open(full, os.O_RDONLY | os.O_NONBLOCK)
+        filler = os.open(full, os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            try:
+                while True:
+                    os.write(filler, b"x" * 4096)
+            except BlockingIOError:
+                pass
+            args = ["-m", "haiku", "--system", "S", "hi"]
+            for wait, plan, run_args, extra, mode in (
+                    ("open", "_is_fifo:%d", args, {"C_LEAN_USAGE_LOG": log}, "script"),
+                    # 0.5 s into the wait for room, from a thread
+                    ("write", "open_record_file+0.5:%d", args, {"C_LEAN_USAGE_LOG": full},
+                     "script"),
+                    ("--check open", "_is_fifo:%d", ["--check"],
+                     {"C_LEAN_CHECK_PROBE_FILE": probe}, "usageinout")):
+                with self.subTest(wait=wait):
+                    p = self.run_stop_probe(plan % signal.SIGTERM, run_args, mode=mode,
+                                            extra_env=dict(extra, RECORD_WAIT="60"), limit=20,
+                                            why="a stop must end the wait for the %s of a record"
+                                            % wait)
+                    self.assertEqual(p.returncode, 143, p.stderr[-300:])
+                    self.assertEqual(len([l for l in p.stderr.splitlines()
+                                          if "WARN could not write" in l]), 1, p.stderr[-400:])
+        finally:
+            os.close(filler)
+            os.close(reader)
+
+    # Runs put_exact on a stderr whose buffer still holds a line a stop cut,
+    # as print() leaves it under a buffered stderr: "bounded" a full pipe that
+    # is never read, through write_bounded; "nonblock" a full O_NONBLOCK pipe
+    # read from 0.3 s on, through write_end, as the trailer is written.
+    LEFTOVER_PROBE = r'''
+import importlib.machinery, importlib.util, io, os, sys, threading, time
+loader = importlib.machinery.SourceFileLoader("c_lean_cli", sys.argv[1])
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("c_lean_cli", loader))
+loader.exec_module(mod)
+case = sys.argv[2]
+r, w = os.pipe()
+os.set_blocking(w, False)
+try:
+    while True:
+        os.write(w, b"x" * 4096)
+except BlockingIOError:
+    pass
+os.set_blocking(w, case == "bounded")
+stream = io.TextIOWrapper(io.BufferedWriter(io.FileIO(w, "w", closefd=False)), encoding="utf-8")
+stream.write("a line a stop cut, ")
+sys.stderr = stream
+if case == "bounded":
+    t0 = time.monotonic()
+    mod.write_bounded(b"the stop line\n")
+    print("took %.1f" % (time.monotonic() - t0), flush=True)
+    mod.silence(stream)  # as c-lean does: the way out must not flush it again
+else:
+    got = bytearray()
+
+    def drain():
+        time.sleep(0.3)
+        end = time.monotonic() + 20
+        while not got.endswith(b"the trailer\n") and time.monotonic() < end:
+            try:
+                got.extend(os.read(r, 65536))
+            except BlockingIOError:
+                time.sleep(0.01)
+    os.set_blocking(r, False)
+    th = threading.Thread(target=drain)
+    th.start()
+    ok = mod.write_end("the trailer\n")
+    th.join()
+    print(ok, got.lstrip(b"x") == b"a line a stop cut, the trailer\n")
+'''
+
+    def test_a_line_left_in_the_buffer_of_stderr_is_waited_for_within_the_bound(self):
+        """A stop that cut a line on a full stderr left it in the buffer of
+        stderr, and the write of the stop lines flushed it first, before
+        their bound was armed: a stderr that is not read held the run past
+        it, for good. The flush is bounded with them now."""
+        probe = self.write("leftover_probe.py", self.LEFTOVER_PROBE)
+        try:
+            p = subprocess.run([sys.executable, probe, CLI, "bounded"], capture_output=True,
+                               text=True, timeout=20, env=child_env("single", self.state, self.env))
+        except subprocess.TimeoutExpired:
+            self.fail("a line left in the buffer of stderr must not hold the stop lines past "
+                      "their bound")
+        self.assertEqual(p.returncode, 0, p.stderr[-300:])
+        self.assertLess(float(p.stdout.split()[1]), 3, p.stdout)
+
+    def test_a_line_left_in_the_buffer_of_a_non_blocking_stderr_is_waited_for(self):
+        """The same flush on a full O_NONBLOCK stderr raised BlockingIOError,
+        and the run ended with exit 120 while its reader was alive: the
+        answer of a good call was lost. What the buffer holds is waited for,
+        and goes out first, as every other write to stderr is."""
+        probe = self.write("leftover_probe.py", self.LEFTOVER_PROBE)
+        p = subprocess.run([sys.executable, probe, CLI, "nonblock"], capture_output=True,
+                           text=True, timeout=60, env=child_env("single", self.state, self.env))
+        self.assertEqual(p.returncode, 0, p.stderr[-300:])
+        self.assertEqual(p.stdout.split(), ["True", "True"],
+                         "a full O_NONBLOCK stderr must be waited for, the line its buffer "
+                         "held first, never cost exit 120")
+
+    def test_a_stop_does_not_wait_for_the_lock_of_its_own_thread(self):
+        """A stop that landed while the main thread held the lock of the live
+        children waited for it, 1 s, inside the signal handler: the holder was
+        the thread the handler had stopped."""
+        self.assertEqual(B.interrupted(), 0)
+        with mock.patch.dict(B._INTERRUPT):  # the stop is this test's alone
+            with B._LIVE_LOCK:
+                t0 = time.monotonic()
+                B.interrupt(signal.SIGTERM)
+                took = time.monotonic() - t0
+        self.assertLess(took, 0.5, "a stop must not wait for a lock its own thread holds")
+
+    def test_help_says_a_stop_while_printing_still_gives_128_plus_n(self):
+        h = " ".join(run([CLI, "-h"], state=self.state, extra_env=self.env).stdout.split())
+        for phrase in ("A stop after the call, until the end of the run is printed, gives "
+                       "128+signal too, and a reader that does not read cannot hold it",
+                       "about 1 s later when the stop lands in a write to stderr that blocks",
+                       "a wait for the usage log or the --check record ends at once too",
+                       "it may hold part of the answer, NOT a result",
+                       "under --schema the text blocks, not the structured output",
+                       "stderr is given at most 1 s for these lines",
+                       "Lines written before the call ends (a WARN about C_LEAN_PASS_ENV or "
+                       "stdin, or one of the call) go to stderr as they come: a reader that "
+                       "does not read can hold them, and a stop then waits for it",
+                       "So it holds the end of the run after a stop before or during the "
+                       "call, until a second stop ends it",
+                       "Exit 120, and 128+N for a stop after the call until the end of the run "
+                       "is printed, are the exceptions",
+                       "and after it until the end of the run is printed",
+                       "a stop after the `result`), whole unless a stop comes after the call, "
+                       "before it is all printed"):
+            self.assertIn(phrase, h, "c-lean -h must say: %s" % phrase)
+        readme = " ".join(open(os.path.join(os.path.dirname(TESTS), "README.md"),
+                               encoding="utf-8").read().split())
+        for phrase in ("about 1 s later when the stop lands in a write to stderr that blocks",
+                       "the text blocks of the call (if any) are saved",
+                       "Lines written before the call ends (a WARN about `C_LEAN_PASS_ENV` or "
+                       "stdin, or one of the call) go to stderr as they come",
+                       "also after the call until the end of the run is printed",
+                       "a stop after the `result`), whole unless a stop comes after the call, "
+                       "before it is all printed"):
+            self.assertIn(phrase, readme, "the README must say: %s" % phrase)
 
     def test_a_stdout_with_no_reader_ends_without_a_second_error(self):
         """An answer small enough for the buffer of stdout failed only when the
@@ -4008,7 +5103,8 @@ if _dir:
                 stack.enter_context(mock.patch.object(B, "_dt", types.SimpleNamespace(
                     datetime=SteppingDatetime, timezone=timezone)))
                 stack.enter_context(mock.patch.object(B, "time", types.SimpleNamespace(
-                    monotonic=mock.Mock(side_effect=[1000.0, 1003.5]))))
+                    monotonic=mock.Mock(side_effect=itertools.chain([1000.0, 1003.5],
+                                                                    itertools.repeat(1003.5))))))
                 stack.enter_context(mock.patch.object(tempfile, "tempdir", tmp))
                 stack.enter_context(mock.patch.object(B, "_communicate",
                     timed_out if outcome == "timeout" else read_all))
@@ -4026,9 +5122,28 @@ if _dir:
                 self.assertTrue(rec["ts"].startswith("2026-10-29T"))
 
     def test_usage_log_to_dev_null_does_not_warn(self):
+        # Root may fchmod /dev/null, so "no WARN" alone proves nothing there,
+        # and a mutated run would really change the device. The probe refuses
+        # every fchmod on a non-regular file and notes it: nothing real is
+        # ever chmodded, and the test fails on the attempt itself.
+        tried = self.path("fchmod-tried")
+        armed = self.path("fchmod-armed")
+        site = self.site("import stat\n"
+                         "real = os.fchmod\n"
+                         "def refuse_devices(fd, mode):\n"
+                         "    if not stat.S_ISREG(os.fstat(fd).st_mode):\n"
+                         "        with open(os.environ['FCHMOD_TRIED'], 'a') as f:\n"
+                         "            f.write(oct(mode) + '\\n')\n"
+                         "        raise PermissionError(1, 'probe: not a regular file')\n"
+                         "    return real(fd, mode)\n"
+                         "os.fchmod = refuse_devices\n"
+                         "open(os.environ['FCHMOD_ARMED'], 'w').close()\n")
         p = run([CLI, "-m", "haiku", "hello"], mode="single", state=self.state,
-                extra_env=dict(self.env, C_LEAN_USAGE_LOG="/dev/null"))
+                extra_env=dict(self.env, C_LEAN_USAGE_LOG="/dev/null", PYTHONPATH=site,
+                               FCHMOD_TRIED=tried, FCHMOD_ARMED=armed))
+        self.assertTrue(os.path.exists(armed), "the fchmod probe never loaded (is sitecustomize loaded?)")
         self.assertEqual((p.returncode, p.stdout), (0, "ECHO:hello\n"), p.stderr)
+        self.assertFalse(os.path.exists(tried), "a usage log on a device must not be chmodded")
         self.assertEqual(self.warns(p), [], "a usage log on /dev/null must not WARN")
 
     def test_usage_log_fifo_is_written_without_changing_its_mode(self):
@@ -4044,6 +5159,191 @@ if _dir:
         self.assertEqual(json.loads(data), {"probe": "fifo"})
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o640,
                          "a FIFO usage log must keep its existing mode")
+
+    def run_with_fifo(self, args, env_name, fill=False):
+        """Run c-lean with `env_name` naming a FIFO. No reader, or with `fill`
+        a reader that never reads and a pipe already full. A hang fails here
+        on its own timeout, not in the runner's."""
+        path = self.path("sink-%s.fifo" % ("full" if fill else "empty"))
+        os.mkfifo(path, 0o600)
+        rd = os.open(path, os.O_RDONLY | os.O_NONBLOCK) if fill else None
+        try:
+            if fill:
+                wr = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                try:
+                    while True:
+                        os.write(wr, b"x" * 4096)
+                except BlockingIOError:
+                    pass
+                finally:
+                    os.close(wr)
+            env = child_env("single", self.state, dict(self.env, **{env_name: path}))
+            try:
+                return subprocess.run([sys.executable, CLI] + args, env=env, capture_output=True,
+                                      text=True, timeout=20, preexec_fn=default_sighup)
+            except subprocess.TimeoutExpired:
+                self.fail("c-lean hung on a FIFO that %s" % ("nobody drains" if fill else "has no reader"))
+        finally:
+            if rd is not None:
+                os.close(rd)
+
+    def test_usage_log_fifo_without_reader_warns_and_does_not_hang(self):
+        for fill in (False, True):
+            with self.subTest(fill=fill):
+                p = self.run_with_fifo(["-m", "haiku", "hello"], "C_LEAN_USAGE_LOG", fill)
+                self.assertEqual((p.returncode, p.stdout), (0, "ECHO:hello\n"), p.stderr)
+                self.assertEqual(len([w for w in self.warns(p) if "could not write usage log" in w]), 1,
+                                 "a usage log FIFO that cannot take the record must give one WARN: "
+                                 + p.stderr)
+
+    def test_probe_file_fifo_without_reader_warns_and_does_not_hang(self):
+        for fill in (False, True):
+            with self.subTest(fill=fill):
+                p = self.run_with_fifo(["--check"], "C_LEAN_CHECK_PROBE_FILE", fill)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(len([w for w in p.stderr.splitlines()
+                                      if "WARN could not write the probe record" in w]), 1,
+                                 "a probe FIFO that cannot take the record must give one WARN: "
+                                 + p.stderr)
+
+    def test_a_short_write_of_the_usage_record_is_a_warn_not_silence(self):
+        said = []
+        def write(fd, data):
+            if said_calls:
+                raise BlockingIOError(11, "Resource temporarily unavailable")
+            said_calls.append(1)
+            return 3
+        said_calls = []
+        with mock.patch.object(B.os, "write", write), \
+                mock.patch.object(B, "RECORD_WAIT_SECS", 0.2), \
+                mock.patch.object(B, "_say_during_call", said.append):
+            B.log_usage({"probe": "short"}, path=self.log)
+        self.assertEqual(len(said), 1, "a torn usage record must give one WARN")
+        self.assertIn("wrote 3 of ", said[0])
+        self.assertIn("the record is torn", said[0])
+
+    def test_a_large_usage_record_reaches_a_reader_that_drains(self):
+        """A record over the 64 KiB a pipe holds was cut by one non-blocking
+        write even though the reader kept reading."""
+        path = self.path("big.fifo")
+        os.mkfifo(path, 0o600)
+        rd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        got, stop = [], threading.Event()
+
+        def drain():
+            while not stop.is_set():
+                try:
+                    chunk = os.read(rd, 4096)
+                except BlockingIOError:
+                    chunk = None
+                if chunk:
+                    got.append(chunk)
+                else:
+                    time.sleep(0.001)
+        t = threading.Thread(target=drain)
+        t.start()
+        said = []
+        try:
+            with mock.patch.object(B, "_say_during_call", said.append):
+                B.log_usage({"tag": "x" * 120000}, path=path)
+            time.sleep(0.2)
+        finally:
+            stop.set()
+            t.join()
+            os.close(rd)
+        data = b"".join(got)
+        self.assertEqual(said, [], "a reader that drains must get the whole record")
+        self.assertTrue(data.endswith(b"}\n"), "a reader that drains must get the whole record")
+        self.assertEqual(len(json.loads(data)["tag"]), 120000)
+
+    def test_a_record_for_a_reader_that_never_drains_ends_in_a_warn(self):
+        path = self.path("stuck.fifo")
+        os.mkfifo(path, 0o600)
+        rd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        said = []
+        # in a thread: without O_NONBLOCK the write blocks, and a hang must
+        # fail here, not in the runner's timeout
+        t = threading.Thread(target=B.log_usage, args=({"tag": "x" * 120000},),
+                             kwargs={"path": path}, daemon=True)
+        try:
+            with mock.patch.object(B, "RECORD_WAIT_SECS", 0.3), \
+                    mock.patch.object(B, "_say_during_call", said.append):
+                t.start()
+                t.join(10)
+                finished = not t.is_alive()
+        finally:
+            os.close(rd)  # a stuck write ends with EPIPE
+            t.join(5)
+        self.assertTrue(finished, "log_usage must not hold the record for ever")
+        self.assertEqual(len(said), 1, said)
+        self.assertIn("the record is torn", said[0])
+
+    def test_a_fifo_reader_that_opens_late_still_gets_the_record(self):
+        """`while true; do cat fifo; done` has no reader between two cats; a
+        blocking open waited for the next one, and the record must not be lost."""
+        path = self.path("late.fifo")
+        os.mkfifo(path, 0o600)
+        got = []
+
+        def late_reader():
+            time.sleep(0.3)
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                while True:
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        break
+                    got.append(chunk)
+            finally:
+                os.close(fd)
+        t = threading.Thread(target=late_reader, daemon=True)
+        t.start()
+        said = []
+        w = threading.Thread(target=B.log_usage, args=({"probe": "late"},), kwargs={"path": path},
+                             daemon=True)
+        with mock.patch.object(B, "_say_during_call", said.append):
+            w.start()
+            w.join(10)
+            ended = not w.is_alive()
+        t.join(5)
+        self.assertTrue(ended, "log_usage must not hold the record for ever")
+        self.assertEqual(said, [], "a reader that opens late must get the whole record")
+        self.assertEqual(json.loads(b"".join(got)), {"probe": "late"},
+                         "a reader that opens late must get the whole record")
+
+    def test_a_fifo_nobody_opens_gives_one_warn_within_the_bound(self):
+        path = self.path("never.fifo")
+        os.mkfifo(path, 0o600)
+        said = []
+        w = threading.Thread(target=B.log_usage, args=({"probe": "never"},), kwargs={"path": path},
+                             daemon=True)
+        with mock.patch.object(B, "_say_during_call", said.append):
+            t0 = time.monotonic()
+            w.start()
+            w.join(B.RECORD_WAIT_SECS + 8)
+            took = time.monotonic() - t0
+            ended = not w.is_alive()
+        self.assertTrue(ended, "log_usage must not wait for a reader for ever")
+        self.assertLess(took, B.RECORD_WAIT_SECS + 5)
+        self.assertEqual(len(said), 1, said)
+        self.assertIn("a FIFO with no reader", said[0])
+
+    def test_enxio_on_a_socket_path_is_not_called_a_fifo(self):
+        import socket
+        # a short directory: a socket path over ~104 bytes cannot be bound
+        short = tempfile.mkdtemp(dir="/tmp")
+        self.tmpdirs.append(short)
+        path = os.path.join(short, "s.sock")
+        srv = socket.socket(socket.AF_UNIX)
+        srv.bind(path)
+        try:
+            said = []
+            with mock.patch.object(B, "_say_during_call", said.append):
+                B.log_usage({"probe": "sock"}, path=path)
+        finally:
+            srv.close()
+        self.assertEqual(len(said), 1, said)
+        self.assertNotIn("FIFO", said[0])
 
     def test_an_existing_regular_usage_log_is_made_private(self):
         self.write("usage.jsonl", "")
@@ -4201,6 +5501,358 @@ if _dir:
         self.assertEqual((p.returncode, p.stdout), (0, "ECHO:" + prompt + "\n"),
                          "a good prompt from -f - must reach the CLI whole: " + p.stderr)
         self.on_stdin(prompt)
+
+    # --- how the prompt is put together, and stdin that is not read
+    def run_stdin(self, args, kind, data=b"DATA\n", mode="single"):
+        """`c-lean -m haiku args` with stdin of the given kind, as bytes. A pipe,
+        a socket and a file are given `data`; `empty` is an empty file; `tty` is
+        a pseudo-terminal; `devnull` is /dev/null, which is what stdin is inside
+        Claude Code's Bash tool; `closed` is `<&-`."""
+        env = child_env(mode, self.state, self.env)
+        cmd = [sys.executable, CLI, "-m", "haiku"] + args
+        kw, closers = {}, []
+        if kind == "pipe":
+            # written before the spawn: the state c-lean meets must not depend
+            # on how fast the child starts
+            r, w = os.pipe()
+            os.write(w, data)
+            os.close(w)
+            kw["stdin"] = r
+            closers.append(lambda: os.close(r))
+        elif kind in ("file", "empty"):
+            f = open(self.write_bytes("stdin-%s.bin" % kind, data if kind == "file" else b""), "rb")
+            kw["stdin"] = f
+            closers.append(f)
+        elif kind == "socket":
+            a, b = socket.socketpair()
+            a.sendall(data)
+            a.close()
+            kw["stdin"] = b
+            closers.append(b)
+        elif kind in ("eofpipe", "openpipe"):
+            # an os.pipe() whose state at start is exact: no writer left and
+            # nothing written / the writer still open and silent
+            r, w = os.pipe()
+            kw["stdin"] = r
+            closers.append(lambda: os.close(r))
+            if kind == "openpipe":
+                closers.append(lambda: os.close(w))
+            else:
+                os.close(w)
+        elif kind == "fileend":
+            f = open(self.write_bytes("stdin-fileend.bin", data), "rb")
+            f.read()  # the offset is at the end, as after the last pass of `while read`
+            kw["stdin"] = f
+            closers.append(f)
+        elif kind == "wronly":
+            fd = os.open(self.write_bytes("stdin-wronly.bin", data), os.O_WRONLY)
+            kw["stdin"] = fd
+            closers.append(lambda: os.close(fd))
+        elif kind == "listening":
+            srv = socket.socket(socket.AF_UNIX)
+            # a short path: sun_path holds about 100 bytes, and a long TMPDIR
+            # would make the bind an error instead of a test
+            short = tempfile.mkdtemp(dir="/tmp")
+            self.tmpdirs.append(short)
+            srv.bind(os.path.join(short, "s"))
+            srv.listen(1)
+            kw["stdin"] = srv.fileno()
+            closers.append(srv)
+        elif kind == "opensocket":
+            # what Node's stdio "pipe" is on Linux: a socketpair, the peer open and silent
+            a, b = socket.socketpair()
+            kw["stdin"] = b
+            closers += [a, b]
+        elif kind == "eofsocket":
+            a, b = socket.socketpair()
+            a.shutdown(socket.SHUT_WR)  # the peer has shut down for writing
+            kw["stdin"] = b
+            closers += [a, b]
+        elif kind == "devnull":
+            kw["stdin"] = subprocess.DEVNULL
+        elif kind == "tty":
+            master, slave = os.openpty()
+            kw["stdin"] = slave
+            closers += [lambda: os.close(master), lambda: os.close(slave)]
+        elif kind == "closed":
+            kw.update(stdin=None, preexec_fn=self.no_stdin)
+        else:
+            raise AssertionError(kind)
+        try:
+            # a probe or a read that waits for stdin is a failure of the test,
+            # not a reason to wait a minute and end in an error
+            return subprocess.run(cmd, env=env, capture_output=True, timeout=20, **kw)
+        except subprocess.TimeoutExpired:
+            self.fail("c-lean waited for stdin (%s) instead of going on" % kind)
+        finally:
+            for c in closers:
+                c() if callable(c) else c.close()
+
+    def unread_stdin_warnings(self, p):
+        return [l for l in p.stderr.decode("utf-8", "replace").splitlines()
+                if "WARN stdin was not read" in l]
+
+    def test_stdin_that_was_not_read_is_warned_about_once(self):
+        """`echo DATA | c-lean -m haiku "Summarize this:"` sent only the words,
+        exit 0, and the piped data was ignored without a word. It stays unread
+        (an inherited pipe that never closes would hang the call), and one WARN
+        says so and names both ways out."""
+        path = self.write("ctx.md", "CONTEXT")
+        for kind in ("pipe", "file", "socket"):
+            for args, prompt in ((["Summarize this:"], "Summarize this:"),
+                                 (["-f", path], "CONTEXT"),
+                                 (["Q", "-f", path], "Q\n\nCONTEXT")):
+                with self.subTest(kind=kind, args=args):
+                    p = self.run_stdin(args, kind)
+                    err = p.stderr.decode("utf-8", "replace")
+                    self.assertEqual(p.returncode, 0, err)
+                    warns = self.unread_stdin_warnings(p)
+                    self.assertEqual(len(warns), 1,
+                                     "unread data on stdin must cost exactly one WARN: " + err)
+                    for hint in ("c-lean: WARN", "-f -", "</dev/null"):
+                        self.assertIn(hint, warns[0], "the WARN must say how to include the "
+                                      "data and how to silence it")
+                    self.on_stdin(prompt)
+
+    def test_a_pipe_already_at_eof_with_nothing_in_it_gives_no_warning(self):
+        """`true | c-lean -m haiku x` and `subprocess.run(..., input="")` lose
+        nothing: the pipe is at EOF with 0 bytes. A UNIX socket whose peer has
+        shut down for writing is the same."""
+        for kind in ("eofpipe", "eofsocket"):
+            with self.subTest(kind=kind):
+                p = self.run_stdin(["words"], kind)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(self.unread_stdin_warnings(p), [],
+                                 "%s at EOF with nothing in it must not WARN" % kind)
+                self.on_stdin("words")
+
+    def test_an_idle_open_socket_gives_no_warning_and_no_wait(self):
+        """Claude Code's Bash tool spawns the shell with stdin an open socketpair
+        (Node and Bun make one for stdio "pipe"), and appends `< /dev/null` to
+        the command only when its text holds no `<` (a prompt like "is 3 < 5"
+        has one): the call then meets an open stdin that stays idle. It must
+        not WARN, and it must not wait for it."""
+        p = self.run_stdin(["is 3 < 5"], "opensocket")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.unread_stdin_warnings(p), [],
+                         "an idle open socket must not WARN")
+        self.on_stdin("is 3 < 5")
+
+    def test_a_pipe_whose_writer_is_still_open_is_warned_about_and_not_waited_for(self):
+        """A producer that is still running has sent nothing yet: its data would
+        be dropped without a word. The WARN comes, and the call does not wait."""
+        p = self.run_stdin(["words"], "openpipe")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(self.unread_stdin_warnings(p)), 1,
+                         "an open pipe that is not at EOF must WARN: " + p.stderr.decode())
+        self.on_stdin("words")
+
+    def test_a_slow_producer_in_a_shell_pipeline_is_warned_about(self):
+        """`(sleep 0.5; echo DATA) | c-lean -m haiku x` sent only "x" and the
+        data was lost without a word, whenever the producer took more than
+        about 50 ms. The check is made at the start, before any byte comes, or
+        after it came: either way it warns."""
+        env = child_env("single", self.state, self.env)
+        cmd = "(sleep 0.5; echo DATA) | %s %s -m haiku x" % (
+            shlex.quote(sys.executable), shlex.quote(CLI))
+        p = subprocess.run(["sh", "-c", cmd], env=env, capture_output=True, timeout=30,
+                           stdin=subprocess.DEVNULL)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(self.unread_stdin_warnings(p)), 1,
+                         "a slow producer must be warned about: " + p.stderr.decode())
+        self.on_stdin("x")
+
+    def test_a_probe_that_fails_costs_a_warn_not_silence(self):
+        """If the count of waiting bytes fails for any reason, the answer is
+        the conservative one: warn. A pipe at EOF and an idle socket are the
+        controls that stay silent."""
+        mod = self.cli_module()
+        for kind in ("pipe", "socket"):
+            with self.subTest(kind=kind):
+                if kind == "pipe":
+                    r, w = os.pipe()
+                    os.close(w)  # EOF, nothing in it
+                    peer = None
+                else:
+                    r, peer = socket.socketpair()
+                    r = r.detach()
+                with os.fdopen(r) as stream, mock.patch.object(sys, "stdin", stream):
+                    self.assertFalse(mod.stdin_holds_data(), "the control case must not WARN")
+                    with mock.patch.object(mod.fcntl, "ioctl", side_effect=OSError("failed")):
+                        self.assertTrue(mod.stdin_holds_data(),
+                                        "a failed probe must WARN, never stay silent")
+                if peer is not None:
+                    peer.close()
+
+    def test_a_stop_signal_in_the_probe_is_not_swallowed(self):
+        """The stop handler raises PromptStopped in the main thread, and the
+        probe can be the code it lands in: it must reach the caller, as in
+        every other read of the prompt (a WARN and a hang were the result)."""
+        mod = self.cli_module()
+        r, w = os.pipe()
+        os.write(w, b"x")
+        with os.fdopen(r) as pipe, mock.patch.object(sys, "stdin", pipe), \
+                mock.patch.object(mod.fcntl, "ioctl", side_effect=B.PromptStopped()):
+            with self.assertRaises(B.PromptStopped, msg="the probe must let a stop through"):
+                mod.stdin_holds_data()
+        os.close(w)
+
+    def test_the_stdin_warning_on_a_broken_stderr_keeps_the_call_and_the_usage_line(self):
+        """A WARN on a stderr that can no longer be written must not cost the
+        call: base made it, logged it and exited 120; the WARN raised out of
+        the prompt step instead (traceback, exit 1, no call, no log line)."""
+        r, w = os.pipe()
+        os.write(w, b"DATA\n")
+        os.close(w)
+        stderr = self.broken_stderr()
+        try:
+            p = subprocess.run([sys.executable, CLI, "-m", "haiku", "words"], stdin=r,
+                               env=child_env("single", self.state, self.env),
+                               stdout=subprocess.PIPE, stderr=stderr, timeout=60,
+                               preexec_fn=default_sighup)
+        finally:
+            os.close(r)
+            os.close(stderr)
+        self.assertEqual(self.calls(), 1, "the call must still be made")
+        self.assertEqual(p.returncode, 120, "a broken stderr is exit 120, not a traceback")
+        self.assertEqual([x["exit"] for x in self.jsonl(self.log)], [0],
+                         "the usage-log line must still be written")
+
+    def test_a_file_argument_that_is_stdin_is_not_reported_as_unread(self):
+        """`-f /dev/stdin < data` reads the data, so it must not WARN that
+        stdin was not read."""
+        if not os.path.exists("/dev/stdin"):
+            self.skipTest("no /dev/stdin")
+        for kind in ("pipe", "file"):
+            with self.subTest(kind=kind):
+                p = self.run_stdin(["words", "-f", "/dev/stdin"], kind)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(self.unread_stdin_warnings(p), [],
+                                 "-f /dev/stdin reads stdin: nothing is unread")
+                self.on_stdin("words\n\nDATA\n")
+
+    def test_a_stdin_that_never_closes_is_not_waited_for(self):
+        """Words plus an inherited pipe whose writer stays open (a Node parent
+        with default stdio) must not hang the call: stdin is not read."""
+        env = child_env("single", self.state, self.env)
+        r, w = os.pipe()
+        os.write(w, b"DATA\n")  # before the spawn, so that the state is exact
+        proc = subprocess.Popen([sys.executable, CLI, "-m", "haiku", "words"], env=env,
+                                stdin=r, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        os.close(r)
+        assert proc.stdout is not None and proc.stderr is not None
+        try:
+            try:
+                proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                self.fail("the call must not wait for a stdin that never closes")
+            err = proc.stderr.read().decode("utf-8", "replace")
+            self.assertEqual(proc.returncode, 0, err)
+            self.assertEqual(len(self.unread_stdin_warnings(types.SimpleNamespace(stderr=err.encode()))),
+                             1, err)
+            self.on_stdin("words")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            os.close(w)
+            for f in (proc.stdout, proc.stderr):
+                f.close()
+
+    def test_no_warning_when_stdin_holds_no_data_or_is_in_use(self):
+        """No WARN for /dev/null (stdin inside Claude Code's Bash tool), a
+        terminal, a closed stdin, an empty file, nor when -f - reads stdin."""
+        for kind in ("devnull", "tty", "closed", "empty", "fileend", "wronly", "listening"):
+            with self.subTest(kind=kind):
+                p = self.run_stdin(["words"], kind)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(self.unread_stdin_warnings(p), [],
+                                 "%s must not be reported as unread data" % kind)
+                self.assertNotIn(b"-f -", p.stderr)
+                self.on_stdin("words")
+        for kind in ("pipe", "file", "socket"):
+            with self.subTest(kind=kind, flag="-f -"):
+                p = self.run_stdin(["words", "-f", "-"], kind)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(self.unread_stdin_warnings(p), [],
+                                 "-f - reads stdin, so nothing is unread")
+                self.on_stdin("words\n\nDATA\n")
+        with self.subTest(case="stdin is the only input"):
+            p = self.run_stdin([], "pipe")
+            self.assertEqual((p.returncode, self.unread_stdin_warnings(p)), (0, []), p.stderr)
+            self.on_stdin("DATA\n")
+
+    def test_the_prompt_is_words_first_then_the_files_in_the_order_given(self):
+        a, b = self.write("a.md", "AAA"), self.write("b.md", "BBB")
+        for args, stdin, prompt in (
+                (["-f", a, "QUESTION"], b"", "QUESTION\n\nAAA"),
+                (["-f", a, "-f", b, "Q"], b"", "Q\n\nAAA\n\nBBB"),
+                (["-f", b, "-f", a], b"", "BBB\n\nAAA"),
+                (["-f", a, "-f", "-", "-f", b], b"STDIN", "AAA\n\nSTDIN\n\nBBB"),
+                (["-f", "-", "-f", a, "Q"], b"STDIN", "Q\n\nSTDIN\n\nAAA"),
+                (["one", "two", "-f", a, "three"], b"", "one two three\n\nAAA")):
+            with self.subTest(args=args):
+                p = self.run_stdin(args, "pipe", data=stdin)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.on_stdin(prompt)
+
+    def test_words_may_stand_between_the_options(self):
+        """`c-lean -m haiku first -e low second` was a usage error (exit 64,
+        "unrecognized arguments"): the words had to stand together."""
+        for args, prompt in ((["first", "-e", "low", "second"], "first second"),
+                             (["-e", "low", "first", "--json", "second", "third"],
+                              "first second third"),
+                             (["first", "--tag", "t", "second", "--allow-empty"], "first second"),
+                             (["a", "-m", "opus", "b"], "a b")):
+            with self.subTest(args=args):
+                p = self.run_stdin(args, "devnull")
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.on_stdin(prompt)
+        self.run_stdin(["first", "-e", "low", "second"], "devnull")
+        self.assertEqual(self.flag("--effort"), "low", "the option between the words must count")
+        self.run_stdin(["a", "-m", "opus", "b"], "devnull")
+        self.assertEqual(self.flag("--model"), "opus", "the last -m must win, as before")
+
+    def test_a_double_dash_ends_the_options_for_the_words_after_it(self):
+        for args, prompt in ((["--", "-e", "low"], "-e low"),
+                             (["first", "-e", "low", "--", "-m", "--json"], "first -m --json"),
+                             (["--", "-m", "--json"], "-m --json")):
+            with self.subTest(args=args):
+                p = self.run_stdin(args, "devnull")
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.on_stdin(prompt)
+        self.assertNotIn("--effort", self.argv(), "words after `--` are not options")
+
+    def test_usage_errors_of_the_command_line_stay_exit_64(self):
+        for args, message in ((["words", "--bogus"], "c-lean: unrecognized arguments: --bogus"),
+                              (["a", "-e", "low", "b", "-x"], "c-lean: unrecognized arguments: -x"),
+                              (["words", "-f"], "c-lean: argument -f/--file: expected one argument"),
+                              (["a", "--timeout", "x", "b"], "c-lean: argument --timeout: invalid")):
+            with self.subTest(args=args):
+                p = self.run_stdin(args, "devnull")
+                self.assertEqual(p.returncode, 64, p.stderr)
+                self.assertTrue(p.stderr.decode("utf-8", "replace").startswith(message),
+                                p.stderr)
+                self.assertEqual((p.stdout, self.calls()), (b"", 0))
+
+    def test_help_states_the_rules_for_assembling_the_prompt(self):
+        h = " ".join(run([CLI, "-h"], state=self.state, extra_env=self.env).stdout.split())
+        for phrase in ("first the words, then each -f FILE in the order given",
+                       "they may stand between options", "After `--` every argument is a word",
+                       "-f - reads stdin and puts it at that place",
+                       "stdin is read only when it is the only input",
+                       "it is NOT read and one WARN on stderr says so",
+                       "any pipe that is not at EOF and empty", "only bytes already waiting",
+                       "only bytes left after its offset",
+                       "a write-only fd and a listening socket give no WARN",
+                       "`-f /dev/stdin` is not reported as unread",
+                       "a file that reports size 0 (/proc, cgroup v1 files)",
+                       "a datagram socket whose first datagram is empty",
+                       "a named FIFO that gets a new writer after EOF",
+                       "give </dev/null to c-lean there",
+                       "a socket whose first bytes come later (use -f - for it)",
+                       "</dev/null silences the WARN"):
+            self.assertIn(phrase, h, "help must state how the prompt is assembled: " + phrase)
 
     def test_schema_from_a_file_reaches_the_cli_as_json(self):
         schema = '{"type":"object","properties":{"verdict":{"type":"string"}}}'

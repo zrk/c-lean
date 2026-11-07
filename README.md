@@ -91,8 +91,10 @@ c-lean --check
 ## sub-scout and sub-coder
 
 - Both start without CLAUDE.md (`omitClaudeMd: true`), with their own short prompt in place of the Claude Code system prompt, and with a narrow tool list. Give them a self-contained brief: the paths, the question or the change, and the check to run.
-- Neither agent file names a model or an effort, on purpose. The caller names `model` and `effort` in each Agent call to `c-lean:sub-scout` or `c-lean:sub-coder`, as with `-m` and `-e` of `c-lean`. A call without them runs the agent on the session's model and effort.
-- Claude Code picks a subagent's model in this order: the `model` passed in that Agent call, the `model` in the agent file, the `CLAUDE_CODE_SUBAGENT_MODEL` environment variable, the session's model. These two agent files have no `model`, so the second step never applies to them. A per-call `effort` works the same way. `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` pins every subagent to one model.
+- The caller names `model` and `effort` in each Agent call to `c-lean:sub-scout` or `c-lean:sub-coder`, as with `-m` and `-e` of `c-lean`.
+- Both agent files name the model `pass-model-and-effort-in-the-call`, on purpose. No such model exists, so an Agent call without `model` fails with a model-not-found error instead of running on another model (checked on Claude Code 2.1.319).
+- The files cannot enforce effort: Claude Code ignores an `effort` value it does not know. So they name no effort, and a call without `effort` runs at the session's effort.
+- Claude Code picks a subagent's model in this order: the `model` passed in that Agent call, the `model` in the agent file, the `CLAUDE_CODE_SUBAGENT_MODEL` environment variable, the session's model. In these two agent files the second step is the placeholder, which fails. A per-call `effort` works the same way. `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` pins every subagent to one model.
 
 ## Measurements
 

@@ -31,7 +31,7 @@ c-lean -m haiku --system "Answer yes or no." "Does this log line report an error
 ## sub-scout and sub-coder
 
 - They start without CLAUDE.md and without the project's instructions. The brief is the whole task: name the paths, the question or the change, and the check to run.
-- Neither agent file names a model or an effort. Pass `model` and `effort` in every Agent call to choose for this task: a cheaper model for a plain lookup, a stronger one for a hard edit. Without them the subagent runs on the session's model and effort.
+- Pass `model` and `effort` in every Agent call to choose for this task: a cheaper model for a plain lookup, a stronger one for a hard edit. The agent files name a placeholder model that does not exist, so a call without `model` fails with a model-not-found error instead of running on another model. The files cannot enforce effort: a call without `effort` runs at the session's effort.
 - One task per subagent. If the work turns out larger than the brief, the subagent stops and reports instead of widening it.
 
 ## When none of these fits

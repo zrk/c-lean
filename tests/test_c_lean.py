@@ -5885,6 +5885,7 @@ else:
 
 
 FRONTMATTER_KEY_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_-]*)[ \t]*:[ \t]*(.*)$")
+AGENT_MODEL = "pass-model-and-effort-in-the-call"
 
 
 def frontmatter(text):
@@ -5910,10 +5911,13 @@ def frontmatter(text):
 
 def agent_problems(directory):
     """What is wrong with the agent files (*.md) in directory, one line each.
-    Every file needs a name and tools that are not empty and omitClaudeMd: true,
-    and must have no model and no effort: the caller names both in each Agent
-    call. A directory without a single agent file is a problem of its own: a
-    check that looked at nothing has shown nothing."""
+    Every file needs a name and tools that are not empty and omitClaudeMd: true.
+    Its model must be AGENT_MODEL, a model that does not exist, so that an Agent
+    call without `model` fails instead of running on another model. It must have
+    no effort: Claude Code ignores an effort it does not know, so the file cannot
+    enforce one and the caller names it in each call. A directory without a
+    single agent file is a problem of its own: a check that looked at nothing has
+    shown nothing."""
     names = sorted(n for n in os.listdir(directory) if n.endswith(".md")) \
         if os.path.isdir(directory) else []
     if not names:
@@ -5932,17 +5936,22 @@ def agent_problems(directory):
                 problems.append("%s: %s is empty" % (name, key))
         if keys.get("omitClaudeMd") != ["true"]:
             problems.append("%s: omitClaudeMd is not true" % name)
-        for key in ("model", "effort"):
-            if key in keys:
-                problems.append("%s: has the key %s" % (name, key))
+        if "model" not in keys:
+            problems.append("%s: no model" % name)
+        elif keys["model"] != [AGENT_MODEL]:
+            problems.append("%s: model is %s, not %s" % (name, ", ".join(keys["model"]),
+                                                         AGENT_MODEL))
+        if "effort" in keys:
+            problems.append("%s: has the key effort" % name)
     return problems
 
 
 class AgentFiles(unittest.TestCase):
-    def test_agent_files_are_lean_and_name_no_model_or_effort(self):
+    def test_agent_files_are_lean_and_name_a_model_that_fails_a_call_without_model(self):
         self.assertEqual(agent_problems(AGENTS), [],
-                         "every agent file needs name, tools and omitClaudeMd: true, and no "
-                         "model and no effort: the caller names both in each Agent call")
+                         "every agent file needs name, tools, omitClaudeMd: true and model: %s, "
+                         "a model that does not exist, so a call without model fails; and no "
+                         "effort, which the file cannot enforce" % AGENT_MODEL)
 
     def test_a_directory_without_agent_files_is_a_problem(self):
         with tempfile.TemporaryDirectory(prefix="c-lean-agents-") as d:
